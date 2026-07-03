@@ -67,15 +67,22 @@ if response is None:
     st.stop()
 
 response_data = response.json()
-results = response_data.get("results") or []
-if not results:
+
+# Suporta múltiplos formatos de resposta do Turso:
+# - formato com `results` -> [{ "columns": [...], "rows": [...] }]
+# - formato com `cols` e `rows` no nível root
+if "results" in response_data and response_data.get("results"):
+    result = response_data["results"][0]
+    columns = result.get("columns", [])
+    rows = result.get("rows", [])
+elif "cols" in response_data and "rows" in response_data:
+    # Ex.: {"cols": [{"name":"timestamp",...}], "rows": [[{"type":"text","value":"..."}, ...]]}
+    columns = [c.get("name") for c in response_data.get("cols", [])]
+    rows = response_data.get("rows", [])
+else:
     st.error("A resposta do Turso não contém resultados válidos.")
     st.json(response_data)
     st.stop()
-
-result = results[0]
-columns = result.get("columns", [])
-rows = result.get("rows", [])
 
 if not columns or not rows:
     st.warning("Não há dados suficientes para exibir. Verifique a tabela ou os registros do Turso.")
