@@ -75,6 +75,10 @@ if "results" in response_data and response_data.get("results"):
     result = response_data["results"][0]
     columns = result.get("columns", [])
     rows = result.get("rows", [])
+elif "result" in response_data and isinstance(response_data.get("result"), dict) and "cols" in response_data.get("result") and "rows" in response_data.get("result"):
+    # Ex.: {"result": {"cols": [{"name":"timestamp",...}], "rows": [[{"type":"text","value":"..."}, ...]]}}
+    columns = [c.get("name") for c in response_data["result"].get("cols", [])]
+    rows = response_data["result"].get("rows", [])
 elif "cols" in response_data and "rows" in response_data:
     # Ex.: {"cols": [{"name":"timestamp",...}], "rows": [[{"type":"text","value":"..."}, ...]]}
     columns = [c.get("name") for c in response_data.get("cols", [])]
