@@ -27,28 +27,43 @@ headers = {
     "Content-Type": "application/json",
 }
 
-# Query para buscar os dados (Turso espera o campo `stmt` no payload HTTP)
-payload = {
-    # Envia como lista de statements; cada statement é um objeto `stmt` com
-    # campo `sql` e opcional `args`. Isso corresponde ao formato esperado
-    # pela API HTTP do Turso (struct Stmt).
-    "statements": [
-        {
-            "stmt": {
-                "sql": "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100",
-                "args": []
-            }
-        }
-    ]
-}
+# Query SQL
+sql_query = "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100"
 
-response = requests.post(TURSO_URL, json=payload, headers=headers)
+# Testa vários formatos de payload que a API HTTP do Turso pode aceitar.
+payload_variants = [
+    # objeto top-level `stmt` com struct { sql, args }
+    {"stmt": {"sql": sql_query, "args": []}},
+    # lista de statements onde cada item tem um campo `stmt` (objeto)
+    {"statements": [{"stmt": {"sql": sql_query, "args": []}}]},
+    # lista de statements com objeto contendo `sql` diretamente
+    {"statements": [{"sql": sql_query, "args": []}]},
+    # lista simples de strings (menos provável, mas tentamos)
+    {"statements": [sql_query]},
+]
 
-if response.status_code != 200:
-    st.error(
-        "Erro ao conectar com o banco de dados Turso. "
-        f"Status {response.status_code}: {response.text}"
-    )
+response = None
+last_error = None
+for idx, payload in enumerate(payload_variants, start=1):
+    try:
+        resp = requests.post(TURSO_URL, json=payload, headers=headers, timeout=15)
+    except Exception as exc:
+        last_error = f"request error (variant {idx}): {exc}"
+        continue
+
+    if resp.status_code == 200:
+        response = resp
+        used_payload = payload
+        break
+    else:
+        last_error = f"status {resp.status_code}: {resp.text} (variant {idx})"
+
+if response is None:
+    st.error("Erro ao conectar com o banco de dados Turso usando os formatos testados.")
+    st.markdown("**Último erro:**")
+    st.code(last_error or "Sem resposta")
+    st.markdown("**Payloads testados (somente SQL mostrado):**")
+    st.json([{"variant": i + 1, "payload_preview": {k: (v if k != 'stmt' else {'sql': v.get('sql')}) for k, v in p.items()}} for i, p in enumerate(payload_variants)])
     st.stop()
 
 response_data = response.json()
