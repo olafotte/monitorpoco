@@ -127,6 +127,7 @@ if "nivel_cm" in df.columns and "status_bomba" in df.columns:
         y="nivel_cm",
         title="Variação do Nível nas Últimas Leituras",
         labels={"timestamp": "Data/Hora", "nivel_cm": "Nível (cm)"},
+        markers=True,
     )
     st.plotly_chart(fig)
 
