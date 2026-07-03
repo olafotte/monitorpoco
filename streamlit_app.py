@@ -27,11 +27,9 @@ headers = {
     "Content-Type": "application/json",
 }
 
-# Query para buscar os dados
+# Query para buscar os dados (Turso espera o campo `stmt` no payload HTTP)
 payload = {
-    "statements": [
-        "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100"
-    ]
+    "stmt": "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100"
 }
 
 response = requests.post(TURSO_URL, json=payload, headers=headers)
