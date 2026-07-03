@@ -29,7 +29,17 @@ headers = {
 
 # Query para buscar os dados (Turso espera o campo `stmt` no payload HTTP)
 payload = {
-    "stmt": "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100"
+    # Envia como lista de statements; cada statement é um objeto `stmt` com
+    # campo `sql` e opcional `args`. Isso corresponde ao formato esperado
+    # pela API HTTP do Turso (struct Stmt).
+    "statements": [
+        {
+            "stmt": {
+                "sql": "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 100",
+                "args": []
+            }
+        }
+    ]
 }
 
 response = requests.post(TURSO_URL, json=payload, headers=headers)
