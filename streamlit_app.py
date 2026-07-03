@@ -108,6 +108,8 @@ except ValueError as exc:
 
 if "timestamp" in df.columns:
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+    # Ajustar para o horário de Brasília
+    df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
 
 if "nivel_cm" in df.columns and "status_bomba" in df.columns:
     col1, col2 = st.columns(2)
@@ -126,7 +128,7 @@ if "nivel_cm" in df.columns and "status_bomba" in df.columns:
         title="Variação do Nível nas Últimas Leituras",
         labels={"timestamp": "Data/Hora", "nivel_cm": "Nível (cm)"},
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig)
 
     st.subheader("Últimos Registros")
     st.dataframe(df)
