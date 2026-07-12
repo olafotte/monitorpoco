@@ -168,6 +168,7 @@ if "nivel_cm" in df.columns:
         },
         markers=True,
     )
+    fig.update_yaxes(autorange="reversed")
 
     fig.add_hline(
         y=FUNDODOPOCO,
