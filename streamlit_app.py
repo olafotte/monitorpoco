@@ -5,6 +5,8 @@ import plotly.express as px
 import requests
 import streamlit as st
 
+FUNDODOPOCO = 210  # cm, distância do sensor à linha d'água quando o poço está seco
+
 st.set_page_config(page_title="Monitoramento de Poço - Condomínio", layout="wide")
 st.title("📊 Monitoramento do Poço de Drenagem")
 
@@ -125,23 +127,59 @@ if "timestamp" in df.columns:
     df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
     df = df.sort_values("timestamp").reset_index(drop=True)
 
-if "nivel_cm" in df.columns and "status_bomba" in df.columns:
+if "nivel_cm" in df.columns:
+    df["distancia_sensor_cm"] = pd.to_numeric(df["nivel_cm"], errors="coerce")
+    df["altura_agua_cm"] = (FUNDODOPOCO - df["distancia_sensor_cm"]).clip(lower=0)
+
     col1, col2 = st.columns(2)
     with col1:
-        nivel_atual = df["nivel_cm"].iloc[0]
-        st.metric(label="Nível Atual do Poço", value=f"{nivel_atual} cm")
+        distancia_atual = float(df["distancia_sensor_cm"].iloc[0])
+        st.metric(
+            label="Distância atual do sensor à linha d'água",
+            value=f"{distancia_atual:.0f} cm",
+        )
     with col2:
-        status_atual = df["status_bomba"].iloc[0]
-        st.metric(label="Status da Bomba", value=status_atual)
+        if "status_bomba" in df.columns:
+            status_atual = df["status_bomba"].iloc[0]
+            st.metric(label="Status da Bomba", value=status_atual)
+        else:
+            st.info("Coluna de status da bomba não encontrada na resposta.")
 
-    st.subheader("Histórico do Nível")
+    st.subheader("Diagnóstico do poço")
+    if pd.isna(distancia_atual):
+        st.warning("Sem leitura válida da distância do sensor à linha d'água.")
+    elif distancia_atual >= FUNDODOPOCO:
+        st.warning(f"⚠️ Poço seco: a distância do sensor à linha d'água é de {distancia_atual/100:.1f} m ou mais.")
+    elif distancia_atual <= 20:
+        st.error("🚨 Alerta: poço em eminência de transbordamento.")
+    else:
+        altura_agua_cm = float(df["altura_agua_cm"].iloc[0])
+        st.success(f"Nível estimado da água: {altura_agua_cm:.0f} cm acima do fundo do poço.")
+
+    st.subheader("Histórico da distância do sensor à linha d'água")
     fig = px.line(
         df,
         x="timestamp",
-        y="nivel_cm",
-        title="Variação do Nível nas Últimas Leituras",
-        labels={"timestamp": "Data/Hora", "nivel_cm": "Nível (cm)"},
+        y="distancia_sensor_cm",
+        title="Distância do sensor à linha d'água ao longo do tempo",
+        labels={
+            "timestamp": "Data/Hora",
+            "distancia_sensor_cm": "Distância sensor-água (cm)",
+        },
         markers=True,
+    )
+
+    fig.add_hline(
+        y=FUNDODOPOCO,
+        line_dash="dash",
+        line_color="red",
+        annotation_text=f"Poço seco (>= {FUNDODOPOCO} cm)",
+    )
+    fig.add_hline(
+        y=20,
+        line_dash="dash",
+        line_color="orange",
+        annotation_text=f"Transbordamento (<= {20} cm)",
     )
     st.plotly_chart(fig)
 
