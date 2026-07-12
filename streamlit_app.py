@@ -28,7 +28,7 @@ headers = {
 }
 
 # Query SQL
-sql_query = "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 200"
+sql_query = "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 300"
 
 # Testa vários formatos de payload que a API HTTP do Turso pode aceitar.
 payload_variants = [
