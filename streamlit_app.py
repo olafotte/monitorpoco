@@ -27,8 +27,21 @@ headers = {
     "Content-Type": "application/json",
 }
 
-# Query SQL
-sql_query = "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco ORDER BY id DESC LIMIT 300"
+st.sidebar.subheader("Configuração da consulta")
+record_limit = st.sidebar.number_input(
+    "Número de registros a carregar",
+    min_value=1,
+    max_value=10000,
+    value=300,
+    step=50,
+)
+
+# Query SQL: busca os últimos N registros do banco para exibir no gráfico.
+# Ordena por id em ordem decrescente para trazer o histórico mais recente primeiro.
+sql_query = (
+    "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
+    f"ORDER BY id DESC LIMIT {int(record_limit)}"
+)
 
 # Testa vários formatos de payload que a API HTTP do Turso pode aceitar.
 payload_variants = [
@@ -110,6 +123,7 @@ if "timestamp" in df.columns:
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     # Ajustar para o horário de Brasília
     df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
+    df = df.sort_values("timestamp").reset_index(drop=True)
 
 if "nivel_cm" in df.columns and "status_bomba" in df.columns:
     col1, col2 = st.columns(2)
