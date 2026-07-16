@@ -5,7 +5,7 @@ import plotly.express as px
 import requests
 import streamlit as st
 
-FUNDODOPOCO = 210  # cm, distância do sensor à linha d'água quando o poço está seco
+FUNDODOPOCO = 150  # cm, distância do sensor à linha d'água quando o poço está seco
 
 st.set_page_config(page_title="Monitoramento de Poço - Condomínio", layout="wide")
 st.title("📊 Monitoramento do Poço de Drenagem")
