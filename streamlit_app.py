@@ -151,7 +151,7 @@ if "nivel_cm" in df.columns:
     elif distancia_atual >= FUNDODOPOCO:
         st.warning(f"⚠️ Poço seco: a distância do sensor à linha d'água é de {distancia_atual/100:.1f} m ou mais.")
     elif distancia_atual <= 20:
-        st.error("🚨 Alerta: poço em eminência de transbordamento.")
+        st.warning(f"⚠️ Atenção: poço em eminência de transbordamento (<= {20} cm).")
     else:
         altura_agua_cm = float(df["altura_agua_cm"].iloc[0])
         st.success(f"Nível estimado da água: {altura_agua_cm:.0f} cm acima do fundo do poço.")
@@ -180,7 +180,7 @@ if "nivel_cm" in df.columns:
         y=20,
         line_dash="dash",
         line_color="orange",
-        annotation_text=f"Transbordamento (<= {20} cm)",
+        annotation_text=f"Nível de atenção (<= {20} cm)",
     )
     st.plotly_chart(fig)
 
