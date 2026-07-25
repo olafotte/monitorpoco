@@ -326,8 +326,9 @@ with tab1:
     fig.update_layout(
         yaxis=dict(autorange="reversed", title="Distância até o Sensor (cm)"),
         xaxis=dict(title="Data / Hora"),
+        legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
         height=500,
-        margin=dict(l=20, r=20, t=30, b=20),
+        margin=dict(l=20, r=20, t=30, b=40),
     )
     st.plotly_chart(fig, use_container_width=True)
 
