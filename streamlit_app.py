@@ -51,16 +51,32 @@ d_off = st.sidebar.number_input(
     "Nível Desativação Bomba (cm)", value=90.0, step=0.5, help="Distância quando a bomba desliga (água baixa)"
 )
 d_overflow = st.sidebar.number_input(
-    "Nível Crítico de Transbordo (cm)", value=65.0, step=0.5, help="Distância crítica do sensor onde o poço transborda"
+    "Nível Crítico de Transbordo (cm)", value=0.0, step=0.5, help="Distância crítica do sensor onde o poço transborda"
 )
 r_gnd_param = st.sidebar.number_input(
     "Taxa Lençol Freático (cm/h)", value=1.44, step=0.1
 )
-r_pump_param = st.sidebar.number_input(
-    "Vazão de Esvaziamento Bomba (cm/h)", value=76.6, step=1.0, help="Capacidade nominal da bomba (14 m³/h)"
+vazao_bomba_m3h = st.sidebar.number_input(
+    "Capacidade da Bomba (m³/h)", value=14.0, step=0.5,
+    help="Vazão nominal da bomba em metros cúbicos por hora"
 )
+fator_m3h_para_cmh = st.sidebar.number_input(
+    "Fator de Conversão (cm/h por m³/h)", value=5.471, step=0.01, format="%.3f",
+    help="Fator que converte m³/h em cm/h de variação no poço (depende da área da seção transversal). "
+         "Calculado como: 100 / (Área do poço em m²). Ex.: bomba de 14 m³/h → 76.6 cm/h ⟹ fator ≈ 5.471"
+)
+r_pump_param = vazao_bomba_m3h * fator_m3h_para_cmh
+st.sidebar.caption(f"↳ Vazão equivalente: **{r_pump_param:.2f} cm/h**")
 factor_mm_cm = st.sidebar.number_input(
     "Fator de Amplificação (cm de poço / mm de chuva)", value=2.83, step=0.1, help="Relação calibrada na chuva de 22/07 (54mm -> 153cm no poço)"
+)
+
+st.sidebar.header("🌍 Localização Meteorológica")
+latitude = st.sidebar.number_input(
+    "Latitude", value=-26.9265068, format="%.4f", help="Latitude do local monitorado"
+)
+longitude = st.sidebar.number_input(
+    "Longitude", value=-49.0687619, format="%.4f", help="Longitude do local monitorado"
 )
 
 sql_query = (
@@ -250,8 +266,100 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+@st.cache_data(ttl=1800)
+def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
+    """Busca dados horários de precipitação na API Open-Meteo.
+    Retorna DataFrame com índice datetime e coluna 'precipitation' (mm/h).
+    Inclui histórico (archive) e previsão (forecast) conforme as datas solicitadas."""
+    today = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
+    start_ts = pd.Timestamp(start_date, tz="America/Sao_Paulo")
+    end_ts = pd.Timestamp(end_date, tz="America/Sao_Paulo")
+
+    frames = []
+
+    # Histórico via open-meteo archive
+    archive_end = min(end_ts, today - pd.Timedelta(days=1))
+    if start_ts <= archive_end:
+        url_archive = "https://archive-api.open-meteo.com/v1/archive"
+        params_archive = {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": start_ts.strftime("%Y-%m-%d"),
+            "end_date": archive_end.strftime("%Y-%m-%d"),
+            "hourly": "precipitation",
+            "timezone": "America/Sao_Paulo",
+        }
+        try:
+            r = requests.get(url_archive, params=params_archive, timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
+                precip = d["hourly"]["precipitation"]
+                frames.append(pd.DataFrame({"precipitation": precip}, index=times))
+        except Exception:
+            pass
+
+    # Previsão via open-meteo forecast
+    forecast_start = max(start_ts, today)
+    if forecast_start <= end_ts:
+        url_forecast = "https://api.open-meteo.com/v1/forecast"
+        params_forecast = {
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "precipitation",
+            "timezone": "America/Sao_Paulo",
+            "forecast_days": 7,
+        }
+        try:
+            r = requests.get(url_forecast, params=params_forecast, timeout=15)
+            if r.status_code == 200:
+                d = r.json()
+                times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
+                precip = d["hourly"]["precipitation"]
+                frames.append(pd.DataFrame({"precipitation": precip}, index=times))
+        except Exception:
+            pass
+
+    if not frames:
+        return pd.DataFrame(columns=["precipitation"])
+
+    result = pd.concat(frames).sort_index()
+    result = result[~result.index.duplicated(keep="first")]
+    return result
+
+
+def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex) -> pd.Series:
+    """Distribui precipitação horária em intervalos de 5 minutos (mm / 5min).
+    Cada hora é dividida igualmente pelos 12 períodos de 5 min que a compõem."""
+    if weather_df.empty:
+        return pd.Series(0.0, index=grid_index, name="precipitation_5min")
+
+    # Reindex na grade de 5min usando forward-fill para mapear cada hora
+    hourly = weather_df["precipitation"].copy()
+    # Dividir por 12 para obter mm por 5min
+    precip_5min = hourly / 12.0
+    # Reindexar para a grade do sensor
+    precip_reindexed = precip_5min.reindex(
+        precip_5min.index.union(grid_index)
+    ).ffill().reindex(grid_index).fillna(0.0)
+    precip_reindexed.name = "precipitation_5min"
+    return precip_reindexed
+
+
 processed_df = preprocess_time_series(df)
 filled_df = fill_gaps(processed_df)
+
+# Buscar dados meteorológicos alinhados ao período do sensor
+_sensor_min = filled_df["dt_round"].min()
+_sensor_max = filled_df["dt_round"].max()
+_weather_start = (_sensor_min - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+_weather_end = (pd.Timestamp.now(tz="America/Sao_Paulo") + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+
+weather_df = fetch_weather_data(latitude, longitude, _weather_start, _weather_end)
+
+# Precipitação em 5min alinhada ao grid do sensor
+precip_5min_series = build_precip_5min(weather_df, filled_df["dt_round"])
+filled_df["precipitation_5min"] = precip_5min_series.values
 
 latest_valid = filled_df[filled_df["nivel_cm"].notna()]
 if not latest_valid.empty:
@@ -297,13 +405,31 @@ col2.metric("Leituras Validadas", f"{total_obs - missing_obs:,}")
 col3.metric("Dados Preenchidos (Gaps)", f"{missing_obs:,} ({missing_pct:.1f}%)")
 col4.metric("Faixa de Operação", f"{d_on:.1f} cm - {d_off:.1f} cm")
 
-tab1, tab2, tab3 = st.tabs(["📊 Visualização e Imputação", "📐 Modelo Matemático", "🌧️ Simulador Pluviométrico"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Visualização e Imputação", "📐 Modelo Matemático", "🌧️ Simulador Pluviométrico", "🌦️ Chuvas", "🔮 Previsão do Nível"])
 
 with tab1:
     st.subheader("Série Temporal do Nível do Poço")
-    st.caption("O eixo Y é invertido para refletir a altura real da água no poço (valores menores de distância = nível de água mais alto).")
+    st.caption(
+        "O eixo Y esquerdo (invertido) mostra a distância do sensor à linha d'água. "
+        "O eixo Y direito mostra a precipitação acumulada em cada intervalo de 5 minutos."
+    )
+
+    has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
 
     fig = go.Figure()
+
+    # Barras de precipitação no eixo secundário (renderizadas primeiro para ficarem atrás)
+    if has_rain_data:
+        fig.add_trace(
+            go.Bar(
+                x=filled_df["dt_round"],
+                y=filled_df["precipitation_5min"],
+                name="Chuva (mm / 5min)",
+                marker_color="rgba(30, 144, 255, 0.35)",
+                yaxis="y2",
+            )
+        )
+
     fig.add_trace(
         go.Scatter(
             x=filled_df["dt_round"],
@@ -326,13 +452,29 @@ with tab1:
     fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bomba Desliga (Água Baixa)")
     fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Nível Crítico / Transbordo")
     fig.update_layout(
-        yaxis=dict(autorange="reversed", title="Distância até o Sensor (cm)"),
+        yaxis=dict(
+            autorange="reversed",
+            title="Distância até o Sensor (cm)",
+        ),
+        yaxis2=dict(
+            title="Precipitação (mm / 5min)",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            rangemode="tozero",
+            tickfont=dict(color="rgba(30, 144, 255, 0.8)"),
+            title_font=dict(color="rgba(30, 144, 255, 0.8)"),
+        ),
         xaxis=dict(title="Data / Hora"),
         legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
-        height=500,
-        margin=dict(l=20, r=20, t=30, b=40),
+        height=520,
+        margin=dict(l=20, r=60, t=30, b=40),
+        bargap=0,
     )
     st.plotly_chart(fig, use_container_width=True)
+
+    if not has_rain_data:
+        st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
 
     st.subheader("Últimos Registros")
     st.dataframe(filled_df)
@@ -436,3 +578,377 @@ with tab3:
         )
     else:
         st.info("ℹ️ Nenhum transbordamento previsto para este cenário específico.")
+
+with tab4:
+    st.subheader("🌦️ Dados de Precipitação – Open-Meteo")
+    st.caption(f"Localização: lat {latitude:.4f}, lon {longitude:.4f} | Fonte: Open-Meteo (histórico + previsão 7 dias)")
+
+    if weather_df.empty:
+        st.error("Não foi possível obter dados de precipitação da API Open-Meteo. Verifique a conexão ou as coordenadas.")
+    else:
+        now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+
+        # Separar histórico e previsão
+        hist_df = weather_df[weather_df.index <= now_tz].copy()
+        fcast_df = weather_df[weather_df.index > now_tz].copy()
+
+        # Métricas principais
+        last_24h = weather_df[weather_df.index >= (now_tz - pd.Timedelta(hours=24))]
+        next_24h = weather_df[
+            (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=24)))
+        ]
+        next_48h = weather_df[
+            (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=48)))
+        ]
+        max_intensity = weather_df["precipitation"].max()
+
+        col_w1, col_w2, col_w3, col_w4 = st.columns(4)
+        col_w1.metric("Acumulado últimas 24h", f"{last_24h['precipitation'].sum():.1f} mm")
+        col_w2.metric("Previsão próximas 24h", f"{next_24h['precipitation'].sum():.1f} mm")
+        col_w3.metric("Previsão próximas 48h", f"{next_48h['precipitation'].sum():.1f} mm")
+        col_w4.metric("Intensidade máxima (período)", f"{max_intensity:.1f} mm/h")
+
+        st.markdown("---")
+
+        # Gráfico de precipitação horária completo
+        st.subheader("Precipitação Horária – Histórico e Previsão")
+        fig_rain = go.Figure()
+
+        if not hist_df.empty:
+            fig_rain.add_trace(
+                go.Bar(
+                    x=hist_df.index,
+                    y=hist_df["precipitation"],
+                    name="Histórico (mm/h)",
+                    marker_color="rgba(30, 100, 220, 0.7)",
+                )
+            )
+
+        if not fcast_df.empty:
+            fig_rain.add_trace(
+                go.Bar(
+                    x=fcast_df.index,
+                    y=fcast_df["precipitation"],
+                    name="Previsão (mm/h)",
+                    marker_color="rgba(100, 200, 100, 0.7)",
+                )
+            )
+
+        _now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
+        fig_rain.add_shape(
+            type="line",
+            x0=_now_str,
+            x1=_now_str,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(dash="dash", color="orange", width=1.5),
+        )
+        fig_rain.add_annotation(
+            x=_now_str,
+            y=1,
+            yref="paper",
+            text="Agora",
+            showarrow=False,
+            xanchor="left",
+            font=dict(color="orange"),
+        )
+        fig_rain.update_layout(
+            xaxis_title="Data / Hora",
+            yaxis_title="Precipitação (mm/h)",
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+            height=420,
+            bargap=0,
+            margin=dict(l=20, r=20, t=20, b=40),
+        )
+        st.plotly_chart(fig_rain, use_container_width=True)
+
+        # Previsão detalhada próximas 48h
+        st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
+        if not next_48h.empty:
+            fcast_table = next_48h.copy()
+            fcast_table.index = fcast_table.index.strftime("%d/%m/%Y %H:%M")
+            fcast_table.columns = ["Precipitação (mm/h)"]
+            fcast_table = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
+            if fcast_table.empty:
+                st.success("✅ Nenhuma precipitação prevista nas próximas 48 horas.")
+            else:
+                st.dataframe(fcast_table, use_container_width=True)
+                total_prev = next_48h["precipitation"].sum()
+                nivel_equiv_cm = total_prev * factor_mm_cm
+                st.info(
+                    f"📈 Volume previsto de **{total_prev:.1f} mm** equivale a uma variação estimada de "
+                    f"**{nivel_equiv_cm:.1f} cm** no nível do poço (fator {factor_mm_cm:.2f} cm/mm)."
+                )
+        else:
+            st.info("Dados de previsão não disponíveis.")
+
+        # Histórico completo dos últimos 7 dias
+        with st.expander("📂 Ver histórico completo de precipitação (últimos 7 dias)"):
+            if not hist_df.empty:
+                show_hist = hist_df.copy()
+                show_hist.index = show_hist.index.strftime("%d/%m/%Y %H:%M")
+                show_hist.columns = ["Precipitação (mm/h)"]
+                st.dataframe(show_hist, use_container_width=True)
+            else:
+                st.write("Sem dados históricos disponíveis.")
+
+with tab5:
+    st.subheader("🔮 Previsão do Nível do Poço – Próximas 48 Horas")
+    st.caption(
+        "Simulação a partir do nível atual real do sensor, aplicando o modelo de balanço de massa "
+        "com a previsão horária de precipitação da Open-Meteo."
+    )
+
+    now_tz5 = pd.Timestamp.now(tz="America/Sao_Paulo")
+
+    # Previsão de precipitação nas próximas 48h (dados horários)
+    fcast_48h = pd.DataFrame()
+    if not weather_df.empty:
+        fcast_48h = weather_df[
+            (weather_df.index > now_tz5) &
+            (weather_df.index <= now_tz5 + pd.Timedelta(hours=48))
+        ].copy()
+
+    # Controles da simulação
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        bomba_status5 = st.selectbox(
+            "Status da Bomba para Previsão",
+            ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"],
+            key="bomba_status_tab5",
+        )
+    with col_s2:
+        horizonte_h = st.slider(
+            "Horizonte da Previsão (horas)", min_value=6, max_value=48, value=24, step=6,
+            key="horizonte_tab5",
+        )
+
+    # Nível inicial = último valor real do sensor
+    nivel_inicial_cm = latest_distance if latest_distance is not None else d_off
+    st.info(
+        f"📍 Nível de partida: **{nivel_inicial_cm:.1f} cm** (distância sensor→água) "
+        f"| Leitura de: **{latest_row['dt_round'].strftime('%d/%m/%Y %H:%M') if 'dt_round' in latest_row and not pd.isna(latest_row.get('dt_round')) else 'última leitura'}**"
+    )
+
+    # Simular em passos de 5 minutos usando a previsão horária
+    dt_min = 5.0  # minutos por passo
+    dt_h_step = dt_min / 60.0
+    n_steps = int(horizonte_h * 60 / dt_min)
+
+    sim_times = [now_tz5 + pd.Timedelta(minutes=dt_min * i) for i in range(n_steps + 1)]
+    sim_levels = []
+    sim_pump_state = []
+    sim_rain_rate = []  # cm/h de entrada por chuva em cada passo
+
+    curr_d5 = nivel_inicial_cm
+    pump_on = curr_d5 <= d_on  # se já está com água alta, bomba começa ligada
+    overflow5 = False
+    overflow5_time = None
+
+    for i, t in enumerate(sim_times):
+        # Precipitação horária correspondente ao instante t
+        if not fcast_48h.empty:
+            # pegar a hora exata ou anterior mais próxima
+            idx_candidates = fcast_48h.index[fcast_48h.index <= t]
+            if len(idx_candidates) > 0:
+                precip_mmh = float(fcast_48h.loc[idx_candidates[-1], "precipitation"])
+            else:
+                precip_mmh = 0.0
+        else:
+            precip_mmh = 0.0
+
+        # Taxa de entrada no poço (lençol + chuva)
+        r_chuva_cm_h = precip_mmh * factor_mm_cm
+        r_total_entrada = r_gnd_param + r_chuva_cm_h  # cm/h
+        sim_rain_rate.append(r_chuva_cm_h)
+
+        # Gravar o nível antes de avançar
+        sim_levels.append(curr_d5)
+        sim_pump_state.append(pump_on)
+
+        # Checar transbordo
+        if not overflow5 and curr_d5 <= d_overflow:
+            overflow5 = True
+            overflow5_time = t
+
+        if i == n_steps:
+            break
+
+        # Avançar o nível
+        if bomba_status5 == "Falha / Sem Energia (Desligada)":
+            curr_d5 -= r_total_entrada * dt_h_step
+        else:
+            if pump_on:
+                curr_d5 += (r_pump_param - r_total_entrada) * dt_h_step
+                if curr_d5 >= d_off:
+                    pump_on = False
+            else:
+                curr_d5 -= r_total_entrada * dt_h_step
+                if curr_d5 <= d_on:
+                    pump_on = True
+        curr_d5 = max(curr_d5, d_overflow - 10)  # limitar para não sair do gráfico
+
+    sim_df = pd.DataFrame({
+        "datetime": sim_times[:len(sim_levels)],
+        "nivel_cm": sim_levels,
+        "bomba_ligada": sim_pump_state,
+        "r_chuva_cm_h": sim_rain_rate,
+    })
+
+    # ── Métricas resumo ──
+    nivel_final = sim_levels[-1]
+    nivel_min = min(sim_levels)
+    chuva_total_prev = fcast_48h["precipitation"].sum() if not fcast_48h.empty else 0.0
+    chuva_periodo = (
+        weather_df[
+            (weather_df.index > now_tz5) &
+            (weather_df.index <= now_tz5 + pd.Timedelta(hours=horizonte_h))
+        ]["precipitation"].sum()
+        if not weather_df.empty else 0.0
+    )
+
+    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+    col_m1.metric("Nível Atual (Partida)", f"{nivel_inicial_cm:.1f} cm")
+    col_m2.metric(f"Nível Previsto em {horizonte_h}h", f"{nivel_final:.1f} cm",
+                  delta=f"{nivel_final - nivel_inicial_cm:+.1f} cm",
+                  delta_color="inverse")
+    col_m3.metric("Nível Mais Crítico Previsto", f"{nivel_min:.1f} cm")
+    col_m4.metric(f"Chuva prevista ({horizonte_h}h)", f"{chuva_periodo:.1f} mm")
+
+    st.markdown("---")
+
+    # ── Gráfico principal ──
+    fig5 = go.Figure()
+
+    # Barras de chuva prevista (eixo secundário)
+    if not fcast_48h.empty:
+        fcast_plot = fcast_48h[fcast_48h.index <= now_tz5 + pd.Timedelta(hours=horizonte_h)]
+        if not fcast_plot.empty:
+            fig5.add_trace(
+                go.Bar(
+                    x=fcast_plot.index,
+                    y=fcast_plot["precipitation"],
+                    name="Precipitação Prevista (mm/h)",
+                    marker_color="rgba(30, 144, 255, 0.3)",
+                    yaxis="y2",
+                )
+            )
+
+    # Linha do nível simulado colorida por estado da bomba
+    # Segmentos: bomba ligada = vermelho, desligada = azul
+    colors_pump = ["#e74c3c" if b else "#2980b9" for b in sim_df["bomba_ligada"]]
+    # Plotar como scatter com cores contínuas
+    fig5.add_trace(
+        go.Scatter(
+            x=sim_df["datetime"],
+            y=sim_df["nivel_cm"],
+            mode="lines",
+            name="Nível Simulado",
+            line=dict(color="#2980b9", width=2.5),
+            hovertemplate="<b>%{x|%d/%m %H:%M}</b><br>Dist. sensor: %{y:.1f} cm<extra></extra>",
+        )
+    )
+
+    # Ponto de partida
+    fig5.add_trace(
+        go.Scatter(
+            x=[now_tz5],
+            y=[nivel_inicial_cm],
+            mode="markers",
+            name="Nível Atual (Real)",
+            marker=dict(size=12, color="#f39c12", symbol="star"),
+        )
+    )
+
+    # Linhas de referência
+    fig5.add_hline(y=d_on, line_dash="dash", line_color="red",
+                   annotation_text="Bomba Liga", annotation_position="top right")
+    fig5.add_hline(y=d_off, line_dash="dash", line_color="green",
+                   annotation_text="Bomba Desliga", annotation_position="top right")
+    fig5.add_hline(y=d_overflow, line_dash="dot", line_color="black",
+                   annotation_text="Nível Crítico", annotation_position="top right")
+
+    # Linha vertical "Agora"
+    _now5_str = now_tz5.strftime("%Y-%m-%d %H:%M:%S")
+    fig5.add_shape(
+        type="line", x0=_now5_str, x1=_now5_str, y0=0, y1=1, yref="paper",
+        line=dict(dash="dash", color="orange", width=1.5),
+    )
+    fig5.add_annotation(
+        x=_now5_str, y=0.98, yref="paper", text="Agora",
+        showarrow=False, xanchor="left", font=dict(color="orange", size=11),
+    )
+
+    # Zona crítica de transbordo (faixa cinza)
+    fig5.add_hrect(
+        y0=0, y1=d_overflow,
+        fillcolor="rgba(231,76,60,0.08)",
+        line_width=0,
+        annotation_text="Zona de Transbordo",
+        annotation_position="top left",
+        annotation_font_color="#e74c3c",
+    )
+
+    fig5.update_layout(
+        yaxis=dict(
+            autorange="reversed",
+            title="Distância Sensor → Água (cm)",
+        ),
+        yaxis2=dict(
+            title="Precipitação (mm/h)",
+            overlaying="y",
+            side="right",
+            showgrid=False,
+            rangemode="tozero",
+            tickfont=dict(color="rgba(30, 144, 255, 0.7)"),
+            title_font=dict(color="rgba(30, 144, 255, 0.7)"),
+        ),
+        xaxis=dict(title="Data / Hora"),
+        legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
+        height=540,
+        margin=dict(l=20, r=70, t=30, b=50),
+        bargap=0,
+    )
+    st.plotly_chart(fig5, use_container_width=True)
+
+    # ── Alertas ──
+    if overflow5:
+        st.error(
+            f"🚨 **ALERTA DE TRANSBORDO PREVISTO:** o poço deve atingir o nível crítico "
+            f"({d_overflow} cm) em **{overflow5_time.strftime('%d/%m %H:%M')}** "
+            f"({(overflow5_time - now_tz5).seconds // 3600}h "
+            f"{((overflow5_time - now_tz5).seconds % 3600) // 60}min a partir de agora)."
+        )
+    else:
+        intensidade_max_prev = fcast_48h["precipitation"].max() if not fcast_48h.empty else 0.0
+        intensidade_sat = r_pump_param / factor_mm_cm
+        if intensidade_max_prev > intensidade_sat and bomba_status5 == "Operacional (Ligada)":
+            st.warning(
+                f"⚠️ **Atenção:** a previsão inclui intensidades de até **{intensidade_max_prev:.1f} mm/h**, "
+                f"acima do limite de saturação da bomba ({intensidade_sat:.1f} mm/h). "
+                "Monitorar de perto."
+            )
+        else:
+            st.success("✅ Nenhum transbordo previsto no horizonte selecionado.")
+
+    # ── Tabela de detalhes horáros ──
+    with st.expander("📋 Ver tabela de evolução horária simulada"):
+        hourly_sim = sim_df.set_index("datetime").resample("1h").first()
+        hourly_sim["Bomba"] = hourly_sim["bomba_ligada"].map({True: "🔴 Ligada", False: "🟢 Desligada"})
+        hourly_sim["Entrada por Chuva (cm/h)"] = hourly_sim["r_chuva_cm_h"].round(2)
+        hourly_sim["Nível (dist. sensor, cm)"] = hourly_sim["nivel_cm"].round(1)
+        hourly_sim["Altura Água (cm)"] = (FUNDODOPOCO - hourly_sim["nivel_cm"]).clip(lower=0).round(1)
+
+        # Merge com precipitação horária prevista
+        if not fcast_48h.empty:
+            fcast_merge = fcast_48h.resample("1h").sum().rename(columns={"precipitation": "Chuva Prevista (mm/h)"})
+            hourly_sim = hourly_sim.join(fcast_merge, how="left")
+            hourly_sim["Chuva Prevista (mm/h)"] = hourly_sim["Chuva Prevista (mm/h)"].fillna(0.0).round(2)
+
+        display_cols = ["Nível (dist. sensor, cm)", "Altura Água (cm)", "Bomba", "Entrada por Chuva (cm/h)"]
+        if "Chuva Prevista (mm/h)" in hourly_sim.columns:
+            display_cols.append("Chuva Prevista (mm/h)")
+
+        hourly_sim.index = hourly_sim.index.strftime("%d/%m/%Y %H:%M")
+        st.dataframe(hourly_sim[display_cols], use_container_width=True)
