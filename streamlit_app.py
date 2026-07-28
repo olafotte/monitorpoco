@@ -164,6 +164,7 @@ if "status_bomba" not in df.columns:
 @st.cache_data
 def preprocess_time_series(input_df: pd.DataFrame) -> pd.DataFrame:
     df = input_df.copy()
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     # Ajustar para o horário de Brasília
     df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
     df["nivel_cm"] = pd.to_numeric(df["nivel_cm"], errors="coerce")
