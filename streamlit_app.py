@@ -2425,6 +2425,11 @@ with tab9:
 - O poço tem capacidade total de **{capacidade_total_cm:.0f} cm** de coluna d'água:
   {FUNDODOPOCO} cm do sensor até o fundo + {dist_borda_cm:.0f} cm do sensor até a borda superior.
 
+💡 **Nota Técnica — Por que a área/volume equivalente é maior que a seção do cilindro de concreto?**
+> Embora a camisa cilíndrica de concreto do poço tenha um diâmetro físico de **1,20 m** (seção transversal de **1,13 m²**), o poço não opera de forma isolada. As galerias e tubulações de drenagem que deságuam nele estão instaladas em diferentes cotas com inclinação suave (semi-horizontais).
+>
+> Quando o nível de água sobe no poço, ocorre o **efeito de remanso (backwater effect)**: a água retrocede e invade a rede de tubulações a montante. Para subir cada 1 cm no sensor do poço, a chuva precisa preencher não apenas o tubo vertical do poço, mas também metros de galerias conectadas (*Pipe Storage*). Esse volume em rede funciona como um **reservatório de amortecimento físico**, fazendo com que a seção acumuladora equivalente de água se comporte como uma área significativamente maior do que a camisa cilíndrica de 1,20 m.
+
 | Parâmetro | Valor | Interpretação |
 |---|---|---|
 | Profundidade sensor → fundo | **{FUNDODOPOCO} cm** | Reservatório principal de água |
@@ -2436,6 +2441,7 @@ with tab9:
 | Fator correção ERA5 aplicado | **×{era5_correction:.2f}** | Ajuste dos dados climáticos (ver Seção 2) |
         """
     )
+
 
     # -- SEÇÃO 2: BASE DE DADOS -----------------------------------------------------------------
     st.markdown("### 2. Base de Dados Pluviométrica Utilizada")
@@ -2765,7 +2771,7 @@ um transbordamento esperado *no pior caso* a cada 25 anos de operação.
                     f"remover **{r_pump_param:.1f} cm/h**. A diferença de **{_excesso_norma:.1f} cm/h** "
                     f"faz o nível subir mesmo com a bomba ligada. Com os **{dist_borda_cm:.0f} cm** de "
                     f"buffer disponível, o poço levaria cerca de **{_t_buf:.0f} minutos** para transbordar "
-                    f"(assumindo chuva contínua na intensidade máxima — o que raramente ocorre na prática)."
+                    f"(assumindo chuva contínua na intensidade máxima — o que raramente ocorre na prática, mas é teoricamente possível e por isso a norma exige esse cálculo)."
                 )
 
         # Recomendações
