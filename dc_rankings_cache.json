@@ -1,0 +1,366 @@
+{
+  "gerado_em": "2026-07-30T13:38:31.654075",
+  "fonte": "https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas",
+  "dados": {
+    "15min": [
+      {
+        "Estação": "Passo Manso",
+        "Região": "Oeste",
+        "Data/Hora": "29/03/2023 19:30",
+        "Acumulado_mm": 43.0,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Coripós",
+        "Região": "Oeste",
+        "Data/Hora": "16/01/2018 16:45",
+        "Acumulado_mm": 41.0,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Passo Manso",
+        "Região": "Oeste",
+        "Data/Hora": "13/10/2017 17:30",
+        "Acumulado_mm": 40.8,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Glória",
+        "Região": "Sul",
+        "Data/Hora": "08/01/2015 18:45",
+        "Acumulado_mm": 39.2,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Velha Central",
+        "Região": "Oeste",
+        "Data/Hora": "20/02/2016 17:30",
+        "Acumulado_mm": 38.8,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Ruy Barbosa",
+        "Região": "Sul",
+        "Data/Hora": "04/01/2017 16:30",
+        "Acumulado_mm": 38.6,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Araranguá",
+        "Região": "Sul",
+        "Data/Hora": "02/02/2019 19:00",
+        "Acumulado_mm": 37.6,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Tatutiba",
+        "Região": "Norte",
+        "Data/Hora": "27/01/2022 16:15",
+        "Acumulado_mm": 36.2,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "13/02/2025 16:30",
+        "Acumulado_mm": 35.4,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      },
+      {
+        "Estação": "Itoupava Central",
+        "Região": "Norte",
+        "Data/Hora": "17/01/2019 17:15",
+        "Acumulado_mm": 35.4,
+        "ultima_atualizacao": "20/02/2025 09:13"
+      }
+    ],
+    "30min": [
+      {
+        "Estação": "Coripós",
+        "Região": "Oeste",
+        "Data/Hora": "16/01/2018 17:00",
+        "Acumulado_mm": 67.2,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Ruy Barbosa",
+        "Região": "Sul",
+        "Data/Hora": "04/01/2017 16:30",
+        "Acumulado_mm": 65.4,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Velha Central",
+        "Região": "Oeste",
+        "Data/Hora": "20/02/2016 17:30",
+        "Acumulado_mm": 64.6,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "17/01/2019 17:15",
+        "Acumulado_mm": 63.8,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "20/02/2016 17:45",
+        "Acumulado_mm": 62.2,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Passo Manso",
+        "Região": "Oeste",
+        "Data/Hora": "29/03/2023 19:45",
+        "Acumulado_mm": 58.4,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Ponte Adolfo Konder",
+        "Região": "Central",
+        "Data/Hora": "13/02/2025 17:00",
+        "Acumulado_mm": 58.2,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Glória",
+        "Região": "Sul",
+        "Data/Hora": "08/01/2015 19:00",
+        "Acumulado_mm": 58.2,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Tatutiba",
+        "Região": "Norte",
+        "Data/Hora": "27/01/2022 16:30",
+        "Acumulado_mm": 58.0,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      },
+      {
+        "Estação": "Velha Grande",
+        "Região": "Oeste",
+        "Data/Hora": "05/03/2017 18:45",
+        "Acumulado_mm": 56.8,
+        "ultima_atualizacao": "20/02/2025 09:56"
+      }
+    ],
+    "01h": [
+      {
+        "Estação": "Velha Grande",
+        "Região": "Oeste",
+        "Data/Hora": "05/03/2017 19:15",
+        "Acumulado_mm": 101.0,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "05/04/2026 15:55",
+        "Acumulado_mm": 93.0,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Ruy Barbosa",
+        "Região": "Sul",
+        "Data/Hora": "04/01/2017 16:45",
+        "Acumulado_mm": 89.0,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Tatutiba",
+        "Região": "Norte",
+        "Data/Hora": "12/02/2025 19:15",
+        "Acumulado_mm": 86.6,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Velha Central",
+        "Região": "Oeste",
+        "Data/Hora": "20/02/2016 18:00",
+        "Acumulado_mm": 85.2,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Glória",
+        "Região": "Sul",
+        "Data/Hora": "08/01/2015 19:15",
+        "Acumulado_mm": 85.0,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "17/01/2019 17:30",
+        "Acumulado_mm": 84.2,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Coripós",
+        "Região": "Oeste",
+        "Data/Hora": "16/01/2018 17:30",
+        "Acumulado_mm": 83.4,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "12/02/2025 18:30",
+        "Acumulado_mm": 83.2,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "13/02/2025 17:00",
+        "Acumulado_mm": 81.8,
+        "ultima_atualizacao": "06/04/2026 12:16"
+      }
+    ],
+    "24h": [
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "13/02/2025 17:30",
+        "Acumulado_mm": 222.8,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Itoupava Central",
+        "Região": "Norte",
+        "Data/Hora": "13/02/2025 17:30",
+        "Acumulado_mm": 176.4,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Jordão",
+        "Região": "Sul",
+        "Data/Hora": "17/01/2025 07:30",
+        "Acumulado_mm": 170.4,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Nova Esperança",
+        "Região": "Leste",
+        "Data/Hora": "17/01/2025 07:00",
+        "Acumulado_mm": 170.0,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Tatutiba",
+        "Região": "Norte",
+        "Data/Hora": "13/02/2025 18:00",
+        "Acumulado_mm": 166.2,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Glória",
+        "Região": "Sul",
+        "Data/Hora": "17/01/2025 15:45",
+        "Acumulado_mm": 162.8,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Nova Esperança",
+        "Região": "Leste",
+        "Data/Hora": "27/11/2022 10:30",
+        "Acumulado_mm": 162.2,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Ruy Barbosa",
+        "Região": "Sul",
+        "Data/Hora": "05/01/2017 15:45",
+        "Acumulado_mm": 155.8,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Itoupava Central",
+        "Região": "Norte",
+        "Data/Hora": "27/11/2022 10:30",
+        "Acumulado_mm": 153.4,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      },
+      {
+        "Estação": "Ruy Barbosa",
+        "Região": "Sul",
+        "Data/Hora": "17/01/2025 15:30",
+        "Acumulado_mm": 150.6,
+        "ultima_atualizacao": "20/02/2025 11:13"
+      }
+    ],
+    "96h": [
+      {
+        "Estação": "Itoupava Central",
+        "Região": "Norte",
+        "Data/Hora": "30/11/2022 13:00",
+        "Acumulado_mm": 286.0,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Nova Esperança",
+        "Região": "Leste",
+        "Data/Hora": "30/11/2022 06:00",
+        "Acumulado_mm": 269.8,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Tatutiba",
+        "Região": "Norte",
+        "Data/Hora": "30/11/2022 13:15",
+        "Acumulado_mm": 262.4,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Fidelis",
+        "Região": "Norte",
+        "Data/Hora": "30/11/2022 12:30",
+        "Acumulado_mm": 254.6,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "16/02/2025 12:45",
+        "Acumulado_mm": 248.6,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Vila Itoupava",
+        "Região": "Norte",
+        "Data/Hora": "30/11/2022 09:15",
+        "Acumulado_mm": 239.4,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Glória",
+        "Região": "Sul",
+        "Data/Hora": "19/01/2025 22:45",
+        "Acumulado_mm": 229.6,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Itoupavazinha",
+        "Região": "Norte",
+        "Data/Hora": "30/11/2022 13:15",
+        "Acumulado_mm": 229.6,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Jordão",
+        "Região": "Sul",
+        "Data/Hora": "19/01/2025 22:45",
+        "Acumulado_mm": 220.8,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      },
+      {
+        "Estação": "Nova Esperança",
+        "Região": "Leste",
+        "Data/Hora": "20/01/2025 01:30",
+        "Acumulado_mm": 216.6,
+        "ultima_atualizacao": "20/02/2025 12:03"
+      }
+    ]
+  }
+}

@@ -1,8 +1,8 @@
 import os
+import json
 import re
 import warnings
 
-from bs4 import BeautifulSoup
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -489,36 +489,67 @@ col4.metric("Faixa de Operação", f"{d_on:.1f} cm - {d_off:.1f} cm")
 
 @st.cache_data(ttl=3600)  # cache de 1h
 def fetch_defesa_civil_rankings() -> dict:
-    """Faz scraping das tabelas de maiores chuvas do site da Defesa Civil de Blumenau.
-    Retorna dict {duração: DataFrame} com colunas [Estação, Região, Data/Hora, Acumulado_mm]."""
+    """Retorna rankings de maiores chuvas da Defesa Civil de Blumenau.
+
+    Estratégia híbrida:
+    - LOCAL com bs4 instalado: faz scraping em tempo real, atualiza dc_rankings_cache.json.
+    - STREAMLIT CLOUD (sem bs4): lê dc_rankings_cache.json do repositório.
+    Retorna dict {duração: DataFrame} com colunas [Estação, Região, Data/Hora, Acumulado_mm].
+    """
+    # ── Localizar o arquivo de cache junto ao próprio script ──
+    _cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dc_rankings_cache.json")
+
+    def _json_to_dict(payload: dict) -> dict:
+        """Converte o JSON salvo de volta para dict {dur: DataFrame}."""
+        out = {}
+        for dur, rows in payload.get("dados", {}).items():
+            df = pd.DataFrame(rows)
+            if "Acumulado_mm" in df.columns:
+                df["Acumulado_mm"] = pd.to_numeric(df["Acumulado_mm"], errors="coerce")
+            out[dur] = df
+        return out
+
+    def _load_json_cache() -> dict:
+        if os.path.exists(_cache_path):
+            try:
+                with open(_cache_path, encoding="utf-8") as f:
+                    return _json_to_dict(json.load(f))
+            except Exception:
+                pass
+        return {}
+
+    # ── Tentar scraping (só funciona se bs4 estiver instalado) ──
+    try:
+        from bs4 import BeautifulSoup  # import local: não quebra cloud se ausente
+    except ImportError:
+        # Estamos no cloud sem bs4: usar cache JSON
+        return _load_json_cache()
+
     url = "https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas"
-    headers_req = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers_req = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
     resultado = {}
     try:
         warnings.filterwarnings("ignore", category=InsecureRequestWarning)
         resp = requests.get(url, headers=headers_req, timeout=20, verify=False)
         if resp.status_code != 200:
-            return {}
+            return _load_json_cache()
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # Cada bloco é precedido por um <h3> com o título (ex: "Maiores Chuvas em 15min")
         page_headers = soup.find_all("div", class_="page-header")
         for ph in page_headers:
             h3 = ph.find("h3")
             if not h3:
                 continue
             titulo_raw = h3.get_text(separator=" ", strip=True)
-            # Extrair a duração do título
             match = re.search(r"em\s+([\d]+h|[\d]+min)", titulo_raw, re.IGNORECASE)
             duracao = match.group(1) if match else titulo_raw
 
-            # Atualização
             small = h3.find("small")
-            ultima_atualizacao = small.get_text(strip=True).replace("Última atualização:", "").strip() if small else ""
+            ultima_atualizacao = (
+                small.get_text(strip=True).replace("\u00daltima atualiza\u00e7\u00e3o:", "").strip()
+                if small else ""
+            )
 
-            # Tabela seguinte
             table = ph.find_next_sibling("table")
             if not table:
                 continue
@@ -526,23 +557,41 @@ def fetch_defesa_civil_rankings() -> dict:
             for tr in table.find("tbody").find_all("tr"):
                 cells = [td.get_text(strip=True) for td in tr.find_all("td")]
                 if len(cells) == 4:
-                    acumulado_str = cells[3].replace(",", ".")
                     try:
-                        acumulado_float = float(acumulado_str)
+                        acumulado_float = float(cells[3].replace(",", "."))
                     except ValueError:
                         acumulado_float = None
                     rows_data.append({
-                        "Estação": cells[0],
-                        "Região": cells[1],
+                        "Esta\u00e7\u00e3o": cells[0],
+                        "Regi\u00e3o": cells[1],
                         "Data/Hora": cells[2],
                         "Acumulado_mm": acumulado_float,
+                        "ultima_atualizacao": ultima_atualizacao,
                     })
             if rows_data:
                 df_dur = pd.DataFrame(rows_data)
-                df_dur["ultima_atualizacao"] = ultima_atualizacao
                 resultado[duracao] = df_dur
+
+        # ── Atualizar o cache JSON (para distribuição no cloud) ──
+        if resultado:
+            import datetime
+            cache_payload = {
+                "gerado_em": datetime.datetime.now().isoformat(),
+                "fonte": url,
+                "dados": {
+                    dur: df.to_dict(orient="records")
+                    for dur, df in resultado.items()
+                },
+            }
+            try:
+                with open(_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache_payload, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass  # cloud pode ser read-only; ignora silenciosamente
+
     except Exception:
-        pass
+        return _load_json_cache()  # rede falhou: usa cache
+
     return resultado
 
 tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
