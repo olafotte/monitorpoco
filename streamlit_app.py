@@ -2202,6 +2202,12 @@ with tab8:
 # ────────────────────────────────────────────────────────────────────────────────
 with tab9:
     import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        _tz_br = ZoneInfo("America/Sao_Paulo")
+    except Exception:
+        _tz_br = _dt.timezone(_dt.timedelta(hours=-3))
+    _now_br = _dt.datetime.now(_tz_br)
 
     st.subheader("📋 Relatório de Adequação da Bomba de Drenagem")
     st.caption(
@@ -2278,7 +2284,7 @@ with tab9:
         st.markdown("## Relatório de Adequação Hidráulica")
         st.markdown(
             f"**Local:** lat {latitude:.4f}, lon {longitude:.4f} &nbsp;|&nbsp; "
-            f"**Emitido:** {_dt.datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            f"**Emitido:** {_now_br.strftime('%d/%m/%Y %H:%M')} (Horário de Brasília)"
         )
     with col_badge:
         if bomba_ok is True:
@@ -2816,7 +2822,7 @@ um transbordamento esperado *no pior caso* a cada 25 anos de operação.
     st.markdown("---")
     _rpt_txt = (
         f"RELATORIO DE ADEQUACAO - POCO DE DRENAGEM\n"
-        f"Data: {_dt.datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
+        f"Data: {_now_br.strftime('%d/%m/%Y %H:%M')} (Horario de Brasilia)\n"
         f"Local: lat {latitude:.4f}, lon {longitude:.4f}\n\n"
         f"SISTEMA INSTALADO\n"
         f"  Bomba: {vazao_bomba_m3h:.1f} m3/h = {r_pump_param:.1f} cm/h\n"
