@@ -8,6 +8,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
+# pyrefly: ignore [missing-import]
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import streamlit as st
 
@@ -547,6 +548,7 @@ def fetch_defesa_civil_rankings() -> dict:
 
     # ── Tentar scraping (só funciona se bs4 estiver instalado) ──
     try:
+        # pyrefly: ignore [missing-import]
         from bs4 import BeautifulSoup  # import local: não quebra cloud se ausente
     except ImportError:
         # Estamos no cloud sem bs4: usar cache JSON
