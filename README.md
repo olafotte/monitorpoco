@@ -1,5 +1,21 @@
 # 🌊 Monitoramento de Poço de Drenagem e Previsão Meteorológica
 
+## 🏗️ Estrutura do Projeto
+
+```text
+Monitor_poco/
+├── streamlit_app.py             # Aplicativo principal e orquestrador Streamlit
+├── src/                         # Pacote modular do sistema
+│   ├── config.py                # Constantes físicas e parâmetros padrão
+│   ├── data/
+│   │   └── adolfo_konder.py     # Loader e cache dinâmico da Estação Ponte Adolfo Konder
+│   └── models/
+│       └── gumbel.py            # Distribuição de Gumbel e Curvas IDF
+├── Ponte Adolfo Konder_pluv_*.txt # Dados históricos de 15 minutos da estação física
+├── README.md                    # Documentação do projeto
+└── requirements.txt             # Dependências Python
+```
+
 Uma aplicação web desenvolvida em **Streamlit** para monitoramento em tempo real de nível de poço de drenagem, análise estatística de pluviometria histórica (curvas IDF / Gumbel), calibração geométrica de reservatórios e emissão automatizada de **Relatório de Adequação Hidráulica** em conformidade com a norma **ABNT NBR 10844**.
 
 ---
@@ -13,22 +29,30 @@ O aplicativo está estruturado em 9 abas principais:
    - Visualização gráfica de nível d'água, volume acumulado e status operacional da bomba.
    - Simulação da dinâmica de acionamento (nível LIGA/DESLIGA) e taxa de esvaziamento.
 
-2. **📈 Estatísticas de Nível**
-   - Análise estatística descritiva (médias, mínimos, máximos e distribuição de frequência) das medições do sensor.
+2. **📐 Modelo Matemático**
+   - Formulação do balanço de massa/continuidade hidráulica do poço.
+   - **Descrição do Fator de Conversão ($\text{m}^3/\text{h} \rightarrow \text{cm}/\text{h}$):** Explicação detalhada da geometria teórica do poço ($D = 1,20\text{ m}$), efeito de remanso e volume em rede (*pipe storage*, área efetiva de $18,28\text{ m}^2$) e metodologia empírica de calibração pelos ciclos de desce/subida medidos pelo sensor ultrassônico.
+   - **📈 Comparativo no Momento LIGA $\rightarrow$ DESLIGA:** Alinhamento preciso do instante exato de atracamento da bomba ($d \le d_{\text{on}}$, $t = 0\text{ min}$) para comparar a rampa de esvaziamento teórica com a curva real gravada pelo sensor ultrassônico, exibindo métricas de taxa real medida ($\text{cm/h}$) e tempo decorrido.
 
-3. **🌤️ Previsão Meteorológica (Open-Meteo)**
-   - Integração com a API da Open-Meteo para previsão de chuva acumulada e intensidade pluviométrica na região de Blumenau/SC.
+3. **🌧️ Simulador Pluviométrico (Sintético & Reconstrução Histórica)**
+   - **Simulação Sintética:** Avaliação dinâmica de volumes hipotéticos de chuva ($mm$) e duração ($h$), calculando taxas de enchimento, atuação da bomba e instante exato de transbordamento.
+   - **⏮️ Reconstrução de Eventos Históricos Passados:** Emulação e reconstituição de tempestades reais passadas (ex: 12 a 14 de Fevereiro de 2025 ou qualquer data desde 2015).
+   - **Escolha da Fonte de Dados:** Alterna livremente entre **medições reais de 15 minutos da Estação Pluviométrica Ponte Adolfo Konder**, o **Modelo ERA5 Corrigido** ou o **Modelo ERA5 Bruto**.
+   - Simulação contínua passo a passo (5 min) do nível d'água no poço e acionamento por bóias (1ª bomba e 2ª bomba em paralelo se ativada).
 
-4. **🚨 Defesa Civil de Blumenau**
-   - Web scraping e consulta com cache local aos dados oficiais das estações pluviométricas e de nível de rios da Defesa Civil de Blumenau.
+4. **🛑 Defesa Civil de Blumenau & Estação Ponte Adolfo Konder**
+   - Web scraping aos dados oficiais de chuva e nível de rios da Defesa Civil de Blumenau.
+   - **Seção Exclusiva Gumbel — Estação Ponte Adolfo Konder (2021–2025):** Análise de extremos com ajuste da Distribuição de Gumbel sobre as séries de 15min a 24h e curvas IDF locais.
+   - **Rankings Top 10 por Duração Específica:** Abas dedicadas para os 10 maiores eventos históricos de cada duração (**15min, 30min, 1h, 2h, 4h, 12h e 24h**), com desduplicação de tempestades, acumulado ($\text{mm}$), intensidade ($\text{mm/h}$), afluxo no poço ($\text{cm/h}$) e status da bomba.
 
-5. **🌧️ Histórico Pluviométrico & Curvas IDF**
-   - Ingestão de dados históricos climáticos (ERA5 / Open-Meteo Archive API) com janela ajustável de anos (ex: 5 a 10+ anos).
-   - Ajuste da **Distribuição de Extremos de Gumbel** para cálculo de curvas IDF (Intensidade-Duração-Frequência) para diversas durações (1h a 24h) e Períodos de Retorno ($Tr$ de 2 a 100 anos).
-   - Aplicação de fator de correção calibrado (ERA5 vs. Defesa Civil).
+5. **📊 Histórico Pluviométrico & Curvas IDF (Análise de Extremos)**
+   - Série histórica de precipitação horária (5 a 10 anos) via Open-Meteo Archive API.
+   - **Calibração com Estação Real Ponte Adolfo Konder (2021-2025):** Tabela comparativa dos picos reais vs. ERA5 bruto e seleção de base de cálculo para as curvas IDF (ERA5 Corregido vs. Ponte Adolfo Konder).
+   - Cálculo automatizado de curvas IDF (Intensidade-Duração-Frequência) usando a distribuição de Gumbel (método dos momentos).
+   - Identificação de eventos saturantes e chuva de projeto para Período de Retorno $Tr = 25$ anos.
 
 6. **🔮 Previsão de Nível por Chuva**
-   - Previsão da resposta do nível d'água no poço em função dos volumes de chuva previstos, considerando o fator de amplificação da área de drenagem.
+   - Simulação hidrológica que converte a previsão meteorológica em elevação do nível d'água, considerando a área de contribuição do poço, perdas de carga e a eficiência de bombeamento, emitindo alertas de risco de transbordo (buffer).
 
 7. **🗺️ Análise Espacial & Regiões**
    - Comparativo pluviométrico por bairros e regiões do município.
@@ -39,11 +63,11 @@ O aplicativo está estruturado em 9 abas principais:
 
 9. **📋 Relatório de Adequação Hidráulica (NBR 10844)**
    - Avaliação automatizada da capacidade da bomba instalada versus a demanda requerida para chuva de projeto de $Tr = 25$ anos (NBR 10844).
+   - **Fonte Pluviométrica Primária:** Curvas IDF de Gumbel calculadas diretamente sobre as medições reais de 15 minutos da **Estação Pluviométrica Ponte Adolfo Konder (Blumenau)**.
    - Diagnóstico automático para cenários de dados insuficientes.
    - Cálculo de margem de segurança física (tempo até transbordo no buffer acima do sensor).
    - Linguagem acessível e explicativa para leigos e parecer técnico final com recomendações de engenharia.
    - Opção de download do resumo executivo em formato texto (`.txt`).
-
 ---
 
 ## ⚙️ Parâmetros Configuráveis (Barra Lateral)
