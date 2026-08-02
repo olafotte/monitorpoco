@@ -739,7 +739,14 @@ with tab1:
         st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
 
     st.subheader("Últimos Registros")
-    st.dataframe(filled_df)
+    df_export = filled_df.round(2)
+    st.dataframe(df_export)
+    st.download_button(
+        label="📥 Baixar Registros em CSV",
+        data=df_export.to_csv(index=False, float_format="%.2f").encode("utf-8"),
+        file_name="registros_poco.csv",
+        mime="text/csv",
+    )
 
 with tab2:
     st.header("Formulação do Modelo Matemático")
