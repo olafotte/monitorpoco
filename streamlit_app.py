@@ -3,7 +3,7 @@ import json
 import re
 import warnings
 import datetime as _dt
-import datetime
+import textwrap
 
 import numpy as np
 import pandas as pd
@@ -486,16 +486,277 @@ def format_hours(hours: float) -> str:
         return f"{m}min"
 
 
+def format_hours_status(hours: float, current_val: float, target_val: float) -> str:
+    """Formata tempo restante ou indica se a marca já foi ultrapassada."""
+    if current_val <= target_val:
+        return "⚡ Já Atingido"
+    if hours == float("inf") or hours < 0 or pd.isna(hours):
+        return "N/A"
+    tot_min = int(round(hours * 60))
+    h = tot_min // 60
+    m = tot_min % 60
+    if h >= 48:
+        days = h // 24
+        rem_h = h % 24
+        return f"{days}d {rem_h}h {m:02d}min ({h}h)"
+    elif h > 0:
+        return f"{h}h {m:02d}min"
+    else:
+        return f"{m}min"
+
+
+def segment_operational_periods(df: pd.DataFrame):
+    """Segmenta a série temporal em períodos completos contínuos de Enchimento (Subida) e Esvaziamento (Bombeamento).
+
+    Calcula a taxa física de cada período a partir da variação total dividida pelo tempo total decorrido do período:
+    Rate = Δd_período / Δt_período (cm/h).
+    """
+    if df is None or df.empty or "dt_round" not in df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    col_nivel = "nivel_imputed" if "nivel_imputed" in df.columns else "nivel_cm"
+    if col_nivel not in df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df_calc = df.sort_values("dt_round").copy()
+    df_calc["smooth"] = df_calc[col_nivel].ewm(span=3).mean()
+    df_calc["diff"] = df_calc["smooth"].diff()
+
+    df_calc["direction"] = 0
+    df_calc.loc[df_calc["diff"] < -0.05, "direction"] = -1  # Subida (Enchimento)
+    df_calc.loc[df_calc["diff"] > 0.05, "direction"] = 1   # Descida (Esvaziamento)
+    df_calc["direction"] = df_calc["direction"].replace(0, np.nan).ffill().fillna(-1)
+
+    df_calc["block"] = (df_calc["direction"] != df_calc["direction"].shift()).cumsum()
+
+    period_ench = []
+    period_esv = []
+
+    for _, group in df_calc.groupby("block"):
+        if len(group) < 2:
+            continue
+        t_start = group["dt_round"].iloc[0]
+        t_end = group["dt_round"].iloc[-1]
+        dur_h = (t_end - t_start).total_seconds() / 3600.0
+        if dur_h < 0.08:  # Ignora micro-flutuações menores que ~5 minutos
+            continue
+
+        d_start = group[col_nivel].iloc[0]
+        d_end = group[col_nivel].iloc[-1]
+        dir_val = group["direction"].iloc[0]
+
+        if dir_val == -1:
+            total_cm = d_start - d_end
+            if total_cm > 0.3:  # Mínimo 0.3 cm de subida total para período válido
+                rate = total_cm / dur_h
+                period_ench.append({
+                    "t_start": t_start,
+                    "t_end": t_end,
+                    "dur_h": dur_h,
+                    "d_start": d_start,
+                    "d_end": d_end,
+                    "total_cm": total_cm,
+                    "rate_cmh": rate,
+                })
+        elif dir_val == 1:
+            total_cm = d_end - d_start
+            if total_cm > 0.3:  # Mínimo 0.3 cm de descida total para período válido
+                rate = total_cm / dur_h
+                period_esv.append({
+                    "t_start": t_start,
+                    "t_end": t_end,
+                    "dur_h": dur_h,
+                    "d_start": d_start,
+                    "d_end": d_end,
+                    "total_cm": total_cm,
+                    "rate_cmh": rate,
+                })
+
+    return pd.DataFrame(period_ench), pd.DataFrame(period_esv)
+
+
+def compute_rate_statistics(df: pd.DataFrame) -> dict:
+    """Calcula estatísticas de taxas operacionais baseadas em períodos completos (Δd_período / Δt_período)."""
+    df_ench, df_esv = segment_operational_periods(df)
+    if df_ench.empty and df_esv.empty:
+        return None
+
+    res = {
+        "ench_media": float(df_ench["rate_cmh"].median()) if not df_ench.empty else 0.0,
+        "ench_pico": float(df_ench["rate_cmh"].max()) if not df_ench.empty else 0.0,
+        "ench_min": float(df_ench["rate_cmh"].min()) if not df_ench.empty else 0.0,
+        "ench_count": len(df_ench),
+        "esv_media": float(df_esv["rate_cmh"].median()) if not df_esv.empty else 0.0,
+        "esv_pico": float(df_esv["rate_cmh"].max()) if not df_esv.empty else 0.0,
+        "esv_min": float(df_esv["rate_cmh"].min()) if not df_esv.empty else 0.0,
+        "esv_count": len(df_esv),
+    }
+    return res
+
+
+def plot_historical_extremes_chart(df: pd.DataFrame):
+    """Gera gráfico interativo Plotly anotando exatamente quando ocorreram as máximas e mínimas históricas (nível e períodos de taxa extrema)."""
+    if df is None or df.empty or "dt_round" not in df.columns:
+        return None, None, None, None, None
+
+    col_nivel = "nivel_imputed" if "nivel_imputed" in df.columns else "nivel_cm"
+    if col_nivel not in df.columns:
+        return None, None, None, None, None
+
+    df_calc = df.sort_values("dt_round").copy()
+    df_ench, df_esv = segment_operational_periods(df_calc)
+
+    idx_max_water = df_calc[col_nivel].idxmin()  # Menor distância ao sensor = Nível mais alto da água
+    idx_min_water = df_calc[col_nivel].idxmax()  # Maior distância ao sensor = Nível mais baixo da água
+
+    row_max_w = df_calc.loc[idx_max_water]
+    row_min_w = df_calc.loc[idx_min_water]
+
+    row_peak_rise = df_ench.iloc[df_ench["rate_cmh"].idxmax()] if not df_ench.empty else None
+    row_peak_drop = df_esv.iloc[df_esv["rate_cmh"].idxmax()] if not df_esv.empty else None
+
+    fig = go.Figure()
+
+    # Série temporal contínua
+    fig.add_trace(
+        go.Scatter(
+            x=df_calc["dt_round"],
+            y=df_calc[col_nivel],
+            mode="lines",
+            name="Nível do Poço (cm)",
+            line=dict(color="#2b5c8f", width=1.8),
+        )
+    )
+
+    # 1. Água mais alta
+    d1 = row_max_w[col_nivel]
+    t1 = row_max_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+    fig.add_trace(
+        go.Scatter(
+            x=[row_max_w["dt_round"]],
+            y=[d1],
+            mode="markers+text",
+            name="Água Mais Alta (Nível Máximo)",
+            marker=dict(symbol="star", size=14, color="#d9534f", line=dict(width=1.5, color="black")),
+            text=[f"🔴 Nível Máx: {d1:.1f} cm ({t1})"],
+            textposition="top center",
+        )
+    )
+
+    # 2. Água mais baixa
+    d2 = row_min_w[col_nivel]
+    t2 = row_min_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+    fig.add_trace(
+        go.Scatter(
+            x=[row_min_w["dt_round"]],
+            y=[d2],
+            mode="markers+text",
+            name="Água Mais Baixa (Nível Mínimo)",
+            marker=dict(symbol="diamond", size=12, color="#0275d8", line=dict(width=1.5, color="black")),
+            text=[f"🔵 Nível Mín: {d2:.1f} cm ({t2})"],
+            textposition="bottom center",
+        )
+    )
+
+    # 3. Maior taxa de subida por período completo
+    if row_peak_rise is not None:
+        r3 = row_peak_rise["rate_cmh"]
+        t3 = row_peak_rise["t_start"].strftime("%d/%m/%Y às %H:%M")
+        fig.add_trace(
+            go.Scatter(
+                x=[row_peak_rise["t_start"]],
+                y=[row_peak_rise["d_start"]],
+                mode="markers+text",
+                name="Maior Taxa de Subida por Período",
+                marker=dict(symbol="triangle-up", size=13, color="#f0ad4e", line=dict(width=1.5, color="black")),
+                text=[f"⚡ Pico Subida Período: +{r3:.1f} cm/h ({t3})"],
+                textposition="top left",
+            )
+        )
+
+    # 4. Maior taxa de descida por período completo
+    if row_peak_drop is not None:
+        r4 = row_peak_drop["rate_cmh"]
+        t4 = row_peak_drop["t_start"].strftime("%d/%m/%Y às %H:%M")
+        fig.add_trace(
+            go.Scatter(
+                x=[row_peak_drop["t_start"]],
+                y=[row_peak_drop["d_start"]],
+                mode="markers+text",
+                name="Maior Taxa de Descida por Período",
+                marker=dict(symbol="triangle-down", size=13, color="#5cb85c", line=dict(width=1.5, color="black")),
+                text=[f"🌊 Pico Descida Período: -{r4:.1f} cm/h ({t4})"],
+                textposition="bottom right",
+            )
+        )
+
+    fig.update_layout(
+        title="📈 Ocorrência Temporal dos Extremos de Nível e Períodos Operacionais",
+        yaxis=dict(autorange="reversed", title="Distância até o Sensor (cm)"),
+        xaxis=dict(title="Data / Hora"),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        height=520,
+        margin=dict(l=20, r=40, t=50, b=60),
+    )
+
+    return fig, row_max_w, row_min_w, row_peak_rise, row_peak_drop
+
+
+def plot_rate_histograms(df: pd.DataFrame):
+    """Gera dois histogramas Plotly com a distribuição das taxas médias calculadas por período completo."""
+    df_ench, df_esv = segment_operational_periods(df)
+
+    fig_ench = None
+    if not df_ench.empty:
+        fig_ench = px.histogram(
+            df_ench,
+            x="rate_cmh",
+            nbins=100,
+            title="🟢 Distribuição das Taxas de Subida / Enchimento por Período (cm/h)",
+            labels={"rate_cmh": "Taxa Média do Período (cm/h)", "count": "Frequência (Períodos)"},
+            color_discrete_sequence=["#2e7d32"],
+        )
+        fig_ench.update_layout(
+            height=360,
+            margin=dict(l=20, r=20, t=40, b=40),
+            showlegend=False,
+            bargap=0.05,
+        )
+
+    fig_esv = None
+    if not df_esv.empty:
+        fig_esv = px.histogram(
+            df_esv,
+            x="rate_cmh",
+            nbins=100,
+            title="🔵 Distribuição das Taxas de Descida / Bombeamento por Período (cm/h)",
+            labels={"rate_cmh": "Taxa Média do Bombeamento (cm/h)", "count": "Frequência (Períodos)"},
+            color_discrete_sequence=["#1565c0"],
+        )
+        fig_esv.update_layout(
+            height=360,
+            margin=dict(l=20, r=20, t=40, b=40),
+            showlegend=False,
+            bargap=0.05,
+        )
+
+    return fig_ench, fig_esv
+
+
 def compute_recent_rising_trend(
     df: pd.DataFrame,
     dist_borda_cm: float,
+    d_on: float = 71.5,
+    tem_bomba2: bool = False,
+    d_on2: float = 41.5,
     weather_df: pd.DataFrame = None,
     factor_mm_cm: float = 2.83,
+    window_size: int = 20,
 ):
     """
-    Analisa os dados mais recentes desde a última mudança de derivada / desligamento da bomba
-    para calcular a taxa real de subida do nível do poço e estimar o tempo até atingir o sensor e o transbordo,
-    incorporando opcionalmente a previsão de chuva futura do ERA5 (Open-Meteo).
+    Analisa a tendência recente das últimas N leituras (padrão: 20 leituras ~1h40min)
+    para calcular a velocidade/taxa atual de subida do nível do poço e estimar o tempo
+    até ligar bomba 1, ligar bomba 2 (se ativa), atingir sensor e transbordar.
     """
     valid = df.dropna(subset=["dt_round"]).copy()
     if "nivel_cm" in valid.columns:
@@ -507,24 +768,9 @@ def compute_recent_rising_trend(
     if len(valid) < 2:
         return None
 
-    latest_idx = len(valid) - 1
-    max_d = valid.loc[latest_idx, "val_d"]
-    max_idx = latest_idx
-
-    # Buscar para trás a inflexão (maior distância / menor nível de água quando a bomba parou)
-    for i in range(latest_idx - 1, -1, -1):
-        curr_d = valid.loc[i, "val_d"]
-        if curr_d >= max_d:
-            max_d = curr_d
-            max_idx = i
-        else:
-            # Se diminuiu mais de 0.8 cm para trás, a bomba estava ativa antes de max_idx
-            if curr_d < max_d - 0.8:
-                break
-
-    segment = valid.loc[max_idx:latest_idx].copy()
-    if len(segment) < 2:
-        return None
+    # Usar as últimas N leituras (padrão 20 leituras = ~1h40min)
+    n_points = min(window_size, len(valid))
+    segment = valid.tail(n_points).copy()
 
     t0 = segment["dt_round"].iloc[0]
     t_latest = segment["dt_round"].iloc[-1]
@@ -534,16 +780,19 @@ def compute_recent_rising_trend(
         return None
 
     slope, intercept = np.polyfit(times_h, segment["val_d"], 1)
-    rate_cmh = -slope  # taxa positiva de subida base em cm/h
+    rate_cmh = -slope  # taxa positiva de subida recente em cm/h
 
     curr_d = segment["val_d"].iloc[-1]
-    dist_sensor = curr_d
-    dist_overflow = curr_d + dist_borda_cm
 
-    time_sensor_h = dist_sensor / rate_cmh if rate_cmh > 0 else float("inf")
-    time_overflow_h = dist_overflow / rate_cmh if rate_cmh > 0 else float("inf")
+    # Tempos de projeção linear base (sem chuva)
+    time_bomba1_h = max(0.0, (curr_d - d_on) / rate_cmh) if (curr_d > d_on and rate_cmh > 0) else (0.0 if curr_d <= d_on else float("inf"))
+    time_bomba2_h = max(0.0, (curr_d - d_on2) / rate_cmh) if (tem_bomba2 and curr_d > d_on2 and rate_cmh > 0) else (0.0 if (tem_bomba2 and curr_d <= d_on2) else float("inf"))
+    time_sensor_h = max(0.0, curr_d / rate_cmh) if (curr_d > 0 and rate_cmh > 0) else (0.0 if curr_d <= 0 else float("inf"))
+    time_overflow_h = max(0.0, (curr_d + dist_borda_cm) / rate_cmh) if (curr_d > -dist_borda_cm and rate_cmh > 0) else (0.0 if curr_d <= -dist_borda_cm else float("inf"))
 
     # ── Simulação com Previsão Meteorológica ERA5 ──
+    time_bomba1_era5_h = time_bomba1_h
+    time_bomba2_era5_h = time_bomba2_h
     time_sensor_era5_h = time_sensor_h
     time_overflow_era5_h = time_overflow_h
     era5_sim_df = None
@@ -556,8 +805,10 @@ def compute_recent_rising_trend(
         c_d = curr_d
         c_t = t_latest
 
-        t_sensor_era5_dt = None
-        t_overflow_era5_dt = None
+        t_bomba1_era5_dt = c_t if curr_d <= d_on else None
+        t_bomba2_era5_dt = c_t if (tem_bomba2 and curr_d <= d_on2) else None
+        t_sensor_era5_dt = c_t if curr_d <= 0 else None
+        t_overflow_era5_dt = c_t if curr_d <= -dist_borda_cm else None
 
         w_df_clean = weather_df.copy()
         if w_df_clean.index.tz is None:
@@ -570,6 +821,10 @@ def compute_recent_rising_trend(
             sim_times.append(c_t)
             sim_d.append(c_d)
 
+            if t_bomba1_era5_dt is None and c_d <= d_on:
+                t_bomba1_era5_dt = c_t
+            if tem_bomba2 and t_bomba2_era5_dt is None and c_d <= d_on2:
+                t_bomba2_era5_dt = c_t
             if t_sensor_era5_dt is None and c_d <= 0:
                 t_sensor_era5_dt = c_t
             if t_overflow_era5_dt is None and c_d <= -dist_borda_cm:
@@ -589,6 +844,10 @@ def compute_recent_rising_trend(
             c_d -= r_total * (5.0 / 60.0)
             c_t += pd.Timedelta(minutes=5)
 
+        if t_bomba1_era5_dt is not None:
+            time_bomba1_era5_h = (t_bomba1_era5_dt - t_latest).total_seconds() / 3600.0
+        if tem_bomba2 and t_bomba2_era5_dt is not None:
+            time_bomba2_era5_h = (t_bomba2_era5_dt - t_latest).total_seconds() / 3600.0
         if t_sensor_era5_dt is not None:
             time_sensor_era5_h = (t_sensor_era5_dt - t_latest).total_seconds() / 3600.0
         if t_overflow_era5_dt is not None:
@@ -600,12 +859,19 @@ def compute_recent_rising_trend(
         "start_time": t0,
         "latest_time": t_latest,
         "duration_h": times_h.iloc[-1],
-        "start_d": valid.loc[max_idx, "val_d"],
+        "start_d": segment["val_d"].iloc[0],
         "curr_d": curr_d,
         "num_points": len(segment),
         "rate_cmh": rate_cmh,
+        "d_on": d_on,
+        "tem_bomba2": tem_bomba2,
+        "d_on2": d_on2,
+        "time_bomba1_h": time_bomba1_h,
+        "time_bomba2_h": time_bomba2_h,
         "time_sensor_h": time_sensor_h,
         "time_overflow_h": time_overflow_h,
+        "time_bomba1_era5_h": time_bomba1_era5_h,
+        "time_bomba2_era5_h": time_bomba2_era5_h,
         "time_sensor_era5_h": time_sensor_era5_h,
         "time_overflow_era5_h": time_overflow_era5_h,
         "has_future_rain": has_future_rain,
@@ -824,49 +1090,16 @@ with tab1:
         "O eixo Y direito mostra a precipitação acumulada em cada intervalo de 5 minutos."
     )
 
-    trend = compute_recent_rising_trend(filled_df, dist_borda_cm, weather_df=weather_df, factor_mm_cm=factor_mm_cm)
-    if trend and trend["rate_cmh"] > 0:
-        t_sens_str = format_hours(trend["time_sensor_h"])
-        t_ovf_str = format_hours(trend["time_overflow_h"])
-        t_sens_era5_str = format_hours(trend["time_sensor_era5_h"])
-        t_ovf_era5_str = format_hours(trend["time_overflow_era5_h"])
-        t_start_fmt = trend["start_time"].strftime("%d/%m/%Y às %H:%M")
-        t_dur_fmt = format_hours(trend["duration_h"])
-
-        rain_badge = (
-            f"<span style='color: #d9534f; font-weight: bold;'>🌦️ Chuva Futura ERA5 (+{trend['total_rain_era5']:.1f} mm previstos)</span>"
-            if trend["has_future_rain"]
-            else "<span style='color: #5cb85c; font-weight: bold;'>☀️ Sem Chuva Prevista no Período</span>"
-        )
-
-        st.markdown(
-            f"""
-            <div style="background-color: #eef9ff; border-left: 5px solid #0056b3; padding: 15px; border-radius: 6px; margin-bottom: 15px;">
-                <h4 style="margin: 0 0 8px 0; color: #0056b3;">🧪 Estimativa de Subida Real (Com Previsão Met. ERA5 / Open-Meteo)</h4>
-                <p style="margin: 0 0 10px 0; font-size: 13px; color: #333;">
-                    Tendência real desde <b>{t_start_fmt}</b> ({t_dur_fmt} atrás | {trend['num_points']} leituras).
-                    Distância inicial: <b>{trend['start_d']:.1f} cm</b> → Atual: <b>{trend['curr_d']:.1f} cm</b> | {rain_badge}
-                </p>
-                <div style="display: flex; gap: 15px; flex-wrap: wrap;">
-                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 160px;">
-                        <span style="font-size: 12px; color: #666;">📈 Taxa Base Observada</span><br>
-                        <b style="font-size: 20px; color: #0056b3;">{trend['rate_cmh']:.2f} cm/h</b>
-                    </div>
-                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 210px;">
-                        <span style="font-size: 12px; color: #666;">🎯 Tempo até o Sensor (0 cm)</span><br>
-                        <b style="font-size: 18px; color: #d9534f;">{t_sens_era5_str}</b>
-                        <br><span style="font-size: 11px; color: #777;">Base sem chuva: {t_sens_str}</span>
-                    </div>
-                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 230px;">
-                        <span style="font-size: 12px; color: #666;">🌊 Tempo até Transbordar (Borda)</span><br>
-                        <b style="font-size: 18px; color: #c9302c;">{t_ovf_era5_str}</b>
-                        <br><span style="font-size: 11px; color: #777;">Base sem chuva: {t_ovf_str}</span>
-                    </div>
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+    trend = compute_recent_rising_trend(
+        filled_df,
+        dist_borda_cm,
+        d_on=d_on,
+        tem_bomba2=tem_bomba2,
+        d_on2=d_on2,
+        weather_df=weather_df,
+        factor_mm_cm=factor_mm_cm,
+        window_size=20,
+    )
 
     has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
 
@@ -931,8 +1164,13 @@ with tab1:
                     line=dict(color="#d9534f", width=2.5, dash="dot"),
                 )
             )
-    fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bomba Liga (Água Alta)")
-    fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bomba Desliga (Água Baixa)")
+    b1_on_label = "Bomba 1 Liga (Água Alta)" if tem_bomba2 else "Bomba Liga (Água Alta)"
+    b1_off_label = "Bomba 1 Desliga (Água Baixa)" if tem_bomba2 else "Bomba Desliga (Água Baixa)"
+    fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label)
+    fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label)
+    if tem_bomba2:
+        fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
+        fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
     fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Nível Crítico / Transbordo")
     fig.update_layout(
         yaxis=dict(
@@ -960,7 +1198,9 @@ with tab1:
         st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
 
     st.subheader("Últimos Registros")
-    df_export = filled_df.round(2)
+    df_export = filled_df.copy()
+    num_cols = df_export.select_dtypes(include=[np.number]).columns
+    df_export[num_cols] = df_export[num_cols].round(2)
     st.dataframe(df_export)
     st.download_button(
         label="📥 Baixar Registros em CSV",
@@ -968,6 +1208,175 @@ with tab1:
         file_name="registros_poco.csv",
         mime="text/csv",
     )
+
+    if trend and trend["rate_cmh"] > 0:
+        t_b1_str = format_hours_status(trend["time_bomba1_h"], trend["curr_d"], d_on)
+        t_b1_era5_str = format_hours_status(trend["time_bomba1_era5_h"], trend["curr_d"], d_on)
+
+        t_b2_str = format_hours_status(trend["time_bomba2_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
+        t_b2_era5_str = format_hours_status(trend["time_bomba2_era5_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
+
+        t_sens_str = format_hours_status(trend["time_sensor_h"], trend["curr_d"], 0.0)
+        t_sens_era5_str = format_hours_status(trend["time_sensor_era5_h"], trend["curr_d"], 0.0)
+
+        t_ovf_str = format_hours_status(trend["time_overflow_h"], trend["curr_d"], d_overflow)
+        t_ovf_era5_str = format_hours_status(trend["time_overflow_era5_h"], trend["curr_d"], d_overflow)
+
+        t_start_fmt = trend["start_time"].strftime("%d/%m/%Y às %H:%M")
+        t_dur_fmt = format_hours(trend["duration_h"])
+
+        st.markdown("---")
+        with st.container(border=True):
+            st.subheader("🧪 Estimativa de Subida Real (Tendência Recente de 20 Leituras + ERA5)")
+
+            rain_msg = (
+                f" 🌦️ **Chuva Futura ERA5:** +{trend['total_rain_era5']:.1f} mm previstos no período."
+                if trend["has_future_rain"]
+                else " ☀️ **Sem chuva futura prevista.**"
+            )
+            st.markdown(
+                f"Análise da velocidade atual baseada nas **últimas {trend['num_points']} leituras** ({t_dur_fmt} | desde **{t_start_fmt}**). "
+                f"Variação na janela: **{trend['start_d']:.1f} cm** → **{trend['curr_d']:.1f} cm** |{rain_msg}"
+            )
+
+            num_cols = 5 if tem_bomba2 else 4
+            cols = st.columns(num_cols)
+
+            cols[0].metric(
+                label="📈 Taxa Recente (Últimas 20)",
+                value=f"{trend['rate_cmh']:.2f} cm/h",
+            )
+
+            cols[1].metric(
+                label=f"🚨 Ligar Bomba 1 ({d_on:.1f} cm)",
+                value=t_b1_era5_str,
+                delta=f"Base: {t_b1_str}" if t_b1_era5_str != t_b1_str else None,
+                delta_color="off",
+            )
+
+            curr_idx = 2
+            if tem_bomba2:
+                cols[curr_idx].metric(
+                    label=f"⚡ Ligar Bomba 2 ({d_on2:.1f} cm)",
+                    value=t_b2_era5_str,
+                    delta=f"Base: {t_b2_str}" if t_b2_era5_str != t_b2_str else None,
+                    delta_color="off",
+                )
+                curr_idx += 1
+
+            cols[curr_idx].metric(
+                label="🎯 Atingir Sensor (0 cm)",
+                value=t_sens_era5_str,
+                delta=f"Base: {t_sens_str}" if t_sens_era5_str != t_sens_str else None,
+                delta_color="off",
+            )
+            curr_idx += 1
+
+            cols[curr_idx].metric(
+                label=f"🌊 Transbordar ({d_overflow:.0f} cm)",
+                value=t_ovf_era5_str,
+                delta=f"Base: {t_ovf_str}" if t_ovf_era5_str != t_ovf_str else None,
+                delta_color="inverse",
+            )
+
+    rate_stats = compute_rate_statistics(filled_df)
+    if rate_stats:
+        with st.container(border=True):
+            st.subheader("📊 Análise Histórica das Taxas Operacionais (Enchimento vs. Esvaziamento)")
+            st.caption(
+                "Estatísticas calculadas a partir de todas as taxas válidas registradas na série temporal. "
+                "Separado em **Enchimento** (subida do nível com bomba desligada) e **Esvaziamento** (descida do nível com bombeamento ativo)."
+            )
+
+            c_ench, c_esv = st.columns(2)
+
+            with c_ench:
+                st.markdown("#### 🟢 Regime de Enchimento (Subida de Nível)")
+                st.caption(f"Amostras: **{rate_stats['ench_count']}** períodos de subida")
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Taxa Mediana", f"{rate_stats['ench_media']:.2f} cm/h")
+                m2.metric("Pico (Máximo)", f"{rate_stats['ench_pico']:.2f} cm/h")
+                m3.metric("Taxa Mínima", f"{rate_stats['ench_min']:.2f} cm/h")
+
+            with c_esv:
+                st.markdown("#### 🔵 Regime de Esvaziamento (Descida por Bombeamento)")
+                st.caption(f"Amostras: **{rate_stats['esv_count']}** períodos de descida")
+                m4, m5, m6 = st.columns(3)
+                m4.metric("Taxa Mediana", f"{rate_stats['esv_media']:.2f} cm/h")
+                m5.metric("Pico (Máximo)", f"{rate_stats['esv_pico']:.2f} cm/h")
+                m6.metric("Taxa Mínima", f"{rate_stats['esv_min']:.2f} cm/h")
+
+    fig_ext, r_max_w, r_min_w, r_pk_rise, r_pk_drop = plot_historical_extremes_chart(filled_df)
+    if fig_ext:
+        with st.container(border=True):
+            st.subheader("📅 Ocorrência Temporal das Máximas e Mínimas Históricas")
+            st.caption(
+                "Gráfico interativo destacando os exatos momentos da série temporal em que o poço atingiu "
+                "o seu nível máximo de água, nível mínimo, maior taxa de subida (enchimento) e maior taxa de descida (bombeamento)."
+            )
+            st.plotly_chart(fig_ext, use_container_width=True)
+
+            ext_cols = st.columns(4)
+            if r_max_w is not None:
+                d1 = r_max_w["nivel_imputed"] if "nivel_imputed" in r_max_w else r_max_w["nivel_cm"]
+                t1 = r_max_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+                ext_cols[0].metric(
+                    label="🔴 Água Mais Alta (Nível Máx)",
+                    value=f"{d1:.1f} cm",
+                    delta=f"Ocorrido em: {t1}",
+                    delta_color="off",
+                )
+
+            if r_min_w is not None:
+                d2 = r_min_w["nivel_imputed"] if "nivel_imputed" in r_min_w else r_min_w["nivel_cm"]
+                t2 = r_min_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+                ext_cols[1].metric(
+                    label="🔵 Água Mais Baixa (Nível Mín)",
+                    value=f"{d2:.1f} cm",
+                    delta=f"Ocorrido em: {t2}",
+                    delta_color="off",
+                )
+
+            if r_pk_rise is not None:
+                r3 = r_pk_rise["rate_cmh"]
+                t3 = r_pk_rise["t_start"].strftime("%d/%m/%Y às %H:%M")
+                ext_cols[2].metric(
+                    label="⚡ Pico de Subida (Enchimento)",
+                    value=f"+{r3:.2f} cm/h",
+                    delta=f"Ocorrido em: {t3}",
+                    delta_color="off",
+                )
+
+            if r_pk_drop is not None:
+                r4 = r_pk_drop["rate_cmh"]
+                t4 = r_pk_drop["t_start"].strftime("%d/%m/%Y às %H:%M")
+                ext_cols[3].metric(
+                    label="🌊 Pico de Descida (Esvaziamento)",
+                    value=f"-{r4:.2f} cm/h",
+                    delta=f"Ocorrido em: {t4}",
+                    delta_color="off",
+                )
+
+    fig_h_ench, fig_h_esv = plot_rate_histograms(filled_df)
+    if fig_h_ench or fig_h_esv:
+        with st.container(border=True):
+            st.subheader("📊 Frequência e Distribuição das Taxas (Histogramas Operacionais)")
+            st.caption(
+                "Histogramas de frequência das velocidades operacionais (cm/h). "
+                "Permite identificar a concentração das taxas típicas de subida da água e a capacidade de rebaixamento das bombas."
+            )
+            h_col1, h_col2 = st.columns(2)
+            with h_col1:
+                if fig_h_ench:
+                    st.plotly_chart(fig_h_ench, use_container_width=True)
+                else:
+                    st.info("Sem dados suficientes de subida para gerar o histograma.")
+
+            with h_col2:
+                if fig_h_esv:
+                    st.plotly_chart(fig_h_esv, use_container_width=True)
+                else:
+                    st.info("Sem dados suficientes de esvaziamento para gerar o histograma.")
 
 with tab2:
     st.header("Formulação do Modelo Matemático")
