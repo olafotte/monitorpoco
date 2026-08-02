@@ -469,6 +469,154 @@ def gumbel_quantile(alpha: float, u: float, return_period: float) -> float:
     return u + alpha * y_t
 
 
+def format_hours(hours: float) -> str:
+    """Formata horas decimais em formato legível de dias, horas e minutos."""
+    if hours == float("inf") or hours < 0 or pd.isna(hours):
+        return "N/A"
+    tot_min = int(round(hours * 60))
+    h = tot_min // 60
+    m = tot_min % 60
+    if h >= 48:
+        days = h // 24
+        rem_h = h % 24
+        return f"{days}d {rem_h}h {m:02d}min ({h}h)"
+    elif h > 0:
+        return f"{h}h {m:02d}min"
+    else:
+        return f"{m}min"
+
+
+def compute_recent_rising_trend(
+    df: pd.DataFrame,
+    dist_borda_cm: float,
+    weather_df: pd.DataFrame = None,
+    factor_mm_cm: float = 2.83,
+):
+    """
+    Analisa os dados mais recentes desde a última mudança de derivada / desligamento da bomba
+    para calcular a taxa real de subida do nível do poço e estimar o tempo até atingir o sensor e o transbordo,
+    incorporando opcionalmente a previsão de chuva futura do ERA5 (Open-Meteo).
+    """
+    valid = df.dropna(subset=["dt_round"]).copy()
+    if "nivel_cm" in valid.columns:
+        valid["val_d"] = valid["nivel_cm"].fillna(valid["nivel_imputed"])
+    else:
+        valid["val_d"] = valid["nivel_imputed"]
+    valid = valid.dropna(subset=["val_d"]).sort_values("dt_round").reset_index(drop=True)
+
+    if len(valid) < 2:
+        return None
+
+    latest_idx = len(valid) - 1
+    max_d = valid.loc[latest_idx, "val_d"]
+    max_idx = latest_idx
+
+    # Buscar para trás a inflexão (maior distância / menor nível de água quando a bomba parou)
+    for i in range(latest_idx - 1, -1, -1):
+        curr_d = valid.loc[i, "val_d"]
+        if curr_d >= max_d:
+            max_d = curr_d
+            max_idx = i
+        else:
+            # Se diminuiu mais de 0.8 cm para trás, a bomba estava ativa antes de max_idx
+            if curr_d < max_d - 0.8:
+                break
+
+    segment = valid.loc[max_idx:latest_idx].copy()
+    if len(segment) < 2:
+        return None
+
+    t0 = segment["dt_round"].iloc[0]
+    t_latest = segment["dt_round"].iloc[-1]
+    times_h = (segment["dt_round"] - t0).dt.total_seconds() / 3600.0
+
+    if times_h.iloc[-1] <= 0:
+        return None
+
+    slope, intercept = np.polyfit(times_h, segment["val_d"], 1)
+    rate_cmh = -slope  # taxa positiva de subida base em cm/h
+
+    curr_d = segment["val_d"].iloc[-1]
+    dist_sensor = curr_d
+    dist_overflow = curr_d + dist_borda_cm
+
+    time_sensor_h = dist_sensor / rate_cmh if rate_cmh > 0 else float("inf")
+    time_overflow_h = dist_overflow / rate_cmh if rate_cmh > 0 else float("inf")
+
+    # ── Simulação com Previsão Meteorológica ERA5 ──
+    time_sensor_era5_h = time_sensor_h
+    time_overflow_era5_h = time_overflow_h
+    era5_sim_df = None
+    has_future_rain = False
+    total_rain_era5 = 0.0
+
+    if weather_df is not None and not weather_df.empty and rate_cmh > 0:
+        sim_times = []
+        sim_d = []
+        c_d = curr_d
+        c_t = t_latest
+
+        t_sensor_era5_dt = None
+        t_overflow_era5_dt = None
+
+        w_df_clean = weather_df.copy()
+        if w_df_clean.index.tz is None:
+            w_df_clean.index = w_df_clean.index.tz_localize("America/Sao_Paulo")
+        elif str(w_df_clean.index.tz) != "America/Sao_Paulo":
+            w_df_clean.index = w_df_clean.index.tz_convert("America/Sao_Paulo")
+
+        max_sim_steps = 12 * 168  # até 7 dias em passos de 5min
+        for step in range(max_sim_steps):
+            sim_times.append(c_t)
+            sim_d.append(c_d)
+
+            if t_sensor_era5_dt is None and c_d <= 0:
+                t_sensor_era5_dt = c_t
+            if t_overflow_era5_dt is None and c_d <= -dist_borda_cm:
+                t_overflow_era5_dt = c_t
+                break
+
+            hour_floor = c_t.floor("1h")
+            precip_mmh = w_df_clean.loc[hour_floor, "precipitation"] if hour_floor in w_df_clean.index else 0.0
+            if isinstance(precip_mmh, pd.Series):
+                precip_mmh = precip_mmh.iloc[0]
+
+            if precip_mmh > 0:
+                has_future_rain = True
+                total_rain_era5 += precip_mmh * (5.0 / 60.0)
+
+            r_total = rate_cmh + precip_mmh * factor_mm_cm
+            c_d -= r_total * (5.0 / 60.0)
+            c_t += pd.Timedelta(minutes=5)
+
+        if t_sensor_era5_dt is not None:
+            time_sensor_era5_h = (t_sensor_era5_dt - t_latest).total_seconds() / 3600.0
+        if t_overflow_era5_dt is not None:
+            time_overflow_era5_h = (t_overflow_era5_dt - t_latest).total_seconds() / 3600.0
+
+        era5_sim_df = pd.DataFrame({"dt_round": sim_times, "nivel_imputed": sim_d})
+
+    return {
+        "start_time": t0,
+        "latest_time": t_latest,
+        "duration_h": times_h.iloc[-1],
+        "start_d": valid.loc[max_idx, "val_d"],
+        "curr_d": curr_d,
+        "num_points": len(segment),
+        "rate_cmh": rate_cmh,
+        "time_sensor_h": time_sensor_h,
+        "time_overflow_h": time_overflow_h,
+        "time_sensor_era5_h": time_sensor_era5_h,
+        "time_overflow_era5_h": time_overflow_era5_h,
+        "has_future_rain": has_future_rain,
+        "total_rain_era5": total_rain_era5,
+        "era5_sim_df": era5_sim_df,
+        "segment_df": segment,
+        "slope": slope,
+        "intercept": intercept,
+    }
+
+
 processed_df = preprocess_time_series(df)
 filled_df = fill_gaps(processed_df)
 
@@ -676,6 +824,50 @@ with tab1:
         "O eixo Y direito mostra a precipitação acumulada em cada intervalo de 5 minutos."
     )
 
+    trend = compute_recent_rising_trend(filled_df, dist_borda_cm, weather_df=weather_df, factor_mm_cm=factor_mm_cm)
+    if trend and trend["rate_cmh"] > 0:
+        t_sens_str = format_hours(trend["time_sensor_h"])
+        t_ovf_str = format_hours(trend["time_overflow_h"])
+        t_sens_era5_str = format_hours(trend["time_sensor_era5_h"])
+        t_ovf_era5_str = format_hours(trend["time_overflow_era5_h"])
+        t_start_fmt = trend["start_time"].strftime("%d/%m/%Y às %H:%M")
+        t_dur_fmt = format_hours(trend["duration_h"])
+
+        rain_badge = (
+            f"<span style='color: #d9534f; font-weight: bold;'>🌦️ Chuva Futura ERA5 (+{trend['total_rain_era5']:.1f} mm previstos)</span>"
+            if trend["has_future_rain"]
+            else "<span style='color: #5cb85c; font-weight: bold;'>☀️ Sem Chuva Prevista no Período</span>"
+        )
+
+        st.markdown(
+            f"""
+            <div style="background-color: #eef9ff; border-left: 5px solid #0056b3; padding: 15px; border-radius: 6px; margin-bottom: 15px;">
+                <h4 style="margin: 0 0 8px 0; color: #0056b3;">🧪 Estimativa de Subida Real (Com Previsão Met. ERA5 / Open-Meteo)</h4>
+                <p style="margin: 0 0 10px 0; font-size: 13px; color: #333;">
+                    Tendência real desde <b>{t_start_fmt}</b> ({t_dur_fmt} atrás | {trend['num_points']} leituras).
+                    Distância inicial: <b>{trend['start_d']:.1f} cm</b> → Atual: <b>{trend['curr_d']:.1f} cm</b> | {rain_badge}
+                </p>
+                <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 160px;">
+                        <span style="font-size: 12px; color: #666;">📈 Taxa Base Observada</span><br>
+                        <b style="font-size: 20px; color: #0056b3;">{trend['rate_cmh']:.2f} cm/h</b>
+                    </div>
+                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 210px;">
+                        <span style="font-size: 12px; color: #666;">🎯 Tempo até o Sensor (0 cm)</span><br>
+                        <b style="font-size: 18px; color: #d9534f;">{t_sens_era5_str}</b>
+                        <br><span style="font-size: 11px; color: #777;">Base sem chuva: {t_sens_str}</span>
+                    </div>
+                    <div style="background: white; padding: 10px 15px; border-radius: 6px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); flex: 1; min-width: 230px;">
+                        <span style="font-size: 12px; color: #666;">🌊 Tempo até Transbordar (Borda)</span><br>
+                        <b style="font-size: 18px; color: #c9302c;">{t_ovf_era5_str}</b>
+                        <br><span style="font-size: 11px; color: #777;">Base sem chuva: {t_ovf_str}</span>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
 
     fig = go.Figure()
@@ -710,6 +902,35 @@ with tab1:
             line=dict(color="#ff7f0e", width=1.5),
         )
     )
+
+    if trend and trend["rate_cmh"] > 0:
+        t_latest = trend["latest_time"]
+        t_sensor_dt = t_latest + pd.Timedelta(hours=trend["time_sensor_h"])
+        t_overflow_dt = t_latest + pd.Timedelta(hours=trend["time_overflow_h"])
+
+        # Projeção Linear Base (Sem Chuva)
+        fig.add_trace(
+            go.Scatter(
+                x=[t_latest, t_sensor_dt, t_overflow_dt],
+                y=[trend["curr_d"], 0, d_overflow],
+                mode="lines+markers",
+                name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
+                line=dict(color="#777777", width=2, dash="dash"),
+                marker=dict(size=5, symbol="circle"),
+            )
+        )
+
+        # Projeção Corrigida com Previsão ERA5 (Com Chuva Futura)
+        if trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=trend["era5_sim_df"]["dt_round"],
+                    y=trend["era5_sim_df"]["nivel_imputed"],
+                    mode="lines",
+                    name="Projeção Corrigida (ERA5 + Chuva)",
+                    line=dict(color="#d9534f", width=2.5, dash="dot"),
+                )
+            )
     fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bomba Liga (Água Alta)")
     fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bomba Desliga (Água Baixa)")
     fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Nível Crítico / Transbordo")
