@@ -2,7 +2,7 @@ streamlit>=1.60.0
 requests>=2.34.2
 pandas>=3.0.5
 plotly>=6.9.0
-numpy>=2.0.0
+numpy>=2.5.1
 # beautifulsoup4 é opcional: se instalado, faz scraping ao vivo da Defesa Civil e atualiza dc_rankings_cache.json
 # Se ausente (Streamlit Cloud), usa o dc_rankings_cache.json do repositório como fallback
-beautifulsoup4>=4.12.0
+beautifulsoup4>=4.15.0
