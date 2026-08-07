@@ -18,6 +18,8 @@ Monitor_poco/
 
 Uma aplicação web desenvolvida em **Streamlit** para monitoramento em tempo real de nível de poço de drenagem, análise estatística de pluviometria histórica (curvas IDF / Gumbel), calibração geométrica de reservatórios e emissão automatizada de **Relatório de Adequação Hidráulica** em conformidade com a norma **ABNT NBR 10844**.
 
+> 📡 **Firmware ESP32 (Sensor de Nível):** [https://github.com/olafotte/ESP32_monitor_poco](https://github.com/olafotte/ESP32_monitor_poco)
+
 ---
 
 ## 📌 Principais Funcionalidades
