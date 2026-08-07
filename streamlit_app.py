@@ -1010,7 +1010,7 @@ else:
 
 st.subheader("Diagnóstico do poço")
 
-# ── Verificação de Atraso nos Dados do Turso (> 6 minutos) ──
+# ── Verificação de Atraso nos Dados do Turso (> 7 minutos) ──
 latest_ts = latest_row.get("dt_round") or latest_row.get("timestamp")
 if latest_ts is not None:
     if not isinstance(latest_ts, pd.Timestamp):
@@ -1023,7 +1023,7 @@ if latest_ts is not None:
     now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
     delay_min = (now_tz - latest_ts).total_seconds() / 60.0
 
-    if delay_min > 6.0:
+    if delay_min > 7.0:
         st.error(
             f"🚨 **ERRO DE DADOS DA LEITURA (Atraso de {delay_min:.0f} min):**\n\n"
             f"Última leitura registrada em **{latest_ts.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
