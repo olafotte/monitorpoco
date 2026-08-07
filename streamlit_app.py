@@ -14,7 +14,15 @@ import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import streamlit as st
 
-from src.config import FUNDODOPOCO, RECOMMENDED_ERA5_FACTOR, DEFAULT_D_ON, DEFAULT_D_OFF, DEFAULT_DIST_BORDA, DEFAULT_D_OFF2, DEFAULT_D_ON2
+from src.config import (
+    FUNDODOPOCO,
+    RECOMMENDED_ERA5_FACTOR,
+    DEFAULT_D_ON,
+    DEFAULT_D_OFF,
+    DEFAULT_DIST_BORDA,
+    DEFAULT_D_ON2,
+    DEFAULT_D_OFF2,
+)
 from src.data.adolfo_konder import get_adolfo_konder_data as load_adolfo_konder_dataset
 from src.data.sensor_config import (
     load_sensor_height_config,
