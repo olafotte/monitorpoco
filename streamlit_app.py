@@ -14,7 +14,7 @@ import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 import streamlit as st
 
-from src.config import FUNDODOPOCO, RECOMMENDED_ERA5_FACTOR
+from src.config import FUNDODOPOCO, RECOMMENDED_ERA5_FACTOR, DEFAULT_D_ON, DEFAULT_D_OFF, DEFAULT_DIST_BORDA, DEFAULT_D_OFF2, DEFAULT_D_ON2
 from src.data.adolfo_konder import get_adolfo_konder_data as load_adolfo_konder_dataset
 from src.data.sensor_config import (
     load_sensor_height_config,
@@ -51,17 +51,17 @@ headers = {
 
 sensor_config_data = load_sensor_height_config()
 sensor_history = sensor_config_data.get("history", [])
-active_dist_default = get_active_dist_borda(sensor_config_data, fallback=70.0)
+active_dist_default = get_active_dist_borda(sensor_config_data, fallback=DEFAULT_DIST_BORDA)
 
 st.sidebar.header("⚙️ Configurações do Sistema")
 
 with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
     d_on = st.number_input(
-        "Nível Ativação Bomba 1 (cm abaixo do topo)", value=151.0, step=0.5,
+        "Nível Ativação Bomba 1 (cm abaixo do topo)", value=DEFAULT_D_ON, step=0.5,
         help="Distância da água abaixo do topo do poço quando a 1ª bomba LIGA (água alta, ex: 160 cm abaixo do topo)."
     )
     d_off = st.number_input(
-        "Nível Desativação Bomba 1 (cm abaixo do topo)", value=172.0, step=0.5,
+        "Nível Desativação Bomba 1 (cm abaixo do topo)", value=DEFAULT_D_OFF, step=0.5,
         help="Distância da água abaixo do topo do poço quando a 1ª bomba DESLIGA (água baixa, ex: 183 cm abaixo do topo)."
     )
     dist_borda_cm = st.number_input(
@@ -131,11 +131,11 @@ with st.sidebar.expander("⚡ Automação & Bombas em Paralelo", expanded=True):
             help="Vazão nominal da 2ª bomba em m³/h (padrão: igual à 1ª bomba)"
         )
         d_on2 = st.number_input(
-            "Nível Ativação 2ª Bomba (cm)", value=max(round(d_on - 30.0, 1), 0.0), step=0.5,
+            "Nível Ativação 2ª Bomba (cm)", value= DEFAULT_D_ON2, step=0.5,
             help="Distância quando a 2ª bomba LIGA (bóia de emergência 30 cm mais alta que a 1ª)"
         )
         d_off2 = st.number_input(
-            "Nível Desativação 2ª Bomba (cm)", value=max(round(d_off - 30.0, 1), 0.0), step=0.5,
+            "Nível Desativação 2ª Bomba (cm)", value=DEFAULT_D_OFF2, step=0.5,
             help="Distância quando a 2ª bomba DESLIGA"
         )
         r_pump2_param = vazao_bomba2_m3h * fator_m3h_para_cmh
@@ -992,19 +992,37 @@ latest_distance = (
     else None
 )
 
-col1, col2 = st.columns(2)
-with col1:
-    if latest_distance is not None:
-        st.metric("Distância atual do sensor à linha d'água", f"{latest_distance:.0f} cm")
-    else:
-        st.metric("Distância atual do sensor à linha d'água", "Sem leitura válida")
-with col2:
-    if "status_bomba" in latest_row and not pd.isna(latest_row["status_bomba"]):
-        st.metric(label="Status da Bomba", value=str(latest_row["status_bomba"]))
-    else:
-        st.info("Coluna de status da bomba não encontrada na resposta.")
+
+
+if latest_distance is not None:
+    st.metric("Distância atual do sensor à linha d'água", f"{latest_distance:.0f} cm")
+else:
+    st.metric("Distância atual do sensor à linha d'água", "Sem leitura válida")
+
 
 st.subheader("Diagnóstico do poço")
+
+# ── Verificação de Atraso nos Dados do Turso (> 6 minutos) ──
+latest_ts = latest_row.get("dt_round") or latest_row.get("timestamp")
+if latest_ts is not None:
+    if not isinstance(latest_ts, pd.Timestamp):
+        latest_ts = pd.to_datetime(latest_ts)
+    if latest_ts.tzinfo is None:
+        latest_ts = latest_ts.tz_localize("America/Sao_Paulo")
+    else:
+        latest_ts = latest_ts.tz_convert("America/Sao_Paulo")
+
+    now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+    delay_min = (now_tz - latest_ts).total_seconds() / 60.0
+
+    if delay_min > 6.0:
+        st.error(
+            f"🚨 **ERRO DE DADOS DA LEITURA (Atraso de {delay_min:.0f} min):**\n\n"
+            f"Última leitura registrada em **{latest_ts.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
+            f"O sistema está há mais de **5 minutos sem dados atualizados** do banco Turso.\n\n"
+            f"⚠️ *Possíveis causas: Servidor Turso offline, sensores sem comunicação, falha na transmissão da ESP32 ou queda de energia.*"
+        )
+
 if latest_distance is None:
     st.warning("Sem leitura válida da distância do sensor à linha d'água.")
 else:
@@ -1900,7 +1918,7 @@ with tab3:
             pico_15m_val = None
 
         min_dist_ev = min(sim_levels_ev)
-        folga_min_ev = min_dist_ev + dist_borda_cm
+        dist_ao_sensor_ev = abs(min_dist_ev - dist_borda_cm)
 
         st.markdown("---")
         m1, m2, m3, m4 = st.columns(4)
@@ -1910,11 +1928,11 @@ with tab3:
             f"{pico_mmh_ev:.1f} mm/h",
             help=f"Maior impulso de chuva. " + (f"Pico de 15min: {pico_15m_val:.1f} mm." if pico_15m_val else "") + f" Entrada no poço: {pico_mmh_ev * factor_mm_cm:.1f} cm/h"
         )
-        m3.metric("Nível Mais Alto Atingido", f"{min_dist_ev:.1f} cm do sensor", help="0 cm = face do sensor")
+        m3.metric("Nível Mais Alto Atingido", f"{min_dist_ev:.1f} cm do topo", help="0 cm = Topo do Poço (Borda Superior)")
         if ovf_ev:
             m4.metric("Status do Evento", "❌ TRANSBORDO", delta="Borda Superada!", delta_color="inverse")
         else:
-            m4.metric("Status do Evento", "✅ SEM TRANSBORDO", delta=f"Folga mín: {folga_min_ev:.0f} cm")
+            m4.metric("Status do Evento", "✅ SEM TRANSBORDO", delta=f"Folga ao topo: {min_dist_ev:.1f} cm")
 
         fig_hist = go.Figure()
 
@@ -1978,8 +1996,7 @@ with tab3:
             t_ovf_str = ovf_ev_time.strftime("%d/%m/%Y às %H:%M")
             st.error(
                 f"🚨 **ALERTA DE TRANSBORDO REGISTRADO NA SIMULAÇÃO:**\n\n"
-                f"Na data de **{t_ovf_str}**, o nível da água ultrapassou a borda superior do poço "
-                f"(superou a folga de {dist_borda_cm:.0f} cm acima do sensor).\n"
+                f"Na data de **{t_ovf_str}**, o nível da água ultrapassou a borda superior do poço.\n"
                 f"O pico de chuva de **{pico_mmh_ev:.1f} mm/h** ({pico_mmh_ev * factor_mm_cm:.1f} cm/h no poço) "
                 f"superou a capacidade instalada de remoção das bombas ({r_pump_total_param:.1f} cm/h)."
             )
@@ -1987,8 +2004,8 @@ with tab3:
             st.success(
                 f"✅ **SISTEMA SUPORTOU O EVENTO HISTÓRICO ({lbl_fonte}):**\n\n"
                 f"Durante todo o período de {duracao_evento_h}h a partir de {start_hist_str}, "
-                f"o nível máximo atingido ficou a **{min_dist_ev:.1f} cm** do sensor "
-                f"(margem restante de **{folga_min_ev:.0f} cm** até a borda superior)."
+                f"o nível máximo atingido ficou a **{min_dist_ev:.1f} cm da borda superior (topo do poço)** "
+                f"(distância de **{dist_ao_sensor_ev:.1f} cm** em relação ao sensor físico)."
             )
 
 with tab4:
