@@ -2,7 +2,7 @@
 Configurações globais e constantes físicas do sistema de monitoramento de poço.
 """
 
-FUNDODOPOCO = 210.0  # cm, profundidade total do poço a partir do topo (borda superior)
+FUNDODOPOCO = 210.0  # cm, profundidade total do poço a partir do topo (borda superior) 
 
 # Coordenadas geográficas padrão (Blumenau / SC)
 DEFAULT_LATITUDE = -26.9166
