@@ -16,6 +16,12 @@ import streamlit as st
 
 from src.config import FUNDODOPOCO, RECOMMENDED_ERA5_FACTOR
 from src.data.adolfo_konder import get_adolfo_konder_data as load_adolfo_konder_dataset
+from src.data.sensor_config import (
+    load_sensor_height_config,
+    save_sensor_height_config,
+    get_active_dist_borda,
+    get_dist_borda_series,
+)
 from src.models.gumbel import fit_gumbel, gumbel_quantile
 
 st.set_page_config(page_title="Monitoramento de Poço - Condomínio", layout="wide")
@@ -43,22 +49,66 @@ headers = {
     "Content-Type": "application/json",
 }
 
+sensor_config_data = load_sensor_height_config()
+sensor_history = sensor_config_data.get("history", [])
+active_dist_default = get_active_dist_borda(sensor_config_data, fallback=70.0)
+
 st.sidebar.header("⚙️ Configurações do Sistema")
 
 with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
     d_on = st.number_input(
-        "Nível Ativação Bomba 1 (cm)", value=71.5, step=0.5, help="Distância quando a 1ª bomba liga (água alta)"
+        "Nível Ativação Bomba 1 (cm abaixo do topo)", value=151.0, step=0.5,
+        help="Distância da água abaixo do topo do poço quando a 1ª bomba LIGA (água alta, ex: 160 cm abaixo do topo)."
     )
     d_off = st.number_input(
-        "Nível Desativação Bomba 1 (cm)", value=92.5, step=0.5, help="Distância quando a 1ª bomba desliga (água baixa)"
+        "Nível Desativação Bomba 1 (cm abaixo do topo)", value=172.0, step=0.5,
+        help="Distância da água abaixo do topo do poço quando a 1ª bomba DESLIGA (água baixa, ex: 183 cm abaixo do topo)."
     )
     dist_borda_cm = st.number_input(
-        "Dist. Sensor → Borda Superior (cm)", value=33.0, step=1.0,
-        help="Distância vertical do sensor até a borda superior do poço."
+        "Profundidade do Sensor no Poço (cm)", value=float(active_dist_default), step=1.0,
+        help="Distância em que o sensor está pendurado dentro do poço a partir do topo (ex: 70 cm)."
     )
-    d_overflow = -dist_borda_cm
-    capacidade_total_cm = FUNDODOPOCO + dist_borda_cm
-    st.caption(f"↳ Transbordo: **−{dist_borda_cm:.0f} cm** | Capacidade total: **{capacidade_total_cm:.0f} cm**")
+    d_overflow = 0.0
+    capacidade_total_cm = FUNDODOPOCO
+    st.caption(f"↳ Topo do Poço: **0 cm** | Liga: **+{d_on:.1f} cm** (sensor lê: {d_on-dist_borda_cm:.1f} cm) | Desliga: **+{d_off:.1f} cm** (sensor lê: {d_off-dist_borda_cm:.1f} cm)")
+
+    with st.expander("📜 Gerenciar Histórico de Alturas (JSON)", expanded=False):
+        st.caption("Histórico por período em `sensor_heights.json`:")
+        if sensor_history:
+            h_df = pd.DataFrame(sensor_history)
+            disp_cols = [c for c in ["start_date", "end_date", "dist_borda_cm", "description"] if c in h_df.columns]
+            st.dataframe(h_df[disp_cols], hide_index=True, use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**➕ Adicionar / Ajustar Período:**")
+        new_start = st.text_input("Data Início (ISO)", value=_dt.datetime.now().strftime("%Y-%m-%dT00:00:00"), key="cfg_new_start")
+        new_end = st.text_input("Data Fim (vazio = período ativo atual)", value="", key="cfg_new_end")
+        new_dist = st.number_input("Dist. Sensor → Borda Superior (cm)", value=float(dist_borda_cm), step=1.0, key="cfg_new_dist")
+        new_desc = st.text_input("Descrição", value="Ajuste de altura do sensor", key="cfg_new_desc")
+
+        if st.button("💾 Salvar Ajuste no JSON"):
+            p_end = new_end.strip() if new_end.strip() else None
+            p_start = new_start.strip()
+
+            if p_end is None and sensor_history:
+                for item in sensor_history:
+                    if item.get("end_date") is None:
+                        item["end_date"] = p_start
+
+            new_id = len(sensor_history) + 1
+            sensor_history.append({
+                "id": new_id,
+                "start_date": p_start,
+                "end_date": p_end,
+                "dist_borda_cm": abs(float(new_dist)),
+                "description": new_desc.strip()
+            })
+            sensor_config_data["history"] = sensor_history
+            if save_sensor_height_config(sensor_config_data):
+                st.success("Histórico atualizado em sensor_heights.json!")
+                st.rerun()
+            else:
+                st.error("Falha ao salvar no arquivo JSON.")
 
 with st.sidebar.expander("⚡ Automação & Bombas em Paralelo", expanded=True):
     vazao_bomba_m3h = st.number_input(
@@ -228,13 +278,31 @@ if "status_bomba" not in df.columns:
 
 
 @st.cache_data
-def preprocess_time_series(input_df: pd.DataFrame) -> pd.DataFrame:
+def preprocess_time_series(
+    input_df: pd.DataFrame, sensor_history_json_str: str = "", active_dist_cm: float = 70.0
+) -> pd.DataFrame:
     df = input_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     # Ajustar para o horário de Brasília
     df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
-    df["nivel_cm"] = pd.to_numeric(df["nivel_cm"], errors="coerce")
+
+    sensor_history = json.loads(sensor_history_json_str) if sensor_history_json_str else []
+
+    df["nivel_cm_raw"] = pd.to_numeric(df["nivel_cm"], errors="coerce")
+
+    # Atribuir histórico dinâmico de dist_borda_cm a cada timestamp
+    df["dist_borda_cm"] = get_dist_borda_series(
+        df["timestamp"],
+        history=sensor_history,
+        active_dist_override=active_dist_cm
+    )
+
+    # Nível da água a partir do TOPO DO POÇO (0.0 cm = Topo do Poço, medidas positivas para baixo)
+    # Sensor pendurado dentro do poço a dist_borda_cm (ex: 70cm) + Leitura do sensor (ex: 90cm) = 160cm abaixo do topo
+    df["dist_borda_agua_cm"] = df["dist_borda_cm"].abs() + df["nivel_cm_raw"]
+    df["nivel_cm"] = df["dist_borda_agua_cm"]
     df["distancia_sensor_cm"] = df["nivel_cm"]
+
     df["altura_agua_cm"] = (FUNDODOPOCO - df["distancia_sensor_cm"]).clip(lower=0)
     df["dt_round"] = df["timestamp"].dt.round("5min")
 
@@ -245,7 +313,15 @@ def preprocess_time_series(input_df: pd.DataFrame) -> pd.DataFrame:
         freq="5min",
     )
     df_grid = pd.DataFrame({"dt_round": full_idx})
-    return pd.merge(df_grid, df_dedup, on="dt_round", how="left")
+    merged = pd.merge(df_grid, df_dedup, on="dt_round", how="left")
+
+    if merged["dist_borda_cm"].isna().any():
+        merged["dist_borda_cm"] = get_dist_borda_series(
+            merged["dt_round"],
+            history=sensor_history,
+            active_dist_override=active_dist_cm
+        )
+    return merged
 
 
 def simulate_gap(
@@ -692,7 +768,7 @@ def plot_historical_extremes_chart(df: pd.DataFrame):
 
     fig.update_layout(
         title="📈 Ocorrência Temporal dos Extremos de Nível e Períodos Operacionais",
-        yaxis=dict(autorange="reversed", title="Distância até o Sensor (cm)"),
+        yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
         xaxis=dict(title="Data / Hora"),
         legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
         height=520,
@@ -883,7 +959,8 @@ def compute_recent_rising_trend(
     }
 
 
-processed_df = preprocess_time_series(df)
+sensor_history_json_str = json.dumps(sensor_history, sort_keys=True)
+processed_df = preprocess_time_series(df, sensor_history_json_str=sensor_history_json_str, active_dist_cm=dist_borda_cm)
 filled_df = fill_gaps(processed_df)
 
 # Buscar dados meteorológicos alinhados ao período do sensor
@@ -930,27 +1007,21 @@ with col2:
 st.subheader("Diagnóstico do poço")
 if latest_distance is None:
     st.warning("Sem leitura válida da distância do sensor à linha d'água.")
-elif latest_distance >= FUNDODOPOCO:
-    st.warning(f"⚠️ Poço seco: a distância do sensor à linha d'água é de {latest_distance/100:.1f} m ou mais.")
 else:
-    altura_agua_cm = max(FUNDODOPOCO - latest_distance, 0.0)
-    dist_ao_transbordo = latest_distance + dist_borda_cm
-    # Alertas progressivos baseados na distância real à borda
-    if dist_ao_transbordo <= 20:
+    dist_sensor_agua = latest_distance - dist_borda_cm
+    if dist_sensor_agua <= 0:
+        st.error(f"🚨 **ALERTA EXTREMO:** Sensor SUBMERGIDO! Nível d'água **{abs(dist_sensor_agua):.0f} cm** acima do sensor físico.")
+    elif dist_sensor_agua <= 20.0:
         st.error(
-            f"🚨 **ALERTA:** poço a apenas **{dist_ao_transbordo:.0f} cm** da borda! "
-            f"(sensor: {latest_distance:.0f} cm | borda: +{dist_borda_cm:.0f} cm)"
+            f"🚨 **ALERTA DE RISCO:** A água está a apenas **{dist_sensor_agua:.0f} cm** do sensor físico "
+            f"(na eminência de ser submergido!)."
         )
-    elif dist_ao_transbordo <= 50:
-        st.warning(
-            f"⚠️ Atenção: poço a **{dist_ao_transbordo:.0f} cm** da borda. "
-            f"(sensor: {latest_distance:.0f} cm | borda: +{dist_borda_cm:.0f} cm)"
-        )
+    elif latest_distance >= FUNDODOPOCO * 0.9:
+        st.warning(f"⚠️ Poço seco: a distância do sensor à linha d'água é de {latest_distance/100:.1f} m ou mais.")
     else:
         st.success(
-            f"Nível estimado da água: **{altura_agua_cm:.0f} cm** acima do fundo | "
-            f"📦 Folga até a borda: **{dist_ao_transbordo:.0f} cm** "
-            f"({latest_distance:.0f} cm sensor + {dist_borda_cm:.0f} cm borda)"
+            f"Nível estimado da água: **{latest_distance:.1f} cm** abaixo do topo do poço "
+            f"(Sensor a {dist_sensor_agua:.0f} cm da água | Bomba Liga a {d_on:.0f} cm | Desliga a {d_off:.0f} cm)"
         )
 
 col1, col2, col3, col4 = st.columns(4)
@@ -1171,11 +1242,11 @@ with tab1:
     if tem_bomba2:
         fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
         fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
-    fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Nível Crítico / Transbordo")
+    fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)")
     fig.update_layout(
         yaxis=dict(
             autorange="reversed",
-            title="Distância até o Sensor (cm)",
+            title="Nível da Água (cm abaixo do topo do poço)",
         ),
         yaxis2=dict(
             title="Precipitação (mm / 5min)",
@@ -1555,7 +1626,7 @@ with tab2:
     fig_comp.update_layout(
         title="Rampa de Esvaziamento do Poço: Instante da Ativação da Bomba (t = 0 min, Múltiplos Eventos)",
         xaxis_title="Tempo Decorrido desde a Ativação da Bomba (Minutos)",
-        yaxis=dict(autorange="reversed", title="Distância do Sensor à Água (cm)"),
+        yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
         height=480,
         margin=dict(l=20, r=20, t=40, b=40)
     )
@@ -1644,7 +1715,7 @@ with tab3:
     fig_sim.update_layout(
         title=f"Simulação Dinâmica para Chuva de {chuva_mm}mm em {chuva_horas}h ({intensidade_mm_h:.1f} mm/h)",
         xaxis_title="Tempo Decorrido (Horas)",
-        yaxis=dict(autorange="reversed", title="Distância até o Sensor (cm)"),
+        yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
         height=450,
     )
     st.plotly_chart(fig_sim, use_container_width=True)
@@ -1884,13 +1955,13 @@ with tab3:
             fig_hist.add_hline(y=d_on2, line_dash="dash", line_color="orange", annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
             fig_hist.add_hline(y=d_off2, line_dash="dash", line_color="teal", annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
 
-        fig_hist.add_hline(y=d_overflow, line_dash="dot", line_color="darkred", annotation_text="Borda (Transbordo)", annotation_position="top right")
+        fig_hist.add_hline(y=d_overflow, line_dash="dot", line_color="darkred", annotation_text="Topo do Poço / Borda Superior (0 cm)", annotation_position="top right")
         fig_hist.add_hrect(y0=0, y1=d_overflow, fillcolor="rgba(231,76,60,0.10)", line_width=0)
 
         fig_hist.update_layout(
             title=f"Reconstrução do Evento ({lbl_fonte}): {start_hist_str} ({duracao_evento_h}h) | Chuva Total: {precip_total_ev:.1f} mm | Pico: {pico_mmh_ev:.1f} mm/h",
             xaxis=dict(title="Data / Hora"),
-            yaxis=dict(autorange="reversed", title="Distância Sensor → Água (cm)"),
+            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
             yaxis2=dict(
                 title="Intensidade de Chuva (mm/h)",
                 overlaying="y", side="right", showgrid=False, rangemode="tozero",
@@ -2248,7 +2319,7 @@ with tab5:
     fig5.update_layout(
         yaxis=dict(
             autorange="reversed",
-            title="Distância Sensor → Água (cm)",
+            title="Nível da Água (cm abaixo do topo do poço)",
         ),
         yaxis2=dict(
             title="Precipitação (mm/h)",
@@ -2673,7 +2744,7 @@ with tab6:
         fig_idf_sim.update_layout(
             title=f"Chuva Tr=25 anos | {dur_sel}h | {intens_sel:.1f} mm/h | Partida: d_off={d_off:.0f} cm",
             xaxis_title="Tempo (horas)",
-            yaxis=dict(autorange="reversed", title="Distância Sensor → Água (cm)"),
+            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
             height=420, margin=dict(l=20, r=20, t=50, b=30),
         )
         st.plotly_chart(fig_idf_sim, use_container_width=True)
@@ -3283,11 +3354,6 @@ with tab7:
                     line=dict(color=palette_k[idx_tr % len(palette_k)], width=2.5 if tr_val == 25 else 1.5),
                     marker=dict(size=7),
                 ))
-            fig_idf_k.add_hline(
-                y=intensidade_sat_dc, line_dash="dash", line_color="red",
-                annotation_text=f"Saturação bomba ({intensidade_sat_dc:.1f} mm/h)",
-                annotation_position="top right",
-            )
             fig_idf_k.update_layout(
                 title="Curvas IDF Gumbel — Estação Ponte Adolfo Konder (2021–2025)",
                 xaxis_title="Duração", yaxis_title="Intensidade Média (mm/h)",
@@ -3336,183 +3402,157 @@ with tab7:
 # ──────────────────────────────────────────────────────────────────────────────────
 with tab8:
     st.subheader("🗂️ Diagrama do Poço de Drenagem")
-    st.caption("Diagrama em escala real baseado nos parâmetros do sidebar. Atualiza automaticamente ao alterar qualquer parâmetro.")
+    st.caption("Diagrama esquemático em escala real a partir do Topo do Poço (0 cm). Atualiza automaticamente ao alterar qualquer parâmetro.")
 
-    # ── Geometria do poço (eixo Y: distância a partir do sensor, positivo = abaixo, negativo = acima) ──
-    # Eixo Y = distância do sensor à água (o mesmo do simulador)
-    # Y = 0  → nível do sensor
-    # Y > 0  → abaixo do sensor (fundo = +FUNDODOPOCO)
-    # Y < 0  → acima do sensor (borda = -dist_borda_cm)
+    # ── Posições Y em cm a partir do Topo do Poço (0.0 cm = Topo do Poço) ──
+    y_topo = 0.0
+    y_sensor = abs(float(dist_borda_cm))     # Ex: +70.0 cm (pendurado dentro do poço)
+    y_risco = y_sensor + 20.0                # Ex: +90.0 cm (20 cm da água ao sensor)
+    y_don = float(d_on)                      # Ex: +160.0 cm abaixo do topo
+    y_doff = float(d_off)                    # Ex: +183.0 cm abaixo do topo
+    y_don2 = float(d_on2)
+    y_doff2 = float(d_off2)
+    y_fundo = float(FUNDODOPOCO)             # Ex: +210.0 cm abaixo do topo
 
-    y_fundo = float(FUNDODOPOCO)          # +150 cm (fundo do poço)
-    y_borda = -float(dist_borda_cm)       # -90 cm (borda superior)
-    y_sensor = 0.0                         # sensor
-    y_don = float(d_on)                   # nível onde bomba 1 liga
-    y_doff = float(d_off)                 # nível onde bomba 1 desliga
-    y_don2 = float(d_on2)                 # nível onde bomba 2 liga (emergência)
-    y_doff2 = float(d_off2)               # nível onde bomba 2 desliga
-    y_overflow = float(d_overflow)        # = -dist_borda_cm
-
-    # Nível atual da água
+    # Nível atual da água (distância a partir do topo do poço)
     if latest_distance is not None:
-        y_agua = float(latest_distance)   # leitura do sensor = distância atual
+        y_agua = float(latest_distance)
     else:
-        y_agua = y_doff  # fallback: nível de desligamento da bomba
+        y_agua = y_don  # fallback
 
-    # Total de altura representada
-    y_top = y_borda - 10          # margem acima da borda
-    y_bottom = y_fundo + 10       # margem abaixo do fundo
+    dist_sensor_agua = max(y_agua - y_sensor, 0.0)
 
-    # Largura simbólica do poço
-    w = 1.0       # largura total
-    wwall = 0.08  # espessura da parede
+    y_top = -20.0                # Margem acima do topo do poço
+    y_bottom = y_fundo + 20.0    # Margem abaixo do fundo
+
+    w = 1.0       # Largura do poço
+    wwall = 0.08  # Espessura da parede
 
     fig_diag = go.Figure()
 
-    # ── Fundo do poço ──
+    # 1. Fundo do poço
     fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=y_fundo, y1=y_fundo + 8,
+        x0=-w/2, x1=w/2, y0=y_fundo, y1=y_fundo + 10,
         fillcolor="#795548", line_color="#4e342e", line_width=2)
 
-    # ── Paredes esquerda e direita (do fundo até a borda) ──
+    # 2. Paredes do poço (do topo até o fundo)
     for xi0, xi1 in [(-w/2 - wwall, -w/2), (w/2, w/2 + wwall)]:
         fig_diag.add_shape(type="rect",
-            x0=xi0, x1=xi1, y0=y_borda, y1=y_fundo + 8,
+            x0=xi0, x1=xi1, y0=y_topo, y1=y_fundo + 10,
             fillcolor="#9e9e9e", line_color="#616161", line_width=1.5)
 
-    # ── Zona de transbordo (acima do sensor até a borda) ──
+    # 3. Suporte e caixa do Sensor (pendurado dentro do poço)
     fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=y_borda, y1=0,
-        fillcolor="rgba(231,76,60,0.10)", line_width=0)
+        x0=-w/4, x1=w/4, y0=y_sensor - 5, y1=y_sensor,
+        fillcolor="#ff9800", line_color="#e67e22", line_width=2)
 
-    # ── Zona da bomba 1 ON ──
+    # Cabo/haste de sustentação do sensor vindo do topo (0 cm) até o sensor (+70 cm)
+    fig_diag.add_shape(type="line",
+        x0=0, x1=0, y0=y_topo, y1=y_sensor - 5,
+        line=dict(color="#333333", width=2.5, dash="solid"))
+
+    # 4. Faixa de Risco do Sensor (até 20 cm abaixo do sensor)
     fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=y_don, y1=y_doff,
-        fillcolor="rgba(52,152,219,0.12)", line_width=0)
+        x0=-w/2, x1=w/2, y0=y_sensor, y1=y_risco,
+        fillcolor="rgba(231,76,60,0.15)", line_width=0)
+    fig_diag.add_shape(type="line",
+        x0=-w/2, x1=w/2, y0=y_risco, y1=y_risco,
+        line=dict(color="#e74c3c", width=1.5, dash="dot"))
 
-    # ── Zona da bomba 2 ON (emergência) ──
-    if tem_bomba2:
-        fig_diag.add_shape(type="rect",
-            x0=-w/2, x1=w/2, y0=y_don2, y1=y_don,
-            fillcolor="rgba(230,126,34,0.15)", line_width=0)
+    # 5. Zona de atuação da Bomba 1 (entre Liga e Desliga)
+    fig_diag.add_shape(type="rect",
+        x0=-w/2, x1=w/2, y0=min(y_don, y_doff), y1=max(y_don, y_doff),
+        fillcolor="rgba(52,152,219,0.15)", line_width=0)
 
-    # ── Água atual ──
+    # 6. Água atual no poço (do nível atual da água até o fundo)
     if y_agua <= y_fundo:
         fig_diag.add_shape(type="rect",
             x0=-w/2 + 0.01, x1=w/2 - 0.01,
-            y0=y_agua, y1=y_fundo,
-            fillcolor="rgba(30,144,255,0.35)",
-            line_color="rgba(30,144,255,0.6)", line_width=1)
+            y0=max(y_agua, y_top), y1=y_fundo,
+            fillcolor="rgba(30,144,255,0.40)",
+            line_color="rgba(30,144,255,0.7)", line_width=1.5)
 
-    # ── Linha do sensor ──
+    # 7. Linha do Topo do Poço (0 cm)
     fig_diag.add_shape(type="line",
-        x0=-0.15, x1=0.15, y0=0, y1=0,
-        line=dict(color="#ff9800", width=3))
-    fig_diag.add_shape(type="line",
-        x0=0, x1=0, y0=-15, y1=0,
-        line=dict(color="#ff9800", width=2, dash="dot"))
+        x0=-w/2 - wwall, x1=w/2 + wwall, y0=0, y1=0,
+        line=dict(color="black", width=3.5))
 
-    # ── Linha de borda ──
-    fig_diag.add_shape(type="line",
-        x0=-w/2 - wwall, x1=w/2 + wwall, y0=y_borda, y1=y_borda,
-        line=dict(color="darkred", width=2.5, dash="dot"))
-
-    # ── Linhas de liga/desliga bomba ──
-    diag_lines = [(y_don, "Bóia 1 LIGA", "#e74c3c"), (y_doff, "Bóia 1 DESLIGA", "#27ae60")]
+    # 8. Linhas de liga/desliga bomba
+    diag_lines = [(y_don, f"Bomba 1 LIGA ({y_don:.1f} cm)", "#e74c3c"), (y_doff, f"Bomba 1 DESLIGA ({y_doff:.1f} cm)", "#27ae60")]
     if tem_bomba2:
-        diag_lines.extend([(y_don2, "Bóia 2 LIGA (Emergência)", "#d35400"), (y_doff2, "Bóia 2 DESLIGA", "#16a085")])
+        diag_lines.extend([(y_don2, f"Bomba 2 LIGA ({y_don2:.1f} cm)", "#d35400"), (y_doff2, f"Bomba 2 DESLIGA ({y_doff2:.1f} cm)", "#16a085")])
 
     for y_lv, lbl, clr in diag_lines:
         fig_diag.add_shape(type="line",
             x0=-w/2, x1=w/2, y0=y_lv, y1=y_lv,
-            line=dict(color=clr, width=1.5, dash="dash"))
+            line=dict(color=clr, width=2, dash="dash"))
 
-    # ── Linha do nível atual da água ──
+    # 9. Linha do nível atual da água
     fig_diag.add_shape(type="line",
         x0=-w/2 + 0.01, x1=w/2 - 0.01, y0=y_agua, y1=y_agua,
-        line=dict(color="#1e90ff", width=2.5))
+        line=dict(color="#0056b3", width=3))
 
-    # ── Anotações ──
+    # 10. Anotações laterais
     ann_x = w/2 + wwall + 0.08
     annotations = [
-        dict(x=ann_x, y=y_borda, text=f"<b>Borda do Poço</b><br>+{dist_borda_cm:.0f} cm acima do sensor",
+        dict(x=ann_x, y=0, text="<b>Topo do Poço</b> (0 cm)",
              xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="darkred", size=11),
-             arrowcolor="darkred", arrowwidth=1.5),
-        dict(x=ann_x, y=0, text="<b>Sensor</b> (referência = 0 cm)",
+             font=dict(color="black", size=12),
+             arrowcolor="black", arrowwidth=2),
+        dict(x=ann_x, y=y_sensor, text=f"<b>Sensor Físico</b><br>+{y_sensor:.0f} cm pendurado no poço",
              xanchor="left", showarrow=True, ax=30, ay=0,
              font=dict(color="#e67e22", size=11),
              arrowcolor="#e67e22", arrowwidth=1.5),
-        dict(x=ann_x, y=y_agua,
-             text=f"<b>Nível atual</b><br>{y_agua:.0f} cm do sensor<br>Folga até borda: {y_agua + dist_borda_cm:.0f} cm",
+        dict(x=ann_x, y=y_risco, text=f"<b>Risco Submersão</b><br>+{y_risco:.0f} cm (20 cm do sensor)",
              xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="#1e90ff", size=11),
-             arrowcolor="#1e90ff", arrowwidth=1.5),
+             font=dict(color="#e74c3c", size=10),
+             arrowcolor="#e74c3c", arrowwidth=1.2),
+        dict(x=ann_x, y=y_agua,
+             text=f"<b>Nível Atual da Água</b><br>+{y_agua:.1f} cm do topo (sensor lê: {dist_sensor_agua:.1f} cm)",
+             xanchor="left", showarrow=True, ax=30, ay=0,
+             font=dict(color="#0056b3", size=11),
+             arrowcolor="#0056b3", arrowwidth=1.8),
         dict(x=-ann_x, y=y_don,
-             text=f"Bóia 1 LIGA<br>{y_don:.0f} cm",
+             text=f"Bomba 1 LIGA<br>+{y_don:.1f} cm do topo",
              xanchor="right", showarrow=True, ax=-30, ay=0,
              font=dict(color="#e74c3c", size=10),
              arrowcolor="#e74c3c", arrowwidth=1.2),
         dict(x=-ann_x, y=y_doff,
-             text=f"Bóia 1 DESLIGA<br>{y_doff:.0f} cm",
+             text=f"Bomba 1 DESLIGA<br>+{y_doff:.1f} cm do topo",
              xanchor="right", showarrow=True, ax=-30, ay=0,
              font=dict(color="#27ae60", size=10),
              arrowcolor="#27ae60", arrowwidth=1.2),
         dict(x=-ann_x, y=y_fundo,
-             text=f"Fundo do poço<br>{y_fundo:.0f} cm",
+             text=f"Fundo do poço<br>+{y_fundo:.0f} cm do topo",
              xanchor="right", showarrow=True, ax=-30, ay=0,
              font=dict(color="#795548", size=10),
              arrowcolor="#795548", arrowwidth=1.2),
     ]
-    if tem_bomba2:
-        annotations.append(
-            dict(x=-ann_x, y=y_don2,
-                 text=f"Bóia 2 LIGA (Emergência)<br>{y_don2:.0f} cm",
-                 xanchor="right", showarrow=True, ax=-30, ay=0,
-                 font=dict(color="#d35400", size=10),
-                 arrowcolor="#d35400", arrowwidth=1.2)
-        )
-        annotations.append(
-            dict(x=-ann_x, y=y_doff2,
-                 text=f"Bóia 2 DESLIGA<br>{y_doff2:.0f} cm",
-                 xanchor="right", showarrow=True, ax=-30, ay=0,
-                 font=dict(color="#16a085", size=10),
-                 arrowcolor="#16a085", arrowwidth=1.2)
-        )
-
-    diag_tickvals = [y_borda, 0, y_don, y_doff, y_fundo]
-    diag_ticktext = [f"Borda ({y_borda:.0f})", "Sensor (0)", f"Bóia 1 Liga ({y_don:.0f})", f"Bóia 1 Desliga ({y_doff:.0f})", f"Fundo ({y_fundo:.0f})"]
-    if tem_bomba2:
-        diag_tickvals.extend([y_don2, y_doff2])
-        diag_ticktext.extend([f"Bóia 2 Liga ({y_don2:.0f})", f"Bóia 2 Desliga ({y_doff2:.0f})"])
 
     fig_diag.update_layout(
+        title=f"📐 Corte Esquemático do Poço em Escala Real (Topo do Poço = 0 cm | Nível Atual = {y_agua:.1f} cm)",
+        xaxis=dict(range=[-w*1.6, w*1.6], showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(autorange="reversed", range=[y_bottom, y_top], title="Profundidade a partir do Topo do Poço (cm)"),
         annotations=annotations,
-        xaxis=dict(
-            range=[-w/2 - wwall - 0.45, w/2 + wwall + 0.55],
-            showticklabels=False, showgrid=False, zeroline=False,
-        ),
-        yaxis=dict(
-            autorange="reversed",
-            title="Distância do Sensor (cm)  [↓ positivo = abaixo; negativo = acima]",
-            tickmode="array",
-            tickvals=diag_tickvals,
-            ticktext=diag_ticktext,
-            range=[y_bottom, y_top],
-            gridcolor="rgba(0,0,0,0.06)",
-        ),
-        height=680,
-        margin=dict(l=30, r=200, t=40, b=20),
-        showlegend=False,
+        height=650,
+        margin=dict(l=20, r=20, t=50, b=20),
         plot_bgcolor="#f8f9fa",
         paper_bgcolor="white",
     )
 
-
-    # ── Legenda de cores ──
     st.plotly_chart(fig_diag, use_container_width=True)
 
     col_l1, col_l2, col_l3 = st.columns(3)
+    col_l1.metric("Profundidade Total do Poço", f"{y_fundo:.0f} cm",
+                  help="Fundo do poço a partir do topo superior")
+    if latest_distance is not None:
+        altura_agua_cm = max(y_fundo - y_agua, 0.0)
+        col_l2.metric("Lâmina d'Água no Fundo", f"{altura_agua_cm:.0f} cm")
+        col_l3.metric("Distância da Água ao Sensor", f"{dist_sensor_agua:.0f} cm",
+                      delta=f"Sensor pendurado a {y_sensor:.0f} cm do topo")
+    else:
+        col_l2.metric("Lâmina d'Água", "Sem leitura")
+        col_l3.metric("Distância ao Sensor", "Sem leitura")
     col_l1.metric("Capacidade total do poço", f"{capacidade_total_cm:.0f} cm",
                   help="Fundo do poço até a borda superior")
     if latest_distance is not None:

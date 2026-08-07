@@ -1,0 +1,20 @@
+{
+  "version": "1.0",
+  "description": "Histórico da posição do sensor em relação ao topo do poço (borda superior)",
+  "history": [
+    {
+      "id": 1,
+      "start_date": "2026-07-01T00:00:00",
+      "end_date": "2026-08-04T00:00:00",
+      "dist_borda_cm": 80.0,
+      "description": "01/Jul a 03/Ago/2026: Sensor a 80cm acima do topo do poço"
+    },
+    {
+      "id": 2,
+      "start_date": "2026-08-04T00:00:00",
+      "end_date": null,
+      "dist_borda_cm": 70.0,
+      "description": "Após 03/Ago/2026: Sensor a 70cm acima do topo do poço"
+    }
+  ]
+}
