@@ -182,6 +182,22 @@ with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
     record_limit = st.number_input(
         "Número de registros a carregar", min_value=1, max_value=100000, value=3000, step=50
     )
+    turso_freq_option = st.selectbox(
+        "Frequência de Amostragem do Turso",
+        options=[
+            "Automático (1min em chuva / 5min em seca)",
+            "1 minuto (Alta Resolução)",
+            "5 minutos (Padrão)",
+        ],
+        index=1,
+        help="O ESP32 envia dados a cada 1min durante chuvas/alertas e 5min em períodos normais. O modo automático ajusta a grade sem perda de dados."
+    )
+    if "1 minuto" in turso_freq_option:
+        selected_freq_mode = "1min"
+    elif "5 minutos" in turso_freq_option:
+        selected_freq_mode = "5min"
+    else:
+        selected_freq_mode = "auto"
 if era5_correction != 1.0:
     st.sidebar.caption(f"↳ ERA5 × {era5_correction:.2f} — todos os dados históricos serão escalados")
 
@@ -294,7 +310,10 @@ if "status_bomba" not in df.columns:
 
 @st.cache_data
 def preprocess_time_series(
-    input_df: pd.DataFrame, sensor_history_json_str: str = "", active_dist_cm: float = 70.0
+    input_df: pd.DataFrame,
+    sensor_history_json_str: str = "",
+    active_dist_cm: float = 70.0,
+    freq_mode: str = "auto",
 ) -> pd.DataFrame:
     df = input_df.copy()
     ts_col = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -321,13 +340,30 @@ def preprocess_time_series(
     df["distancia_sensor_cm"] = df["nivel_cm"]
 
     df["altura_agua_cm"] = (FUNDODOPOCO - df["distancia_sensor_cm"]).clip(lower=0)
-    df["dt_round"] = pd.DatetimeIndex(df["timestamp"]).round("5min")
+
+    # Determinar a frequência da grade de amostragem
+    if freq_mode == "1min":
+        target_freq = "1min"
+    elif freq_mode == "5min":
+        target_freq = "5min"
+    else:
+        # Modo automático: detecta se há amostragem em alta frequência (~1 min) no dataset
+        ts_valid = df["timestamp"].dropna().sort_values()
+        if len(ts_valid) > 5:
+            diffs_min = ts_valid.diff().dt.total_seconds() / 60.0
+            # Se a mediana das diferenças for <= 2.5 min ou se > 15% das leituras forem <= 2.5 min
+            is_high_freq = (diffs_min.median() <= 2.5) or ((diffs_min > 0) & (diffs_min <= 2.5)).mean() > 0.15
+            target_freq = "1min" if is_high_freq else "5min"
+        else:
+            target_freq = "5min"
+
+    df["dt_round"] = pd.DatetimeIndex(df["timestamp"]).round(target_freq)
 
     df_dedup = df.drop_duplicates(subset=["dt_round"]).sort_values("dt_round").copy()
     full_idx = pd.date_range(
         start=df_dedup["dt_round"].min(),
         end=df_dedup["dt_round"].max(),
-        freq="5min",
+        freq=target_freq,
     )
     df_grid = pd.DataFrame({"dt_round": full_idx})
     merged = pd.merge(df_grid, df_dedup, on="dt_round", how="left")
@@ -384,6 +420,15 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
     result = df.copy()
     result["nivel_imputed"] = result["nivel_cm"].copy()
 
+    if result.empty or "nivel_cm" not in result.columns:
+        return result
+
+    dt_step_min = 5.0
+    if len(result) > 1 and "dt_round" in result.columns:
+        step_sec = (result["dt_round"].iloc[1] - result["dt_round"].iloc[0]).total_seconds()
+        if step_sec > 0:
+            dt_step_min = step_sec / 60.0
+
     gap_starts = result[result["nivel_cm"].isna() & ~result["nivel_cm"].shift(1).isna()].index
     for g_start in gap_starts:
         g_ends = result.loc[g_start:]["nivel_cm"].dropna().index
@@ -400,15 +445,20 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
         if pd.isna(v_start) or pd.isna(v_end):
             continue
 
-        if gap_len <= 4:
+        t_start_gap = result.loc[g_start - 1, "dt_round"]
+        t_end_gap = result.loc[g_end, "dt_round"]
+        gap_minutes = (t_end_gap - t_start_gap).total_seconds() / 60.0
+
+        if gap_minutes <= 20.0 or gap_len <= 4:
             lin_vals = np.linspace(v_start, v_end, gap_len + 1)[1:-1]
             result.loc[g_start:g_end - 1, "nivel_imputed"] = lin_vals.tolist()
         else:
+            sim_dt_min = gap_minutes / gap_len if gap_len > 0 else dt_step_min
             sim_vals = simulate_gap(
                 v_start,
                 v_end,
                 gap_len + 1,
-                dt_min=5.0,
+                dt_min=sim_dt_min,
                 r_in_cm_min=r_gnd_param / 60.0,
                 r_pump_cm_min=r_pump_param / 60.0,
                 d_trigger_on=d_on,
@@ -486,20 +536,24 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
 
 
 def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex | pd.Series) -> pd.Series:
-    """Distribui precipitação horária em intervalos de 5 minutos (mm / 5min).
-    Cada hora é dividida igualmente pelos 12 períodos de 5 min que a compõem."""
+    """Distribui precipitação horária nos intervalos da grade do sensor (mm por intervalo)."""
     grid_dt = pd.DatetimeIndex(grid_index)
-    if weather_df.empty:
+    if weather_df.empty or len(grid_dt) < 2:
         return pd.Series(0.0, index=grid_dt, name="precipitation_5min")
 
-    # Reindex na grade de 5min usando forward-fill para mapear cada hora
+    step_minutes = (grid_dt[1] - grid_dt[0]).total_seconds() / 60.0
+    if step_minutes <= 0:
+        step_minutes = 5.0
+
     hourly = weather_df["precipitation"].copy()
-    # Dividir por 12 para obter mm por 5min
-    precip_5min = hourly / 12.0
-    # Reindexar para a grade do sensor
-    precip_reindexed = precip_5min.reindex(
-        precip_5min.index.union(grid_dt)
-    ).ffill().reindex(grid_dt).fillna(0.0)
+    precip_step = hourly * (step_minutes / 60.0)
+
+    precip_reindexed = (
+        precip_step.reindex(precip_step.index.union(grid_dt))
+        .ffill()
+        .reindex(grid_dt)
+        .fillna(0.0)
+    )
     precip_reindexed.name = "precipitation_5min"
     return precip_reindexed
 
@@ -984,7 +1038,12 @@ def compute_recent_rising_trend(
 
 
 sensor_history_json_str = json.dumps(sensor_history, sort_keys=True)
-processed_df = preprocess_time_series(df, sensor_history_json_str=sensor_history_json_str, active_dist_cm=dist_borda_cm)
+processed_df = preprocess_time_series(
+    df,
+    sensor_history_json_str=sensor_history_json_str,
+    active_dist_cm=dist_borda_cm,
+    freq_mode=selected_freq_mode,
+)
 filled_df = fill_gaps(processed_df)
 
 # Buscar dados meteorológicos alinhados ao período do sensor
@@ -1043,7 +1102,7 @@ if latest_ts is not None:
         st.error(
             f"🚨 **ERRO DE DADOS DA LEITURA (Atraso de {delay_min:.0f} min):**\n\n"
             f"Última leitura registrada em **{latest_ts.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
-            f"O sistema está há mais de **5 minutos sem dados atualizados** do banco Turso.\n\n"
+            f"O sistema está há mais de **{delay_min:.0f} minutos sem dados atualizados** do banco Turso (frequência esperada: 1 min em chuva ou 5 min em seca).\n\n"
             f"⚠️ *Possíveis causas: Servidor Turso offline, sensores sem comunicação, falha na transmissão da ESP32 ou queda de energia.*"
         )
 
