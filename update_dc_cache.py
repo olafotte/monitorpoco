@@ -6,7 +6,7 @@ try:
 except ImportError:
     raise SystemExit("Instale beautifulsoup4: pip install beautifulsoup4")
 
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from urllib3.exceptions import InsecureRequestWarning
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
 
@@ -37,7 +37,9 @@ for ph in page_headers:
     if not table:
         continue
     rows_data = []
-    for tr in table.find("tbody").find_all("tr"):
+    tbody = table.find("tbody")
+    rows = tbody.find_all("tr") if tbody else table.find_all("tr")
+    for tr in rows:
         cells = [td.get_text(strip=True) for td in tr.find_all("td")]
         if len(cells) == 4:
             acumulado_str = cells[3].replace(",", ".")

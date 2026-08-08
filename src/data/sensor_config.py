@@ -123,7 +123,7 @@ def get_dist_borda_series(
             if (is_active and active_dist_override is not None)
             else float(item.get("dist_borda_cm", default_val))
         )
-        val = abs(float(raw_v))
+        val = abs(raw_v)
 
         min_dt = pd.Timestamp("1970-01-01").tz_localize(target_tz) if target_tz else pd.Timestamp("1970-01-01")
         max_dt = pd.Timestamp("2100-01-01").tz_localize(target_tz) if target_tz else pd.Timestamp("2100-01-01")

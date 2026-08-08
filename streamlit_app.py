@@ -1,4 +1,11 @@
 import os
+import sys
+
+# Garantir que o diretório raiz esteja no sys.path para resolução do pacote 'src'
+_ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
 import json
 import re
 import warnings
@@ -10,8 +17,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import requests
-# pyrefly: ignore [missing-import]
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
+from urllib3.exceptions import InsecureRequestWarning
 import streamlit as st
 
 from src.config import (
@@ -73,7 +79,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
         help="Distância da água abaixo do topo do poço quando a 1ª bomba DESLIGA (água baixa, ex: 183 cm abaixo do topo)."
     )
     dist_borda_cm = st.number_input(
-        "Profundidade do Sensor no Poço (cm)", value=float(active_dist_default), step=1.0,
+        "Profundidade do Sensor no Poço (cm)", value=active_dist_default, step=1.0,
         help="Distância em que o sensor está pendurado dentro do poço a partir do topo (ex: 70 cm)."
     )
     d_overflow = 0.0
@@ -91,7 +97,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
         st.markdown("**➕ Adicionar / Ajustar Período:**")
         new_start = st.text_input("Data Início (ISO)", value=_dt.datetime.now().strftime("%Y-%m-%dT00:00:00"), key="cfg_new_start")
         new_end = st.text_input("Data Fim (vazio = período ativo atual)", value="", key="cfg_new_end")
-        new_dist = st.number_input("Dist. Sensor → Borda Superior (cm)", value=float(dist_borda_cm), step=1.0, key="cfg_new_dist")
+        new_dist = st.number_input("Dist. Sensor → Borda Superior (cm)", value=dist_borda_cm, step=1.0, key="cfg_new_dist")
         new_desc = st.text_input("Descrição", value="Ajuste de altura do sensor", key="cfg_new_desc")
 
         if st.button("💾 Salvar Ajuste no JSON"):
@@ -108,7 +114,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
                 "id": new_id,
                 "start_date": p_start,
                 "end_date": p_end,
-                "dist_borda_cm": abs(float(new_dist)),
+                "dist_borda_cm": abs(new_dist),
                 "description": new_desc.strip()
             })
             sensor_config_data["history"] = sensor_history
@@ -135,7 +141,7 @@ with st.sidebar.expander("⚡ Automação & Bombas em Paralelo", expanded=True):
     )
     if tem_bomba2:
         vazao_bomba2_m3h = st.number_input(
-            "Capacidade 2ª Bomba (m³/h)", value=float(vazao_bomba_m3h), step=0.5,
+            "Capacidade 2ª Bomba (m³/h)", value=vazao_bomba_m3h, step=0.5,
             help="Vazão nominal da 2ª bomba em m³/h (padrão: igual à 1ª bomba)"
         )
         d_on2 = st.number_input(
@@ -189,7 +195,7 @@ longitude = st.sidebar.number_input(
 
 sql_query = (
     "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
-    f"ORDER BY id DESC LIMIT {int(record_limit)}"
+    f"ORDER BY id DESC LIMIT {record_limit}"
 )
 
 payload_variants = [
@@ -224,7 +230,8 @@ if response is None:
         {
             "variant": i + 1,
             "payload_preview": {
-                k: (v if k != "stmt" else {"sql": v.get("sql")}) for k, v in p.items()
+                k: ({"sql": v["sql"]} if (k == "stmt" and isinstance(v, dict) and "sql" in v) else v)
+                for k, v in p.items()
             },
         }
         for i, p in enumerate(payload_variants)
@@ -290,9 +297,11 @@ def preprocess_time_series(
     input_df: pd.DataFrame, sensor_history_json_str: str = "", active_dist_cm: float = 70.0
 ) -> pd.DataFrame:
     df = input_df.copy()
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    # Ajustar para o horário de Brasília
-    df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
+    ts_col = pd.to_datetime(df["timestamp"], errors="coerce")
+    if ts_col.dt.tz is None:
+        df["timestamp"] = ts_col.dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
+    else:
+        df["timestamp"] = ts_col.dt.tz_convert("America/Sao_Paulo")
 
     sensor_history = json.loads(sensor_history_json_str) if sensor_history_json_str else []
 
@@ -312,7 +321,7 @@ def preprocess_time_series(
     df["distancia_sensor_cm"] = df["nivel_cm"]
 
     df["altura_agua_cm"] = (FUNDODOPOCO - df["distancia_sensor_cm"]).clip(lower=0)
-    df["dt_round"] = df["timestamp"].dt.round("5min")
+    df["dt_round"] = pd.DatetimeIndex(df["timestamp"]).round("5min")
 
     df_dedup = df.drop_duplicates(subset=["dt_round"]).sort_values("dt_round").copy()
     full_idx = pd.date_range(
@@ -393,7 +402,7 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
 
         if gap_len <= 4:
             lin_vals = np.linspace(v_start, v_end, gap_len + 1)[1:-1]
-            result.loc[g_start:g_end - 1, "nivel_imputed"] = lin_vals
+            result.loc[g_start:g_end - 1, "nivel_imputed"] = lin_vals.tolist()
         else:
             sim_vals = simulate_gap(
                 v_start,
@@ -408,7 +417,7 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
                 d_trigger_on2=d_on2,
                 d_trigger_off2=d_off2,
             )
-            result.loc[g_start:g_end - 1, "nivel_imputed"] = sim_vals[1:-1]
+            result.loc[g_start:g_end - 1, "nivel_imputed"] = sim_vals[1:-1].tolist()
 
     result["altura_agua_imputed_cm"] = (FUNDODOPOCO - result["nivel_imputed"]).clip(lower=0)
     return result
@@ -476,11 +485,12 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
     return result
 
 
-def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex) -> pd.Series:
+def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex | pd.Series) -> pd.Series:
     """Distribui precipitação horária em intervalos de 5 minutos (mm / 5min).
     Cada hora é dividida igualmente pelos 12 períodos de 5 min que a compõem."""
+    grid_dt = pd.DatetimeIndex(grid_index)
     if weather_df.empty:
-        return pd.Series(0.0, index=grid_index, name="precipitation_5min")
+        return pd.Series(0.0, index=grid_dt, name="precipitation_5min")
 
     # Reindex na grade de 5min usando forward-fill para mapear cada hora
     hourly = weather_df["precipitation"].copy()
@@ -488,8 +498,8 @@ def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex) ->
     precip_5min = hourly / 12.0
     # Reindexar para a grade do sensor
     precip_reindexed = precip_5min.reindex(
-        precip_5min.index.union(grid_index)
-    ).ffill().reindex(grid_index).fillna(0.0)
+        precip_5min.index.union(grid_dt)
+    ).ffill().reindex(grid_dt).fillna(0.0)
     precip_reindexed.name = "precipitation_5min"
     return precip_reindexed
 
@@ -557,7 +567,7 @@ def format_hours(hours: float) -> str:
     """Formata horas decimais em formato legível de dias, horas e minutos."""
     if hours == float("inf") or hours < 0 or pd.isna(hours):
         return "N/A"
-    tot_min = int(round(hours * 60))
+    tot_min = round(hours * 60)
     h = tot_min // 60
     m = tot_min % 60
     if h >= 48:
@@ -576,7 +586,7 @@ def format_hours_status(hours: float, current_val: float, target_val: float) -> 
         return "⚡ Já Atingido"
     if hours == float("inf") or hours < 0 or pd.isna(hours):
         return "N/A"
-    tot_min = int(round(hours * 60))
+    tot_min = round(hours * 60)
     h = tot_min // 60
     m = tot_min % 60
     if h >= 48:
@@ -659,18 +669,18 @@ def segment_operational_periods(df: pd.DataFrame):
     return pd.DataFrame(period_ench), pd.DataFrame(period_esv)
 
 
-def compute_rate_statistics(df: pd.DataFrame) -> dict:
+def compute_rate_statistics(df: pd.DataFrame) -> dict | None:
     """Calcula estatísticas de taxas operacionais baseadas em períodos completos (Δd_período / Δt_período)."""
     df_ench, df_esv = segment_operational_periods(df)
     if df_ench.empty and df_esv.empty:
         return None
 
     res = {
-        "ench_media": float(df_ench["rate_cmh"].median()) if not df_ench.empty else 0.0,
+        "ench_media": df_ench["rate_cmh"].median() if not df_ench.empty else 0.0,
         "ench_pico": float(df_ench["rate_cmh"].max()) if not df_ench.empty else 0.0,
         "ench_min": float(df_ench["rate_cmh"].min()) if not df_ench.empty else 0.0,
         "ench_count": len(df_ench),
-        "esv_media": float(df_esv["rate_cmh"].median()) if not df_esv.empty else 0.0,
+        "esv_media": df_esv["rate_cmh"].median() if not df_esv.empty else 0.0,
         "esv_pico": float(df_esv["rate_cmh"].max()) if not df_esv.empty else 0.0,
         "esv_min": float(df_esv["rate_cmh"].min()) if not df_esv.empty else 0.0,
         "esv_count": len(df_esv),
@@ -696,8 +706,8 @@ def plot_historical_extremes_chart(df: pd.DataFrame):
     row_max_w = df_calc.loc[idx_max_water]
     row_min_w = df_calc.loc[idx_min_water]
 
-    row_peak_rise = df_ench.iloc[df_ench["rate_cmh"].idxmax()] if not df_ench.empty else None
-    row_peak_drop = df_esv.iloc[df_esv["rate_cmh"].idxmax()] if not df_esv.empty else None
+    row_peak_rise = df_ench.loc[df_ench["rate_cmh"].idxmax()] if not df_ench.empty else None
+    row_peak_drop = df_esv.loc[df_esv["rate_cmh"].idxmax()] if not df_esv.empty else None
 
     fig = go.Figure()
 
@@ -833,7 +843,7 @@ def compute_recent_rising_trend(
     d_on: float = 71.5,
     tem_bomba2: bool = False,
     d_on2: float = 41.5,
-    weather_df: pd.DataFrame = None,
+    weather_df: pd.DataFrame | None = None,
     factor_mm_cm: float = 2.83,
     window_size: int = 20,
 ):
@@ -847,14 +857,11 @@ def compute_recent_rising_trend(
         valid["val_d"] = valid["nivel_cm"].fillna(valid["nivel_imputed"])
     else:
         valid["val_d"] = valid["nivel_imputed"]
-    valid = valid.dropna(subset=["val_d"]).sort_values("dt_round").reset_index(drop=True)
 
-    if len(valid) < 2:
+    if len(valid) < 3:
         return None
 
-    # Usar as últimas N leituras (padrão 20 leituras = ~1h40min)
-    n_points = min(window_size, len(valid))
-    segment = valid.tail(n_points).copy()
+    segment = valid.iloc[-min(window_size, len(valid)):].copy()
 
     t0 = segment["dt_round"].iloc[0]
     t_latest = segment["dt_round"].iloc[-1]
@@ -863,7 +870,9 @@ def compute_recent_rising_trend(
     if times_h.iloc[-1] <= 0:
         return None
 
-    slope, intercept = np.polyfit(times_h, segment["val_d"], 1)
+    x_arr = np.asarray(times_h.values, dtype=np.float64)
+    y_arr = np.asarray(segment["val_d"].values, dtype=np.float64)
+    slope, intercept = np.polyfit(x_arr, y_arr, 1)
     rate_cmh = -slope  # taxa positiva de subida recente em cm/h
 
     curr_d = segment["val_d"].iloc[-1]
@@ -874,16 +883,22 @@ def compute_recent_rising_trend(
     time_sensor_h = max(0.0, curr_d / rate_cmh) if (curr_d > 0 and rate_cmh > 0) else (0.0 if curr_d <= 0 else float("inf"))
     time_overflow_h = max(0.0, (curr_d + dist_borda_cm) / rate_cmh) if (curr_d > -dist_borda_cm and rate_cmh > 0) else (0.0 if curr_d <= -dist_borda_cm else float("inf"))
 
-    # ── Simulação com Previsão Meteorológica ERA5 ──
-    time_bomba1_era5_h = time_bomba1_h
-    time_bomba2_era5_h = time_bomba2_h
-    time_sensor_era5_h = time_sensor_h
-    time_overflow_era5_h = time_overflow_h
+    # Simulação integrada com previsão ERA5/Open-Meteo se disponível
+    time_bomba1_era5_h = None
+    time_bomba2_era5_h = None
+    time_sensor_era5_h = None
+    time_overflow_era5_h = None
     era5_sim_df = None
     has_future_rain = False
     total_rain_era5 = 0.0
+    t_bomba1_era5_dt = None
+    t_bomba2_era5_dt = None
+    t_sensor_era5_dt = None
+    t_overflow_era5_dt = None
+    sim_d = None
+    sim_times = None
 
-    if weather_df is not None and not weather_df.empty and rate_cmh > 0:
+    if weather_df is not None and not weather_df.empty:
         sim_times = []
         sim_d = []
         c_d = curr_d
@@ -895,10 +910,11 @@ def compute_recent_rising_trend(
         t_overflow_era5_dt = c_t if curr_d <= -dist_borda_cm else None
 
         w_df_clean = weather_df.copy()
-        if w_df_clean.index.tz is None:
-            w_df_clean.index = w_df_clean.index.tz_localize("America/Sao_Paulo")
-        elif str(w_df_clean.index.tz) != "America/Sao_Paulo":
-            w_df_clean.index = w_df_clean.index.tz_convert("America/Sao_Paulo")
+        if isinstance(w_df_clean.index, pd.DatetimeIndex):
+            if w_df_clean.index.tz is None:
+                w_df_clean.index = w_df_clean.index.tz_localize("America/Sao_Paulo")
+            elif str(w_df_clean.index.tz) != "America/Sao_Paulo":
+                w_df_clean.index = w_df_clean.index.tz_convert("America/Sao_Paulo")
 
         max_sim_steps = 12 * 168  # até 7 dias em passos de 5min
         for step in range(max_sim_steps):
@@ -1128,7 +1144,9 @@ def fetch_defesa_civil_rankings() -> dict:
             if not table:
                 continue
             rows_data = []
-            for tr in table.find("tbody").find_all("tr"):
+            tbody = table.find("tbody")
+            rows = tbody.find_all("tr") if tbody else table.find_all("tr")
+            for tr in rows:
                 cells = [td.get_text(strip=True) for td in tr.find_all("td")]
                 if len(cells) == 4:
                     try:
@@ -1296,7 +1314,7 @@ with tab1:
 
     st.subheader("Últimos Registros")
     df_export = filled_df.copy()
-    num_cols = df_export.select_dtypes(include=[np.number]).columns
+    num_cols = df_export.select_dtypes(include="number").columns
     df_export[num_cols] = df_export[num_cols].round(2)
     st.dataframe(df_export)
     st.download_button(
@@ -1579,7 +1597,8 @@ with tab2:
                     triggers = df_w[(df_w["val"] <= (d_on + 10.0)) & (diff_5m >= 1.0)].index
 
                 for idx in reversed(triggers):
-                    loc = df_w.index.get_loc(idx)
+                    loc_val = df_w.index.get_loc(idx)
+                    loc = int(loc_val.start if isinstance(loc_val, slice) else (loc_val[0] if isinstance(loc_val, np.ndarray) else loc_val))
                     t_curr = df_w["dt_round"].iloc[loc]
 
                     # Evitar duplicatas no mesmo ciclo (separação mínima de 20 min)
@@ -1593,7 +1612,8 @@ with tab2:
 
                     # Truncar no pico de esvaziamento (quando atinge d_off / distância máxima)
                     max_dist_loc = sub["val"].idxmax()
-                    end_loc = sub.index.get_loc(max_dist_loc)
+                    end_loc_val = sub.index.get_loc(max_dist_loc)
+                    end_loc = int(end_loc_val.start if isinstance(end_loc_val, slice) else (end_loc_val[0] if isinstance(end_loc_val, np.ndarray) else end_loc_val))
                     sub_cut = sub.iloc[0:end_loc+1]
 
                     if len(sub_cut) >= 2 and (sub_cut["val"].iloc[-1] - sub_cut["val"].iloc[0]) >= 3.0:
@@ -1756,7 +1776,7 @@ with tab3:
             f"✅ **BOMBA DÁ CONTA DA CHUVA:** A intensidade ({intensidade_mm_h:.1f} mm/h) é inferior ao limite de saturação ({intensidade_saturacao_mm_h:.1f} mm/h). A bomba conseguirá ciclar e esvaziar o poço."
         )
 
-    if overflow_occurred:
+    if overflow_occurred and overflow_time is not None:
         st.error(
             f"🚨 **ALERTA DE TRANSBORDAMENTO:** O poço atingirá a borda superior "
             f"(sensor = −{dist_borda_cm:.0f} cm, água {dist_borda_cm:.0f} cm acima do sensor) "
@@ -1803,7 +1823,7 @@ with tab3:
     with col_h3:
         nivel_inicial_sim = st.number_input(
             "Nível Inicial (cm do sensor)",
-            value=float(d_off),
+            value=d_off,
             step=1.0,
             help="Distância do sensor à água no início do evento (ex: d_off = poço esvaziado)."
         )
@@ -1815,7 +1835,7 @@ with tab3:
         )
 
     start_hist_str = data_evento.strftime("%Y-%m-%d")
-    end_hist_dt = data_evento + _dt.timedelta(hours=int(duracao_evento_h))
+    end_hist_dt = data_evento + _dt.timedelta(hours=duracao_evento_h)
     end_hist_str = end_hist_dt.strftime("%Y-%m-%d")
 
     df_ev = pd.DataFrame()
@@ -1823,7 +1843,7 @@ with tab3:
     usando_konder_real = False
 
     start_ts_ev = pd.Timestamp(data_evento, tz="America/Sao_Paulo")
-    end_ts_ev = start_ts_ev + pd.Timedelta(hours=int(duracao_evento_h))
+    end_ts_ev = start_ts_ev + pd.Timedelta(hours=duracao_evento_h)
 
     if "Ponte Adolfo Konder" in fonte_dados:
         df_konder = load_adolfo_konder_dataset()
@@ -1867,7 +1887,7 @@ with tab3:
         sim_pump_active_ev = []
         sim_rain_rate_ev = []
 
-        curr_d_ev = float(nivel_inicial_sim)
+        curr_d_ev = nivel_inicial_sim
         p1_ev = curr_d_ev <= d_on
         p2_ev = tem_bomba2 and (curr_d_ev <= d_on2)
 
@@ -2000,7 +2020,7 @@ with tab3:
         )
         st.plotly_chart(fig_hist, use_container_width=True)
 
-        if ovf_ev:
+        if ovf_ev and ovf_ev_time is not None:
             t_ovf_str = ovf_ev_time.strftime("%d/%m/%Y às %H:%M")
             st.error(
                 f"🚨 **ALERTA DE TRANSBORDO REGISTRADO NA SIMULAÇÃO:**\n\n"
@@ -2104,7 +2124,7 @@ with tab4:
         st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
         if not next_48h.empty:
             fcast_table = next_48h.copy()
-            fcast_table.index = fcast_table.index.strftime("%d/%m/%Y %H:%M")
+            fcast_table.index = pd.to_datetime(fcast_table.index).strftime("%d/%m/%Y %H:%M")
             fcast_table.columns = ["Precipitação (mm/h)"]
             fcast_table = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
             if fcast_table.empty:
@@ -2124,7 +2144,7 @@ with tab4:
         with st.expander("📂 Ver histórico completo de precipitação (últimos 7 dias)"):
             if not hist_df.empty:
                 show_hist = hist_df.copy()
-                show_hist.index = show_hist.index.strftime("%d/%m/%Y %H:%M")
+                show_hist.index = pd.to_datetime(show_hist.index).strftime("%d/%m/%Y %H:%M")
                 show_hist.columns = ["Precipitação (mm/h)"]
                 st.dataframe(show_hist, use_container_width=True)
             else:
@@ -2364,7 +2384,7 @@ with tab5:
     st.plotly_chart(fig5, use_container_width=True)
 
     # ── Alertas ──
-    if overflow5:
+    if overflow5 and overflow5_time is not None:
         delta_t = overflow5_time - now_tz5
         delta_h = int(delta_t.total_seconds() // 3600)
         delta_m = int((delta_t.total_seconds() % 3600) // 60)
@@ -2404,7 +2424,7 @@ with tab5:
         if "Chuva Prevista (mm/h)" in hourly_sim.columns:
             display_cols.append("Chuva Prevista (mm/h)")
 
-        hourly_sim.index = hourly_sim.index.strftime("%d/%m/%Y %H:%M")
+        hourly_sim.index = pd.DatetimeIndex(hourly_sim.index).strftime("%d/%m/%Y %H:%M")
         st.dataframe(hourly_sim[display_cols], use_container_width=True)
 
 # ──────────────────────────────────────────────────────────────────────────────────
@@ -2774,7 +2794,7 @@ with tab6:
         )
         st.plotly_chart(fig_idf_sim, use_container_width=True)
 
-        if ovf_idf:
+        if ovf_idf and ovf_idf_t is not None:
             st.error(
                 f"🚨 **TRANSBORDO ESPERADO** para chuva Tr=25 anos ({dur_sel}h, {intens_sel:.1f} mm/h): "
                 f"o poço atingiria o nível crítico em **{ovf_idf_t*60:.0f} minutos** "
@@ -2809,7 +2829,7 @@ with tab6:
     st.subheader("🎯 Calibração Pluviométrica: Estação Ponte Adolfo Konder vs. ERA5 Bruto (2021–2025)")
     st.caption(
         "Comparação ano a ano dos picos máximos anuais medidos pelo pluviômetro local da Ponte Adolfo Konder (Blumenau) "
-        "com os picos brutos fornecidos pelo modelo de satélite ERA5 (Open-Meteo):"
+        "com a série horária de precipitação do modelo ERA5 (Open-Meteo). Permite validar se o fator de escala ×2.60 reflete a realidade local."
     )
     konder_calib_ds = load_adolfo_konder_dataset()
     if not konder_calib_ds.empty and 'hist5_raw_df' in locals() and not hist5_raw_df.empty:
@@ -2819,8 +2839,8 @@ with tab6:
         calib_rows = []
         ratios_list = []
         for y_cal in [2021, 2022, 2023, 2024, 2025]:
-            k_val = konder_h_series[str(y_cal)].max() if str(y_cal) in konder_h_series.index.year.astype(str) else np.nan
-            e_val = era_raw_series[str(y_cal)].max() if str(y_cal) in era_raw_series.index.year.astype(str) else np.nan
+            k_val = konder_h_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(konder_h_series.index).year.astype(str) else np.nan
+            e_val = era_raw_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(era_raw_series.index).year.astype(str) else np.nan
             if pd.notna(k_val) and pd.notna(e_val) and e_val > 0:
                 r_cal = k_val / e_val
                 ratios_list.append(r_cal)
@@ -2949,7 +2969,7 @@ with tab6:
 
         if event_rows:
             df_ev = pd.DataFrame(event_rows).sort_values("OM / DC (%)")
-            df_ev.index = range(1, len(df_ev) + 1)
+            df_ev.index = pd.RangeIndex(1, len(df_ev) + 1)
             df_ev.index.name = "#"
 
             def color_ev(val):
@@ -3152,7 +3172,7 @@ with tab7:
                 # Mantém df_sel com o ranking global para exibição de fallback
             else:
                 df_sel = df_sel_filtrado
-        dur_h_sel = dur_para_horas.get(dur_selecionada, 1.0)
+        dur_h_sel = dur_para_horas.get(dur_selecionada, 1.0) if dur_selecionada else 1.0
         df_sel["Intensidade_mmh"] = df_sel["Acumulado_mm"] / dur_h_sel
         ultima_atualiz = df_sel["ultima_atualizacao"].iloc[0] if not df_sel.empty else ""
 
@@ -3217,7 +3237,7 @@ with tab7:
         df_display.columns = ["Estação", "Região", "Data/Hora", f"Acumulado em {dur_selecionada} (mm)", "Intensidade média (mm/h)"]
         df_display[f"Acumulado em {dur_selecionada} (mm)"] = df_display[f"Acumulado em {dur_selecionada} (mm)"].round(1)
         df_display["Intensidade média (mm/h)"] = df_display["Intensidade média (mm/h)"].round(1)
-        df_display.index = range(1, len(df_display) + 1)
+        df_display.index = pd.RangeIndex(1, len(df_display) + 1)
         df_display.index.name = "#"
         st.dataframe(df_display, use_container_width=True)
 
@@ -3338,8 +3358,8 @@ with tab7:
         tot_leituras_k = len(konder_sec_df)
 
         mk1, mk2, mk3, mk4 = st.columns(4)
-        mk1.metric("Recorde 15min (Pulso)", f"{pico_15m_rec:.1f} mm", help=f"Data: {pico_15m_dt.strftime('%d/%m/%Y %H:%M')} | Taxa inst.: {pico_15m_rec*4:.1f} mm/h")
-        mk2.metric("Recorde Horário (1h)", f"{pico_1h_rec:.1f} mm/h", help=f"Data: {pico_1h_dt.strftime('%d/%m/%Y %H:%M')}")
+        mk1.metric("Recorde 15min (Pulso)", f"{pico_15m_rec:.1f} mm", help=f"Data: {pd.to_datetime(pico_15m_dt).strftime('%d/%m/%Y %H:%M')} | Taxa inst.: {pico_15m_rec*4:.1f} mm/h")
+        mk2.metric("Recorde Horário (1h)", f"{pico_1h_rec:.1f} mm/h", help=f"Data: {pd.to_datetime(pico_1h_dt).strftime('%d/%m/%Y %H:%M')}")
         mk3.metric("Período Coberto", "2021–2025", help=f"{konder_sec_df.index.min().strftime('%d/%m/%Y')} a {konder_sec_df.index.max().strftime('%d/%m/%Y')}")
         mk4.metric("Total de Leituras", f"{tot_leituras_k:,}", help="Intervalos contínuos de 15 minutos")
 
@@ -3358,7 +3378,7 @@ with tab7:
         idf_k_dict = {}
 
         for d_lbl, (dh_k, s_k) in dur_map_k.items():
-            ann_max_k = s_k.groupby(s_k.index.year).max().dropna().values
+            ann_max_k = np.asarray(s_k.groupby(pd.to_datetime(s_k.index).year).max().dropna().values, dtype=np.float64)
             if len(ann_max_k) >= 2:
                 alpha_k, u_k = fit_gumbel(ann_max_k)
                 idf_k_dict[d_lbl] = {tr: round(max(gumbel_quantile(alpha_k, u_k, tr), 0.0), 1) for tr in trs_k}
@@ -3403,7 +3423,7 @@ with tab7:
                 rate_h = val_15 * 4.0
                 sat_status = "🚨 Excede Bomba 1" if rate_h > intensidade_sat_dc else "✅ Suportado"
                 top_15m_display.append({
-                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:%M"),
+                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:%M") if hasattr(dt_k, "strftime") else str(dt_k),
                     "Precipitação (mm / 15min)": f"{val_15:.1f} mm",
                     "Taxa Horária Eq. (mm/h)": f"{rate_h:.1f} mm/h",
                     "Entrada no Poço (cm/h)": f"{rate_h * factor_mm_cm:.1f} cm/h",
@@ -3417,7 +3437,7 @@ with tab7:
             for dt_k, val_1h in top_1h.items():
                 sat_status = "🚨 Excede Bomba 1" if val_1h > intensidade_sat_dc else "✅ Suportado"
                 top_1h_display.append({
-                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:00"),
+                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:00") if hasattr(dt_k, "strftime") else str(dt_k),
                     "Chuva Acumulada 1h (mm)": f"{val_1h:.1f} mm/h",
                     "Entrada no Poço (cm/h)": f"{val_1h * factor_mm_cm:.1f} cm/h",
                     "Status": sat_status,
@@ -3431,17 +3451,17 @@ with tab8:
 
     # ── Posições Y em cm a partir do Topo do Poço (0.0 cm = Topo do Poço) ──
     y_topo = 0.0
-    y_sensor = abs(float(dist_borda_cm))     # Ex: +70.0 cm (pendurado dentro do poço)
+    y_sensor = abs(dist_borda_cm)            # Ex: +70.0 cm (pendurado dentro do poço)
     y_risco = y_sensor + 20.0                # Ex: +90.0 cm (20 cm da água ao sensor)
-    y_don = float(d_on)                      # Ex: +160.0 cm abaixo do topo
-    y_doff = float(d_off)                    # Ex: +183.0 cm abaixo do topo
-    y_don2 = float(d_on2)
-    y_doff2 = float(d_off2)
-    y_fundo = float(FUNDODOPOCO)             # Ex: +210.0 cm abaixo do topo
+    y_don = d_on                             # Ex: +160.0 cm abaixo do topo
+    y_doff = d_off                           # Ex: +183.0 cm abaixo do topo
+    y_don2 = d_on2
+    y_doff2 = d_off2
+    y_fundo = FUNDODOPOCO                    # Ex: +210.0 cm abaixo do topo
 
     # Nível atual da água (distância a partir do topo do poço)
     if latest_distance is not None:
-        y_agua = float(latest_distance)
+        y_agua = latest_distance
     else:
         y_agua = y_don  # fallback
 
@@ -3662,9 +3682,9 @@ with tab9:
             _roll = _konder_rep_df["precip_15min"].rolling(_n15, min_periods=1).sum()
             _nh = _n15 / 4.0
             _intens = _roll / _nh
-            _ann = _intens.groupby(_intens.index.year).max().dropna()
+            _ann = _intens.groupby(pd.DatetimeIndex(_intens.index).year).max().dropna()
             if len(_ann) >= 2:
-                _a, _u = fit_gumbel(_ann.values)
+                _a, _u = fit_gumbel(np.asarray(_ann.values, dtype=np.float64))
                 idf_rep[_lbl] = {tr: round(gumbel_quantile(_a, _u, tr), 1) for tr in _TRS}
 
     if not idf_rep:
@@ -3748,13 +3768,14 @@ with tab9:
                 )
 
             # 3. IDF por duração
+            _anos_diag = list(pd.DatetimeIndex(rep_hist_df.index).year.unique()) if not rep_hist_df.empty else []
             st.markdown("**Status da curva IDF por duração:**")
             _idf_diag_rows = []
             if not rep_hist_df.empty:
                 for _lbl2, _nh2 in _DURACOES.items():
                     _roll2 = rep_hist_df["precipitation"].rolling(_nh2).sum()
                     _intens2 = _roll2 / _nh2
-                    _ann2 = _intens2.groupby(_intens2.index.year).max().dropna()
+                    _ann2 = _intens2.groupby(pd.DatetimeIndex(_intens2.index).year).max().dropna()
                     _ok = len(_ann2) >= 3
                     _idf_diag_rows.append({
                         "Duração": _lbl2,
