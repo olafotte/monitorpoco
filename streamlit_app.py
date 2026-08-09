@@ -91,7 +91,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
         if sensor_history:
             h_df = pd.DataFrame(sensor_history)
             disp_cols = [c for c in ["start_date", "end_date", "dist_borda_cm", "description"] if c in h_df.columns]
-            st.dataframe(h_df[disp_cols], hide_index=True, use_container_width=True)
+            st.dataframe(h_df[disp_cols], hide_index=True, width="stretch")
 
         st.markdown("---")
         st.markdown("**➕ Adicionar / Ajustar Período:**")
@@ -180,7 +180,7 @@ with st.sidebar.expander("🌦️ Parâmetros Climáticos & ERA5", expanded=True
 
 with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
     record_limit = st.number_input(
-        "Número de registros a carregar", min_value=1, max_value=100000, value=3000, step=50
+        "Número de registros a carregar", min_value=1, max_value=100000, value=300, step=50
     )
     turso_freq_option = st.selectbox(
         "Frequência de Amostragem do Turso",
@@ -192,6 +192,9 @@ with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
         index=0,
         help="O ESP32 envia dados a cada 1min durante chuvas/alertas e 5min em períodos normais. O modo automático ajusta a grade sem perda de dados."
     )
+    if st.button("🔄 Recarregar Dados do Turso", help="Limpa o cache e busca leituras atualizadas do Turso DB imediatamente"):
+        fetch_turso_data.clear()
+        st.rerun()
     if "1 minuto" in turso_freq_option:
         selected_freq_mode = "1min"
     elif "5 minutos" in turso_freq_option:
@@ -209,103 +212,87 @@ longitude = st.sidebar.number_input(
     "Longitude", value=-49.0687619, format="%.4f", help="Longitude do local monitorado"
 )
 
-sql_query = (
-    "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
-    f"ORDER BY id DESC LIMIT {record_limit}"
-)
+@st.cache_data(ttl=60, show_spinner="⏳ Conectando ao banco Turso...")
+def fetch_turso_data(turso_url: str, turso_token: str, limit: int) -> pd.DataFrame:
+    sql_query = (
+        "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
+        f"ORDER BY id DESC LIMIT {limit}"
+    )
+    headers = {
+        "Authorization": f"Bearer {turso_token}",
+        "Content-Type": "application/json",
+    }
+    payload_variants = [
+        {"stmt": {"sql": sql_query, "args": []}},
+        {"statements": [{"stmt": {"sql": sql_query, "args": []}}]},
+        {"statements": [{"sql": sql_query, "args": []}]},
+        {"statements": [sql_query]},
+    ]
 
-payload_variants = [
-    {"stmt": {"sql": sql_query, "args": []}},
-    {"statements": [{"stmt": {"sql": sql_query, "args": []}}]},
-    {"statements": [{"sql": sql_query, "args": []}]},
-    {"statements": [sql_query]},
-]
+    response = None
+    last_error = None
+    for idx, payload in enumerate(payload_variants, start=1):
+        try:
+            resp = requests.post(turso_url, json=payload, headers=headers, timeout=15)
+        except Exception as exc:
+            last_error = f"request error (variant {idx}): {exc}"
+            continue
 
-response = None
-last_error = None
-for idx, payload in enumerate(payload_variants, start=1):
-    try:
-        resp = requests.post(TURSO_URL, json=payload, headers=headers, timeout=15)
-    except Exception as exc:
-        last_error = f"request error (variant {idx}): {exc}"
-        continue
+        if resp.status_code == 200:
+            response = resp
+            break
+        else:
+            last_error = f"status {resp.status_code}: {resp.text} (variant {idx})"
 
-    if resp.status_code == 200:
-        response = resp
-        used_payload = payload
-        break
+    if response is None:
+        raise RuntimeError(f"Sem resposta das variantes testadas. Último erro: {last_error}")
+
+    response_data = response.json()
+
+    if "results" in response_data and response_data.get("results"):
+        result = response_data["results"][0]
+        columns = result.get("columns", [])
+        rows = result.get("rows", [])
+    elif (
+        "result" in response_data
+        and isinstance(response_data.get("result"), dict)
+        and "cols" in response_data.get("result")
+        and "rows" in response_data.get("result")
+    ):
+        columns = [c.get("name") for c in response_data["result"].get("cols", [])]
+        rows = response_data["result"].get("rows", [])
+    elif "cols" in response_data and "rows" in response_data:
+        columns = [c.get("name") for c in response_data.get("cols", [])]
+        rows = response_data.get("rows", [])
     else:
-        last_error = f"status {resp.status_code}: {resp.text} (variant {idx})"
+        raise ValueError("A resposta do Turso não contém resultados válidos.")
 
-if response is None:
-    st.error("Erro ao conectar com o banco de dados Turso usando os formatos testados.")
-    st.markdown("**Último erro:**")
-    st.code(last_error or "Sem resposta")
-    st.markdown("**Payloads testados (somente SQL mostrado):**")
-    st.json([
-        {
-            "variant": i + 1,
-            "payload_preview": {
-                k: ({"sql": v["sql"]} if (k == "stmt" and isinstance(v, dict) and "sql" in v) else v)
-                for k, v in p.items()
-            },
-        }
-        for i, p in enumerate(payload_variants)
-    ])
+    if not columns or not rows:
+        return pd.DataFrame()
+
+    if isinstance(rows[0], list) and rows[0] and isinstance(rows[0][0], dict):
+        cleaned_rows = [[val.get("value") for val in row] for row in rows]
+    elif isinstance(rows[0], dict):
+        cleaned_rows = [[row.get(col) for col in columns] for row in rows]
+    else:
+        cleaned_rows = rows
+
+    df_res = pd.DataFrame(cleaned_rows, columns=columns)
+    if "status_bomba" not in df_res.columns:
+        df_res["status_bomba"] = pd.NA
+    return df_res
+
+
+try:
+    df = fetch_turso_data(TURSO_URL, TURSO_TOKEN, record_limit)
+except Exception as exc:
+    st.error(f"Erro ao conectar com o banco de dados Turso: {exc}")
     st.stop()
 
-response_data = response.json()
-
-if "results" in response_data and response_data.get("results"):
-    result = response_data["results"][0]
-    columns = result.get("columns", [])
-    rows = result.get("rows", [])
-elif (
-    "result" in response_data
-    and isinstance(response_data.get("result"), dict)
-    and "cols" in response_data.get("result")
-    and "rows" in response_data.get("result")
-):
-    columns = [c.get("name") for c in response_data["result"].get("cols", [])]
-    rows = response_data["result"].get("rows", [])
-elif "cols" in response_data and "rows" in response_data:
-    columns = [c.get("name") for c in response_data.get("cols", [])]
-    rows = response_data.get("rows", [])
-else:
-    st.error("A resposta do Turso não contém resultados válidos.")
-    st.json(response_data)
-    st.stop()
-
-if not columns or not rows:
+if df.empty or "timestamp" not in df.columns or "nivel_cm" not in df.columns:
     st.warning("Não há dados suficientes para exibir. Verifique a tabela ou os registros do Turso.")
     st.stop()
 
-if isinstance(rows[0], list) and rows[0] and isinstance(rows[0][0], dict):
-    cleaned_rows = [[val.get("value") for val in row] for row in rows]
-elif isinstance(rows[0], dict):
-    cleaned_rows = [[row.get(col) for col in columns] for row in rows]
-else:
-    cleaned_rows = rows
-
-try:
-    df = pd.DataFrame(cleaned_rows, columns=columns)
-except ValueError as exc:
-    st.error(f"Erro ao montar o DataFrame: {exc}")
-    st.json(response_data)
-    st.stop()
-
-if "timestamp" not in df.columns:
-    st.error("A resposta do Turso não contém a coluna 'timestamp'.")
-    st.json(df.head(5).to_dict(orient="records"))
-    st.stop()
-
-if "nivel_cm" not in df.columns:
-    st.error("A resposta do Turso não contém a coluna 'nivel_cm'.")
-    st.json(df.head(5).to_dict(orient="records"))
-    st.stop()
-
-if "status_bomba" not in df.columns:
-    df["status_bomba"] = pd.NA
 
 
 @st.cache_data
@@ -348,9 +335,9 @@ def preprocess_time_series(
         target_freq = "5min"
     else:
         # Modo automático: detecta se há amostragem em alta frequência (~1 min) no dataset
-        ts_valid = df["timestamp"].dropna().sort_values()
+        ts_valid = pd.to_datetime(df["timestamp"]).dropna().sort_values()
         if len(ts_valid) > 5:
-            diffs_min = ts_valid.diff().dt.total_seconds() / 60.0
+            diffs_min = pd.to_timedelta(ts_valid.diff()).dt.total_seconds() / 60.0  # type: ignore
             # Se a mediana das diferenças for <= 2.5 min ou se > 15% das leituras forem <= 2.5 min
             is_high_freq = (diffs_min.median() <= 2.5) or ((diffs_min > 0) & (diffs_min <= 2.5)).mean() > 0.15
             target_freq = "1min" if is_high_freq else "5min"
@@ -1261,7 +1248,7 @@ with tab1:
     st.subheader("Série Temporal do Nível do Poço")
     st.caption(
         "O eixo Y esquerdo (invertido) mostra a distância do sensor à linha d'água. "
-        "O eixo Y direito mostra a precipitação acumulada em cada intervalo de 5 minutos."
+        "O eixo Y direito mostra a intensidade de precipitação em mm/hora."
     )
 
     trend = compute_recent_rising_trend(
@@ -1281,11 +1268,19 @@ with tab1:
 
     # Barras de precipitação no eixo secundário (renderizadas primeiro para ficarem atrás)
     if has_rain_data:
+        if len(filled_df) > 1:
+            step_min = (filled_df["dt_round"].iloc[1] - filled_df["dt_round"].iloc[0]).total_seconds() / 60.0
+            if step_min <= 0:
+                step_min = 5.0
+        else:
+            step_min = 5.0
+        precip_mmh = filled_df["precipitation_5min"] * (60.0 / step_min)
+
         fig.add_trace(
             go.Bar(
                 x=filled_df["dt_round"],
-                y=filled_df["precipitation_5min"],
-                name="Chuva (mm / 5min)",
+                y=precip_mmh,
+                name="Chuva (mm/h)",
                 marker_color="rgba(30, 144, 255, 0.35)",
                 yaxis="y2",
             )
@@ -1352,7 +1347,7 @@ with tab1:
             title="Nível da Água (cm abaixo do topo do poço)",
         ),
         yaxis2=dict(
-            title="Precipitação (mm / 5min)",
+            title="Precipitação (mm/h)",
             overlaying="y",
             side="right",
             showgrid=False,
@@ -1366,7 +1361,7 @@ with tab1:
         margin=dict(l=20, r=60, t=30, b=40),
         bargap=0,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     if not has_rain_data:
         st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
@@ -1488,7 +1483,7 @@ with tab1:
                 "Gráfico interativo destacando os exatos momentos da série temporal em que o poço atingiu "
                 "o seu nível máximo de água, nível mínimo, maior taxa de subida (enchimento) e maior taxa de descida (bombeamento)."
             )
-            st.plotly_chart(fig_ext, use_container_width=True)
+            st.plotly_chart(fig_ext, width="stretch")
 
             ext_cols = st.columns(4)
             if r_max_w is not None:
@@ -1542,13 +1537,13 @@ with tab1:
             h_col1, h_col2 = st.columns(2)
             with h_col1:
                 if fig_h_ench:
-                    st.plotly_chart(fig_h_ench, use_container_width=True)
+                    st.plotly_chart(fig_h_ench, width="stretch")
                 else:
                     st.info("Sem dados suficientes de subida para gerar o histograma.")
 
             with h_col2:
                 if fig_h_esv:
-                    st.plotly_chart(fig_h_esv, use_container_width=True)
+                    st.plotly_chart(fig_h_esv, width="stretch")
                 else:
                     st.info("Sem dados suficientes de esvaziamento para gerar o histograma.")
 
@@ -1723,7 +1718,7 @@ with tab2:
                     "Tempo até Desligar (min)": f"{c['duration_min']:.0f} min",
                     "Diferença vs. Teórico": f"{c['rate_cmh'] - r_liq_teorico:+.1f} cm/h",
                 })
-            st.dataframe(pd.DataFrame(det_rows).set_index("Ciclo #"), use_container_width=True)
+            st.dataframe(pd.DataFrame(det_rows).set_index("Ciclo #"), width="stretch")
 
     fig_comp.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=f"Bóia LIGA ({d_on:.1f} cm)", annotation_position="top right")
     fig_comp.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=f"Bóia DESLIGA ({d_off:.1f} cm)", annotation_position="top right")
@@ -1735,7 +1730,7 @@ with tab2:
         height=480,
         margin=dict(l=20, r=20, t=40, b=40)
     )
-    st.plotly_chart(fig_comp, use_container_width=True)
+    st.plotly_chart(fig_comp, width="stretch")
 
     if not real_cycles:
         st.info("ℹ️ Exibindo rampa teórica de esvaziamento. Conecte ao banco Turso DB para sobrepor dados em tempo real dos eventos de acionamento.")
@@ -1823,7 +1818,7 @@ with tab3:
         yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
         height=450,
     )
-    st.plotly_chart(fig_sim, use_container_width=True)
+    st.plotly_chart(fig_sim, width="stretch")
 
     st.subheader("📢 Análise de Capacidade e Risco")
     if intensidade_mm_h > intensidade_saturacao_mm_h and bomba_status == "Operacional (Ligada)":
@@ -2077,7 +2072,7 @@ with tab3:
             height=520,
             margin=dict(l=20, r=70, t=50, b=50),
         )
-        st.plotly_chart(fig_hist, use_container_width=True)
+        st.plotly_chart(fig_hist, width="stretch")
 
         if ovf_ev and ovf_ev_time is not None:
             t_ovf_str = ovf_ev_time.strftime("%d/%m/%Y às %H:%M")
@@ -2177,7 +2172,7 @@ with tab4:
             bargap=0,
             margin=dict(l=20, r=20, t=20, b=40),
         )
-        st.plotly_chart(fig_rain, use_container_width=True)
+        st.plotly_chart(fig_rain, width="stretch")
 
         # Previsão detalhada próximas 48h
         st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
@@ -2189,7 +2184,7 @@ with tab4:
             if fcast_table.empty:
                 st.success("✅ Nenhuma precipitação prevista nas próximas 48 horas.")
             else:
-                st.dataframe(fcast_table, use_container_width=True)
+                st.dataframe(fcast_table, width="stretch")
                 total_prev = next_48h["precipitation"].sum()
                 nivel_equiv_cm = total_prev * factor_mm_cm
                 st.info(
@@ -2205,7 +2200,7 @@ with tab4:
                 show_hist = hist_df.copy()
                 show_hist.index = pd.to_datetime(show_hist.index).strftime("%d/%m/%Y %H:%M")
                 show_hist.columns = ["Precipitação (mm/h)"]
-                st.dataframe(show_hist, use_container_width=True)
+                st.dataframe(show_hist, width="stretch")
             else:
                 st.write("Sem dados históricos disponíveis.")
 
@@ -2440,7 +2435,7 @@ with tab5:
         margin=dict(l=20, r=70, t=30, b=50),
         bargap=0,
     )
-    st.plotly_chart(fig5, use_container_width=True)
+    st.plotly_chart(fig5, width="stretch")
 
     # ── Alertas ──
     if overflow5 and overflow5_time is not None:
@@ -2484,7 +2479,7 @@ with tab5:
             display_cols.append("Chuva Prevista (mm/h)")
 
         hourly_sim.index = pd.DatetimeIndex(hourly_sim.index).strftime("%d/%m/%Y %H:%M")
-        st.dataframe(hourly_sim[display_cols], use_container_width=True)
+        st.dataframe(hourly_sim[display_cols], width="stretch")
 
 # ──────────────────────────────────────────────────────────────────────────────────
 with tab6:
@@ -2651,7 +2646,7 @@ with tab6:
         xaxis_title="Ano", yaxis_title="Precipitação acumulada (mm)",
         height=320, margin=dict(l=20, r=20, t=20, b=30),
     )
-    st.plotly_chart(fig_anual, use_container_width=True)
+    st.plotly_chart(fig_anual, width="stretch")
 
     # ── Gráfico 2 – Histograma de intensidades horárias + limiar de saturação ──
     st.subheader("📊 Distribuição de Intensidades Horárias")
@@ -2679,7 +2674,7 @@ with tab6:
         yaxis_title="Número de horas",
         height=320, margin=dict(l=20, r=20, t=20, b=30),
     )
-    st.plotly_chart(fig_hist, use_container_width=True)
+    st.plotly_chart(fig_hist, width="stretch")
 
     n_eventos_sat_5anos = int((hist5_df["precipitation"] >= intensidade_sat_mmh).sum())
     if n_eventos_sat_5anos > 0:
@@ -2733,7 +2728,7 @@ with tab6:
             legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
             height=420, margin=dict(l=20, r=20, t=20, b=60),
         )
-        st.plotly_chart(fig_idf, use_container_width=True)
+        st.plotly_chart(fig_idf, width="stretch")
 
     # ── Tabela IDF completa ──
     st.subheader("📋 Tabela IDF – Intensidades por Duração e Período de Retorno (mm/h)")
@@ -2747,7 +2742,7 @@ with tab6:
         def highlight_tr25(col):
             return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
 
-        st.dataframe(idf_table.style.apply(highlight_tr25), use_container_width=True)
+        st.dataframe(idf_table.style.apply(highlight_tr25), width="stretch")
 
     st.markdown("---")
 
@@ -2851,7 +2846,7 @@ with tab6:
             yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
             height=420, margin=dict(l=20, r=20, t=50, b=30),
         )
-        st.plotly_chart(fig_idf_sim, use_container_width=True)
+        st.plotly_chart(fig_idf_sim, width="stretch")
 
         if ovf_idf and ovf_idf_t is not None:
             st.error(
@@ -2877,7 +2872,7 @@ with tab6:
             idx = [str(y) for y in anos_disponiveis[:n_rows]]
             max_df = pd.DataFrame(max_table_data, index=idx[:n_rows])
             max_df.index.name = "Ano"
-            st.dataframe(max_df, use_container_width=True)
+            st.dataframe(max_df, width="stretch")
             st.caption(
                 "⚠️ Gumbel ajustado com apenas 5 pontos (1 por ano). "
                 "Para aplicações de engenharia crítica, recomenda-se série histórica ≥ 30 anos."
@@ -2910,7 +2905,7 @@ with tab6:
                     "Fator de Correção Requerido": f"×{r_cal:.2f}",
                 })
         if calib_rows:
-            st.dataframe(pd.DataFrame(calib_rows).set_index("Ano"), use_container_width=True)
+            st.dataframe(pd.DataFrame(calib_rows).set_index("Ano"), width="stretch")
             med_ratio = np.mean(ratios_list) if ratios_list else 2.07
             max_ratio = np.max(ratios_list) if ratios_list else 2.90
             st.info(
@@ -2975,7 +2970,7 @@ with tab6:
 
         st.dataframe(
             df_cmp.style.map(color_ratio, subset=["OM / DC (%)"]),
-            use_container_width=True,
+            width="stretch",
         )
         st.caption(
             "🟢 ≥ 80%: boa concordância | 🟡 60–80%: subestimação moderada | 🔴 < 60%: subestimação significativa"
@@ -3042,7 +3037,7 @@ with tab6:
 
             st.dataframe(
                 df_ev.style.map(color_ev, subset=["OM / DC (%)"]),
-                use_container_width=True,
+                width="stretch",
             )
 
             # ── 3. Scatter OM vs DC ──
@@ -3079,7 +3074,7 @@ with tab6:
                 margin=dict(l=20, r=20, t=20, b=30),
                 legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
             )
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width="stretch")
             st.caption(
                 "Pontos **abaixo** da linha 1:1 → Open-Meteo subestima o dado local. "
                 "Pontos **acima** → Open-Meteo superestima (raro para chuvas intensas pontuais)."
@@ -3276,7 +3271,7 @@ with tab7:
             height=max(300, 50 + 40 * len(df_sel)),
             margin=dict(l=10, r=120, t=20, b=30),
         )
-        st.plotly_chart(fig_dc, use_container_width=True)
+        st.plotly_chart(fig_dc, width="stretch")
 
         # Quantos registros no ranking superam a saturação da bomba?
         n_acima_sat = (df_sel["Intensidade_mmh"] >= intensidade_sat_dc).sum()
@@ -3298,7 +3293,7 @@ with tab7:
         df_display["Intensidade média (mm/h)"] = df_display["Intensidade média (mm/h)"].round(1)
         df_display.index = pd.RangeIndex(1, len(df_display) + 1)
         df_display.index.name = "#"
-        st.dataframe(df_display, use_container_width=True)
+        st.dataframe(df_display, width="stretch")
 
         st.markdown("---")
 
@@ -3383,7 +3378,7 @@ with tab7:
             height=480,
             margin=dict(l=20, r=20, t=20, b=80),
         )
-        st.plotly_chart(fig_ctx, use_container_width=True)
+        st.plotly_chart(fig_ctx, width="stretch")
 
         if not idf_ok:
             st.info(
@@ -3464,12 +3459,12 @@ with tab7:
                 legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
                 height=420, margin=dict(l=20, r=20, t=40, b=50),
             )
-            st.plotly_chart(fig_idf_k, use_container_width=True)
+            st.plotly_chart(fig_idf_k, width="stretch")
 
             st.markdown("##### 📋 Tabela IDF Gumbel (Ponte Adolfo Konder — mm/h)")
             def highlight_tr25_k(col):
                 return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
-            st.dataframe(idf_k_df.style.apply(highlight_tr25_k), use_container_width=True)
+            st.dataframe(idf_k_df.style.apply(highlight_tr25_k), width="stretch")
 
         st.markdown("#### 🏆 Maiores Picos Registrados na Ponte Adolfo Konder")
         tab_p1, tab_p2 = st.tabs(["⚡ Top 10 Pulsos de 15 Minutos", "🌧️ Top 10 Eventos Horários (1h)"])
@@ -3488,7 +3483,7 @@ with tab7:
                     "Entrada no Poço (cm/h)": f"{rate_h * factor_mm_cm:.1f} cm/h",
                     "Status": sat_status,
                 })
-            st.dataframe(pd.DataFrame(top_15m_display), use_container_width=True)
+            st.dataframe(pd.DataFrame(top_15m_display), width="stretch")
 
         with tab_p2:
             top_1h = konder_sec_df["precipitation"].resample("1h").sum().sort_values(ascending=False).head(10).copy()
@@ -3501,7 +3496,7 @@ with tab7:
                     "Entrada no Poço (cm/h)": f"{val_1h * factor_mm_cm:.1f} cm/h",
                     "Status": sat_status,
                 })
-            st.dataframe(pd.DataFrame(top_1h_display), use_container_width=True)
+            st.dataframe(pd.DataFrame(top_1h_display), width="stretch")
 
 # ──────────────────────────────────────────────────────────────────────────────────
 with tab8:
@@ -3644,7 +3639,7 @@ with tab8:
         paper_bgcolor="white",
     )
 
-    st.plotly_chart(fig_diag, use_container_width=True)
+    st.plotly_chart(fig_diag, width="stretch")
 
     col_l1, col_l2, col_l3 = st.columns(3)
     col_l1.metric("Profundidade Total do Poço", f"{y_fundo:.0f} cm",
@@ -3854,7 +3849,7 @@ with tab9:
                     })
             st.dataframe(
                 pd.DataFrame(_idf_diag_rows).set_index("Duração"),
-                use_container_width=True,
+                width="stretch",
             )
 
             # 4. Adequação
@@ -4051,7 +4046,7 @@ instalada não consegue mais acompanhar o enchimento do poço (ponto de saturaç
             row = {"Duração": _lbl}
             row.update({f"Tr {tr}a": f"{idf_rep[_lbl][tr]:.1f} mm/h" for tr in _TRS})
             _idf_rows.append(row)
-        st.dataframe(pd.DataFrame(_idf_rows).set_index("Duração"), use_container_width=True)
+        st.dataframe(pd.DataFrame(_idf_rows).set_index("Duração"), width="stretch")
 
         # Gráfico IDF
         fig_idf_r = go.Figure()
@@ -4080,7 +4075,7 @@ instalada não consegue mais acompanhar o enchimento do poço (ponto de saturaç
             height=400,
             legend=dict(orientation="h", y=-0.28, x=0.5, xanchor="center"),
         )
-        st.plotly_chart(fig_idf_r, use_container_width=True)
+        st.plotly_chart(fig_idf_r, width="stretch")
     else:
         st.warning("IDF não calculada — dados insuficientes.")
 
@@ -4122,7 +4117,7 @@ para dimensionar sistemas de bombeamento de águas pluviais.
                 "Margem (%)": f"{a['margem_pct']:+.1f}%",
                 "Resultado": "✅ Bomba dá conta" if a["adequate"] else "❌ Bomba insuficiente",
             })
-        st.dataframe(pd.DataFrame(_adq_rows).set_index("Tr (anos)"), use_container_width=True)
+        st.dataframe(pd.DataFrame(_adq_rows).set_index("Tr (anos)"), width="stretch")
         st.caption(
             f"Margem positiva = bomba tem folga. Margem negativa = falta capacidade. "
             f"A norma NBR 10844 exige que a bomba seja adequada para Tr = {_TR_NORMA} anos."
@@ -4146,7 +4141,7 @@ para dimensionar sistemas de bombeamento de águas pluviais.
             yaxis_title="Taxa de enchimento necessária (cm/h)",
             height=350,
         )
-        st.plotly_chart(fig_adq_r, use_container_width=True)
+        st.plotly_chart(fig_adq_r, width="stretch")
 
     # -- SEÇÃO 5: BUFFER --------------------------------------------------------------------------
     st.markdown("### 5. Tempo de Amortecimento do Poço (Margem de Segurança Física)")
@@ -4189,7 +4184,7 @@ depois que a chuva diminuir.
                 "Buffer disponível (cm)": dist_borda_cm,
                 "Tempo até transbordo": nota,
             })
-        st.dataframe(pd.DataFrame(_buf_rows).set_index("Tr (anos)"), use_container_width=True)
+        st.dataframe(pd.DataFrame(_buf_rows).set_index("Tr (anos)"), width="stretch")
         st.caption(
             "Nota: o tempo até transbordo assume chuva contínua na intensidade máxima de projeto. "
             "Cenário conservador — na prática, a intensidade varia e o sistema geralmente aguenta mais."
