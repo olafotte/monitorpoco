@@ -189,7 +189,7 @@ with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
             "1 minuto (Alta Resolução)",
             "5 minutos (Padrão)",
         ],
-        index=1,
+        index=0,
         help="O ESP32 envia dados a cada 1min durante chuvas/alertas e 5min em períodos normais. O modo automático ajusta a grade sem perda de dados."
     )
     if "1 minuto" in turso_freq_option:
