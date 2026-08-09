@@ -38,7 +38,11 @@ from src.data.sensor_config import (
 )
 from src.models.gumbel import fit_gumbel, gumbel_quantile
 
-st.set_page_config(page_title="Monitoramento de Poço - Condomínio", layout="wide")
+st.set_page_config(
+    page_title="Monitoramento de Poço - Condomínio",
+    page_icon=":material/water_drop:",
+    layout="wide",
+)
 st.title("📊 Monitoramento do Poço de Drenagem")
 st.markdown(
     "Este aplicativo consulta o banco Turso diretamente, aplica imputação de gaps e traz também um modelo matemático de operação."
@@ -63,6 +67,84 @@ headers = {
     "Content-Type": "application/json",
 }
 
+
+@st.cache_data(ttl="1m", max_entries=5, show_spinner="⏳ Conectando ao banco Turso...")
+def fetch_turso_data(turso_url: str, turso_token: str, limit: int) -> pd.DataFrame:
+    sql_query = (
+        "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
+        f"ORDER BY id DESC LIMIT {limit}"
+    )
+    headers_req = {
+        "Authorization": f"Bearer {turso_token}",
+        "Content-Type": "application/json",
+    }
+    payload_variants = [
+        {"stmt": {"sql": sql_query, "args": []}},
+        {"statements": [{"stmt": {"sql": sql_query, "args": []}}]},
+        {"statements": [{"sql": sql_query, "args": []}]},
+        {"statements": [sql_query]},
+    ]
+
+    response = None
+    last_error = None
+    for idx, payload in enumerate(payload_variants, start=1):
+        try:
+            resp = requests.post(turso_url, json=payload, headers=headers_req, timeout=15)
+        except Exception as exc:
+            last_error = f"request error (variant {idx}): {exc}"
+            continue
+
+        if resp.status_code == 200:
+            response = resp
+            break
+        else:
+            last_error = f"status {resp.status_code}: {resp.text} (variant {idx})"
+
+    if response is None:
+        raise RuntimeError(f"Sem resposta das variantes testadas. Último erro: {last_error}")
+
+    response_data = response.json()
+
+    if "results" in response_data and response_data.get("results"):
+        result = response_data["results"][0]
+        columns = result.get("columns", [])
+        rows = result.get("rows", [])
+    elif (
+        "result" in response_data
+        and isinstance(response_data.get("result"), dict)
+        and "cols" in response_data.get("result")
+        and "rows" in response_data.get("result")
+    ):
+        columns = [c.get("name") for c in response_data["result"].get("cols", [])]
+        rows = response_data["result"].get("rows", [])
+    elif "cols" in response_data and "rows" in response_data:
+        columns = [c.get("name") for c in response_data.get("cols", [])]
+        rows = response_data.get("rows", [])
+    else:
+        raise ValueError("A resposta do Turso não contém resultados válidos.")
+
+    if not columns or not rows:
+        return pd.DataFrame()
+
+    if isinstance(rows[0], list) and rows[0] and isinstance(rows[0][0], dict):
+        cleaned_rows = [[val.get("value") for val in row] for row in rows]
+    elif isinstance(rows[0], dict):
+        cleaned_rows = [[row.get(col) for col in columns] for row in rows]
+    else:
+        cleaned_rows = rows
+
+    df_res = pd.DataFrame(cleaned_rows, columns=columns)
+    if "status_bomba" not in df_res.columns:
+        df_res["status_bomba"] = pd.NA
+
+    # Filtrar datas corrompidas do ESP32 (ex: ano de 1970). Ignora registros anteriores a 2025.
+    if "timestamp" in df_res.columns and not df_res.empty:
+        parsed_ts = pd.to_datetime(df_res["timestamp"], errors="coerce")
+        df_res = df_res[parsed_ts.dt.year >= 2025].copy()
+
+    return df_res
+
+
 sensor_config_data = load_sensor_height_config()
 sensor_history = sensor_config_data.get("history", [])
 active_dist_default = get_active_dist_borda(sensor_config_data, fallback=DEFAULT_DIST_BORDA)
@@ -86,7 +168,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
     capacidade_total_cm = FUNDODOPOCO
     st.caption(f"↳ Topo do Poço: **0 cm** | Liga: **+{d_on:.1f} cm** (sensor lê: {d_on-dist_borda_cm:.1f} cm) | Desliga: **+{d_off:.1f} cm** (sensor lê: {d_off-dist_borda_cm:.1f} cm)")
 
-    with st.expander("📜 Gerenciar Histórico de Alturas (JSON)", expanded=False):
+    with st.expander("Gerenciar histórico de alturas (JSON)", icon=":material/history_edu:", expanded=False):
         st.caption("Histórico por período em `sensor_heights.json`:")
         if sensor_history:
             h_df = pd.DataFrame(sensor_history)
@@ -212,76 +294,6 @@ longitude = st.sidebar.number_input(
     "Longitude", value=-49.0687619, format="%.4f", help="Longitude do local monitorado"
 )
 
-@st.cache_data(ttl=60, show_spinner="⏳ Conectando ao banco Turso...")
-def fetch_turso_data(turso_url: str, turso_token: str, limit: int) -> pd.DataFrame:
-    sql_query = (
-        "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
-        f"ORDER BY id DESC LIMIT {limit}"
-    )
-    headers = {
-        "Authorization": f"Bearer {turso_token}",
-        "Content-Type": "application/json",
-    }
-    payload_variants = [
-        {"stmt": {"sql": sql_query, "args": []}},
-        {"statements": [{"stmt": {"sql": sql_query, "args": []}}]},
-        {"statements": [{"sql": sql_query, "args": []}]},
-        {"statements": [sql_query]},
-    ]
-
-    response = None
-    last_error = None
-    for idx, payload in enumerate(payload_variants, start=1):
-        try:
-            resp = requests.post(turso_url, json=payload, headers=headers, timeout=15)
-        except Exception as exc:
-            last_error = f"request error (variant {idx}): {exc}"
-            continue
-
-        if resp.status_code == 200:
-            response = resp
-            break
-        else:
-            last_error = f"status {resp.status_code}: {resp.text} (variant {idx})"
-
-    if response is None:
-        raise RuntimeError(f"Sem resposta das variantes testadas. Último erro: {last_error}")
-
-    response_data = response.json()
-
-    if "results" in response_data and response_data.get("results"):
-        result = response_data["results"][0]
-        columns = result.get("columns", [])
-        rows = result.get("rows", [])
-    elif (
-        "result" in response_data
-        and isinstance(response_data.get("result"), dict)
-        and "cols" in response_data.get("result")
-        and "rows" in response_data.get("result")
-    ):
-        columns = [c.get("name") for c in response_data["result"].get("cols", [])]
-        rows = response_data["result"].get("rows", [])
-    elif "cols" in response_data and "rows" in response_data:
-        columns = [c.get("name") for c in response_data.get("cols", [])]
-        rows = response_data.get("rows", [])
-    else:
-        raise ValueError("A resposta do Turso não contém resultados válidos.")
-
-    if not columns or not rows:
-        return pd.DataFrame()
-
-    if isinstance(rows[0], list) and rows[0] and isinstance(rows[0][0], dict):
-        cleaned_rows = [[val.get("value") for val in row] for row in rows]
-    elif isinstance(rows[0], dict):
-        cleaned_rows = [[row.get(col) for col in columns] for row in rows]
-    else:
-        cleaned_rows = rows
-
-    df_res = pd.DataFrame(cleaned_rows, columns=columns)
-    if "status_bomba" not in df_res.columns:
-        df_res["status_bomba"] = pd.NA
-    return df_res
-
 
 try:
     df = fetch_turso_data(TURSO_URL, TURSO_TOKEN, record_limit)
@@ -295,7 +307,7 @@ if df.empty or "timestamp" not in df.columns or "nivel_cm" not in df.columns:
 
 
 
-@st.cache_data
+@st.cache_data(ttl="1h", max_entries=10)
 def preprocess_time_series(
     input_df: pd.DataFrame,
     sensor_history_json_str: str = "",
@@ -304,6 +316,12 @@ def preprocess_time_series(
 ) -> pd.DataFrame:
     df = input_df.copy()
     ts_col = pd.to_datetime(df["timestamp"], errors="coerce")
+    
+    # Ignorar leituras corrompidas do ESP32 com ano < 2025 (ex: 1970)
+    valid_years = ts_col.dt.year >= 2025
+    df = df[valid_years].copy()
+    ts_col = ts_col[valid_years]
+
     if ts_col.dt.tz is None:
         df["timestamp"] = ts_col.dt.tz_localize("UTC").dt.tz_convert("America/Sao_Paulo")
     else:
@@ -460,7 +478,7 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl="30m", max_entries=20)
 def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
     """Busca dados horários de precipitação na API Open-Meteo.
     Retorna DataFrame com índice datetime e coluna 'precipitation' (mm/h).
@@ -502,7 +520,7 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
             "longitude": lon,
             "hourly": "precipitation",
             "timezone": "America/Sao_Paulo",
-            "forecast_days": 7,
+            "forecast_days": 8,
         }
         try:
             r = requests.get(url_forecast, params=params_forecast, timeout=15)
@@ -545,7 +563,7 @@ def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex | p
     return precip_reindexed
 
 
-@st.cache_data(ttl=86400)  # cache de 24h – dados históricos mudam pouco
+@st.cache_data(ttl="24h", max_entries=10)  # cache de 24h
 def fetch_historical_5years_precip(lat: float, lon: float, start_date_str: str = "", end_date_str: str = "") -> tuple:
     """Busca dados de precipitação horária via Open-Meteo Archive API.
     Se start_date_str for fornecido, usa essa data como início; caso contrário usa 5 anos atrás.
@@ -1122,7 +1140,7 @@ col3.metric("Dados Preenchidos (Gaps)", f"{missing_obs:,} ({missing_pct:.1f}%)")
 col4.metric("Faixa de Operação", f"{d_on:.1f} cm - {d_off:.1f} cm")
 
 
-@st.cache_data(ttl=3600)  # cache de 1h
+@st.cache_data(ttl="1h", max_entries=5)  # cache de 1h
 def fetch_defesa_civil_rankings() -> dict:
     """Retorna rankings de maiores chuvas da Defesa Civil de Blumenau.
 
@@ -1232,3163 +1250,3308 @@ def fetch_defesa_civil_rankings() -> dict:
 
     return resultado
 
+
+@st.cache_data(ttl="1h", max_entries=10)
+def compute_gumbel_idf_results(latitude: float, longitude: float, era5_factor: float):
+    """Calcula os resultados de Gumbel IDF de forma independente para compartilhamento entre abas."""
+    try:
+        hist5_df, hist_err = fetch_historical_5years_precip(latitude, longitude, start_date_str="")
+        if hist5_df.empty:
+            return {}, {}
+
+        konder_df = load_adolfo_konder_dataset()
+        if not konder_df.empty:
+            hist5_df = pd.DataFrame({"precipitation": konder_df["precip_15min"].resample("1h").sum()}).dropna()
+        
+        hist5_df = hist5_df.copy()
+        hist5_df["precipitation"] = hist5_df["precipitation"] * era5_factor
+
+        duracoes_h = [1, 2, 3, 6, 12, 24]
+        trs = [2, 5, 10, 25, 50, 100]
+
+        idf_res = {}
+        gumbel_p = {}
+        for dur in duracoes_h:
+            rolled = hist5_df["precipitation"].rolling(window=dur, min_periods=dur).sum()
+            rolled_intensity = rolled / dur
+            annual_max = rolled_intensity.groupby(hist5_df.index.year).max().dropna().values
+            if len(annual_max) < 2:
+                continue
+            alpha, u = fit_gumbel(annual_max)
+            gumbel_p[dur] = (alpha, u, annual_max)
+            idf_res[dur] = {}
+            for tr in trs:
+                idf_res[dur][tr] = max(gumbel_quantile(alpha, u, tr), 0.0)
+
+        return idf_res, gumbel_p
+    except Exception:
+        return {}, {}
+
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "📊 Visualização e Imputação",
-    "📐 Modelo Matemático",
-    "🌧️ Simulador Pluviométrico",
-    "🌦️ Chuvas",
-    "🔮 Previsão do Nível",
-    "📊 Histórico & IDF",
-    "🛑 Defesa Civil Blumenau",
-    "🗂️ Diagrama do Poço",
-    "📋 Relatório de Adequação",
-])
+    ":material/analytics: Visualização e Imputação",
+    ":material/architecture: Modelo Matemático",
+    ":material/water: Simulador Pluviométrico",
+    ":material/cloud: Chuvas",
+    ":material/auto_awesome: Previsão do Nível",
+    ":material/history: Histórico & IDF",
+    ":material/shield: Defesa Civil Blumenau",
+    ":material/schema: Diagrama do Poço",
+    ":material/description: Relatório de Adequação",
+], on_change="rerun")
 
 with tab1:
-    st.subheader("Série Temporal do Nível do Poço")
-    st.caption(
-        "O eixo Y esquerdo (invertido) mostra a distância do sensor à linha d'água. "
-        "O eixo Y direito mostra a intensidade de precipitação em mm/hora."
-    )
-
-    trend = compute_recent_rising_trend(
-        filled_df,
-        dist_borda_cm,
-        d_on=d_on,
-        tem_bomba2=tem_bomba2,
-        d_on2=d_on2,
-        weather_df=weather_df,
-        factor_mm_cm=factor_mm_cm,
-        window_size=20,
-    )
-
-    has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
-
-    fig = go.Figure()
-
-    # Barras de precipitação no eixo secundário (renderizadas primeiro para ficarem atrás)
-    if has_rain_data:
-        if len(filled_df) > 1:
-            step_min = (filled_df["dt_round"].iloc[1] - filled_df["dt_round"].iloc[0]).total_seconds() / 60.0
-            if step_min <= 0:
+    if tab1.open:
+        st.subheader("Série Temporal do Nível do Poço")
+        st.caption(
+            "O eixo Y esquerdo (invertido) mostra a distância do sensor à linha d'água. "
+            "O eixo Y direito mostra a intensidade de precipitação em mm/hora."
+        )
+    
+        trend = compute_recent_rising_trend(
+            filled_df,
+            dist_borda_cm,
+            d_on=d_on,
+            tem_bomba2=tem_bomba2,
+            d_on2=d_on2,
+            weather_df=weather_df,
+            factor_mm_cm=factor_mm_cm,
+            window_size=20,
+        )
+    
+        has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
+    
+        fig = go.Figure()
+    
+        # Barras de precipitação no eixo secundário (renderizadas primeiro para ficarem atrás)
+        if not weather_df.empty:
+            sensor_min = filled_df["dt_round"].min()
+            sensor_max = filled_df["dt_round"].max()
+    
+            max_chart_dt = sensor_max
+            if trend and trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
+                max_chart_dt = max(max_chart_dt, trend["era5_sim_df"]["dt_round"].max())
+    
+            w_chart = weather_df[
+                (weather_df.index >= sensor_min) & (weather_df.index <= max_chart_dt)
+            ]
+    
+            if not w_chart.empty:
+                w_hist = w_chart[w_chart.index <= sensor_max]
+                w_fut = w_chart[w_chart.index > sensor_max]
+    
+                if not w_hist.empty:
+                    fig.add_trace(
+                        go.Bar(
+                            x=w_hist.index,
+                            y=w_hist["precipitation"],
+                            name="Chuva Recente (mm/h)",
+                            marker_color="rgba(30, 144, 255, 0.35)",
+                            yaxis="y2",
+                        )
+                    )
+                if not w_fut.empty:
+                    fig.add_trace(
+                        go.Bar(
+                            x=w_fut.index,
+                            y=w_fut["precipitation"],
+                            name="Previsão Chuva ERA5 (mm/h)",
+                            marker_color="rgba(46, 204, 113, 0.45)",
+                            yaxis="y2",
+                        )
+                    )
+        elif "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0:
+            if len(filled_df) > 1:
+                step_min = (filled_df["dt_round"].iloc[1] - filled_df["dt_round"].iloc[0]).total_seconds() / 60.0
+                if step_min <= 0:
+                    step_min = 5.0
+            else:
                 step_min = 5.0
-        else:
-            step_min = 5.0
-        precip_mmh = filled_df["precipitation_5min"] * (60.0 / step_min)
-
-        fig.add_trace(
-            go.Bar(
-                x=filled_df["dt_round"],
-                y=precip_mmh,
-                name="Chuva (mm/h)",
-                marker_color="rgba(30, 144, 255, 0.35)",
-                yaxis="y2",
-            )
-        )
-
-    fig.add_trace(
-        go.Scatter(
-            x=filled_df["dt_round"],
-            y=filled_df["nivel_cm"],
-            mode="markers",
-            name="Dados Reais (Sensor)",
-            marker=dict(size=4, color="#1f77b4"),
-        )
-    )
-    fig.add_trace(
-        go.Scatter(
-            x=filled_df["dt_round"],
-            y=filled_df["nivel_imputed"],
-            mode="lines",
-            name="Modelo Estimado (Sem Gaps)",
-            line=dict(color="#ff7f0e", width=1.5),
-        )
-    )
-
-    if trend and trend["rate_cmh"] > 0:
-        t_latest = trend["latest_time"]
-        t_sensor_dt = t_latest + pd.Timedelta(hours=trend["time_sensor_h"])
-        t_overflow_dt = t_latest + pd.Timedelta(hours=trend["time_overflow_h"])
-
-        # Projeção Linear Base (Sem Chuva)
-        fig.add_trace(
-            go.Scatter(
-                x=[t_latest, t_sensor_dt, t_overflow_dt],
-                y=[trend["curr_d"], 0, d_overflow],
-                mode="lines+markers",
-                name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
-                line=dict(color="#777777", width=2, dash="dash"),
-                marker=dict(size=5, symbol="circle"),
-            )
-        )
-
-        # Projeção Corrigida com Previsão ERA5 (Com Chuva Futura)
-        if trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
+            precip_mmh = filled_df["precipitation_5min"] * (60.0 / step_min)
+    
             fig.add_trace(
-                go.Scatter(
-                    x=trend["era5_sim_df"]["dt_round"],
-                    y=trend["era5_sim_df"]["nivel_imputed"],
-                    mode="lines",
-                    name="Projeção Corrigida (ERA5 + Chuva)",
-                    line=dict(color="#d9534f", width=2.5, dash="dot"),
-                )
-            )
-    b1_on_label = "Bomba 1 Liga (Água Alta)" if tem_bomba2 else "Bomba Liga (Água Alta)"
-    b1_off_label = "Bomba 1 Desliga (Água Baixa)" if tem_bomba2 else "Bomba Desliga (Água Baixa)"
-    fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label)
-    fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label)
-    if tem_bomba2:
-        fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
-        fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
-    fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)")
-    fig.update_layout(
-        yaxis=dict(
-            autorange="reversed",
-            title="Nível da Água (cm abaixo do topo do poço)",
-        ),
-        yaxis2=dict(
-            title="Precipitação (mm/h)",
-            overlaying="y",
-            side="right",
-            showgrid=False,
-            rangemode="tozero",
-            tickfont=dict(color="rgba(30, 144, 255, 0.8)"),
-            title_font=dict(color="rgba(30, 144, 255, 0.8)"),
-        ),
-        xaxis=dict(title="Data / Hora"),
-        legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
-        height=520,
-        margin=dict(l=20, r=60, t=30, b=40),
-        bargap=0,
-    )
-    st.plotly_chart(fig, width="stretch")
-
-    if not has_rain_data:
-        st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
-
-    st.subheader("Últimos Registros")
-    df_export = filled_df.copy()
-    num_cols = df_export.select_dtypes(include="number").columns
-    df_export[num_cols] = df_export[num_cols].round(2)
-    st.dataframe(df_export)
-    st.download_button(
-        label="📥 Baixar Registros em CSV",
-        data=df_export.to_csv(index=False, float_format="%.2f").encode("utf-8"),
-        file_name="registros_poco.csv",
-        mime="text/csv",
-    )
-
-    if trend and trend["rate_cmh"] > 0:
-        t_b1_str = format_hours_status(trend["time_bomba1_h"], trend["curr_d"], d_on)
-        t_b1_era5_str = format_hours_status(trend["time_bomba1_era5_h"], trend["curr_d"], d_on)
-
-        t_b2_str = format_hours_status(trend["time_bomba2_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
-        t_b2_era5_str = format_hours_status(trend["time_bomba2_era5_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
-
-        t_sens_str = format_hours_status(trend["time_sensor_h"], trend["curr_d"], 0.0)
-        t_sens_era5_str = format_hours_status(trend["time_sensor_era5_h"], trend["curr_d"], 0.0)
-
-        t_ovf_str = format_hours_status(trend["time_overflow_h"], trend["curr_d"], d_overflow)
-        t_ovf_era5_str = format_hours_status(trend["time_overflow_era5_h"], trend["curr_d"], d_overflow)
-
-        t_start_fmt = trend["start_time"].strftime("%d/%m/%Y às %H:%M")
-        t_dur_fmt = format_hours(trend["duration_h"])
-
-        st.markdown("---")
-        with st.container(border=True):
-            st.subheader("🧪 Estimativa de Subida Real (Tendência Recente de 20 Leituras + ERA5)")
-
-            rain_msg = (
-                f" 🌦️ **Chuva Futura ERA5:** +{trend['total_rain_era5']:.1f} mm previstos no período."
-                if trend["has_future_rain"]
-                else " ☀️ **Sem chuva futura prevista.**"
-            )
-            st.markdown(
-                f"Análise da velocidade atual baseada nas **últimas {trend['num_points']} leituras** ({t_dur_fmt} | desde **{t_start_fmt}**). "
-                f"Variação na janela: **{trend['start_d']:.1f} cm** → **{trend['curr_d']:.1f} cm** |{rain_msg}"
-            )
-
-            num_cols = 5 if tem_bomba2 else 4
-            cols = st.columns(num_cols)
-
-            cols[0].metric(
-                label="📈 Taxa Recente (Últimas 20)",
-                value=f"{trend['rate_cmh']:.2f} cm/h",
-            )
-
-            cols[1].metric(
-                label=f"🚨 Ligar Bomba 1 ({d_on:.1f} cm)",
-                value=t_b1_era5_str,
-                delta=f"Base: {t_b1_str}" if t_b1_era5_str != t_b1_str else None,
-                delta_color="off",
-            )
-
-            curr_idx = 2
-            if tem_bomba2:
-                cols[curr_idx].metric(
-                    label=f"⚡ Ligar Bomba 2 ({d_on2:.1f} cm)",
-                    value=t_b2_era5_str,
-                    delta=f"Base: {t_b2_str}" if t_b2_era5_str != t_b2_str else None,
-                    delta_color="off",
-                )
-                curr_idx += 1
-
-            cols[curr_idx].metric(
-                label="🎯 Atingir Sensor (0 cm)",
-                value=t_sens_era5_str,
-                delta=f"Base: {t_sens_str}" if t_sens_era5_str != t_sens_str else None,
-                delta_color="off",
-            )
-            curr_idx += 1
-
-            cols[curr_idx].metric(
-                label=f"🌊 Transbordar ({d_overflow:.0f} cm)",
-                value=t_ovf_era5_str,
-                delta=f"Base: {t_ovf_str}" if t_ovf_era5_str != t_ovf_str else None,
-                delta_color="inverse",
-            )
-
-    rate_stats = compute_rate_statistics(filled_df)
-    if rate_stats:
-        with st.container(border=True):
-            st.subheader("📊 Análise Histórica das Taxas Operacionais (Enchimento vs. Esvaziamento)")
-            st.caption(
-                "Estatísticas calculadas a partir de todas as taxas válidas registradas na série temporal. "
-                "Separado em **Enchimento** (subida do nível com bomba desligada) e **Esvaziamento** (descida do nível com bombeamento ativo)."
-            )
-
-            c_ench, c_esv = st.columns(2)
-
-            with c_ench:
-                st.markdown("#### 🟢 Regime de Enchimento (Subida de Nível)")
-                st.caption(f"Amostras: **{rate_stats['ench_count']}** períodos de subida")
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Taxa Mediana", f"{rate_stats['ench_media']:.2f} cm/h")
-                m2.metric("Pico (Máximo)", f"{rate_stats['ench_pico']:.2f} cm/h")
-                m3.metric("Taxa Mínima", f"{rate_stats['ench_min']:.2f} cm/h")
-
-            with c_esv:
-                st.markdown("#### 🔵 Regime de Esvaziamento (Descida por Bombeamento)")
-                st.caption(f"Amostras: **{rate_stats['esv_count']}** períodos de descida")
-                m4, m5, m6 = st.columns(3)
-                m4.metric("Taxa Mediana", f"{rate_stats['esv_media']:.2f} cm/h")
-                m5.metric("Pico (Máximo)", f"{rate_stats['esv_pico']:.2f} cm/h")
-                m6.metric("Taxa Mínima", f"{rate_stats['esv_min']:.2f} cm/h")
-
-    fig_ext, r_max_w, r_min_w, r_pk_rise, r_pk_drop = plot_historical_extremes_chart(filled_df)
-    if fig_ext:
-        with st.container(border=True):
-            st.subheader("📅 Ocorrência Temporal das Máximas e Mínimas Históricas")
-            st.caption(
-                "Gráfico interativo destacando os exatos momentos da série temporal em que o poço atingiu "
-                "o seu nível máximo de água, nível mínimo, maior taxa de subida (enchimento) e maior taxa de descida (bombeamento)."
-            )
-            st.plotly_chart(fig_ext, width="stretch")
-
-            ext_cols = st.columns(4)
-            if r_max_w is not None:
-                d1 = r_max_w["nivel_imputed"] if "nivel_imputed" in r_max_w else r_max_w["nivel_cm"]
-                t1 = r_max_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
-                ext_cols[0].metric(
-                    label="🔴 Água Mais Alta (Nível Máx)",
-                    value=f"{d1:.1f} cm",
-                    delta=f"Ocorrido em: {t1}",
-                    delta_color="off",
-                )
-
-            if r_min_w is not None:
-                d2 = r_min_w["nivel_imputed"] if "nivel_imputed" in r_min_w else r_min_w["nivel_cm"]
-                t2 = r_min_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
-                ext_cols[1].metric(
-                    label="🔵 Água Mais Baixa (Nível Mín)",
-                    value=f"{d2:.1f} cm",
-                    delta=f"Ocorrido em: {t2}",
-                    delta_color="off",
-                )
-
-            if r_pk_rise is not None:
-                r3 = r_pk_rise["rate_cmh"]
-                t3 = r_pk_rise["t_start"].strftime("%d/%m/%Y às %H:%M")
-                ext_cols[2].metric(
-                    label="⚡ Pico de Subida (Enchimento)",
-                    value=f"+{r3:.2f} cm/h",
-                    delta=f"Ocorrido em: {t3}",
-                    delta_color="off",
-                )
-
-            if r_pk_drop is not None:
-                r4 = r_pk_drop["rate_cmh"]
-                t4 = r_pk_drop["t_start"].strftime("%d/%m/%Y às %H:%M")
-                ext_cols[3].metric(
-                    label="🌊 Pico de Descida (Esvaziamento)",
-                    value=f"-{r4:.2f} cm/h",
-                    delta=f"Ocorrido em: {t4}",
-                    delta_color="off",
-                )
-
-    fig_h_ench, fig_h_esv = plot_rate_histograms(filled_df)
-    if fig_h_ench or fig_h_esv:
-        with st.container(border=True):
-            st.subheader("📊 Frequência e Distribuição das Taxas (Histogramas Operacionais)")
-            st.caption(
-                "Histogramas de frequência das velocidades operacionais (cm/h). "
-                "Permite identificar a concentração das taxas típicas de subida da água e a capacidade de rebaixamento das bombas."
-            )
-            h_col1, h_col2 = st.columns(2)
-            with h_col1:
-                if fig_h_ench:
-                    st.plotly_chart(fig_h_ench, width="stretch")
-                else:
-                    st.info("Sem dados suficientes de subida para gerar o histograma.")
-
-            with h_col2:
-                if fig_h_esv:
-                    st.plotly_chart(fig_h_esv, width="stretch")
-                else:
-                    st.info("Sem dados suficientes de esvaziamento para gerar o histograma.")
-
-with tab2:
-    st.header("Formulação do Modelo Matemático")
-    st.markdown("O comportamento hidrodinâmico do poço de drenagem é regido pela **Equação de Balanço de Massa / Continuidade**:")
-    st.latex(r"\frac{dV}{dt} = A \cdot \frac{dh}{dt} = Q_{\text{entrada}}(t) - Q_{\text{saída}}(t)")
-    st.markdown(r"Como o sensor mede a distância $d(t)$ no topo em relação à lâmina d'água ($h(t) = H_{\text{sensor}} - d(t)$), temos $\frac{dh}{dt} = -\frac{dd}{dt}$." )
-    st.markdown("Portanto, a taxa instantânea de variação da distância $d(t)$ é dada por:")
-    st.latex(r"\frac{dd(t)}{dt} = \frac{Q_{\text{saída}}(t) - Q_{\text{entrada}}(t)}{A}")
-    st.subheader("Regimes Operacionais Recalibrados")
-    st.markdown("**1️⃣ Entrada Lenta (Lençol Freático – Estado $S_0$)**")
-    st.markdown("- $Q_{\text{saída}} = 0$ (Bomba desligada)")
-    st.latex(r"\frac{dd}{dt} = -r_{\text{freático}} \approx -1.44\text{ cm/h}")
-    st.markdown("**2️⃣ Entrada por Chuva ($S_1$)**")
-    st.markdown("- Relacionada com a precipitação em mm pela taxa de amplificação do pátio:")
-    st.latex(r"\text{Taxa de Entrada (cm/h)} = \frac{\text{Chuva (mm)}}{\text{Horas}} \times 2.83")
-    st.markdown("**3️⃣ Esvaziamento Forçado (Bomba Ativa – Estado $S_2$)**")
-    st.latex(r"Q_{\text{saída}} = 14.000\text{ L/h} (14\text{ m}^3/h) \Rightarrow r_{\text{bomba}} \approx 76.6\text{ cm/h}")
-
-    st.markdown("---")
-    st.subheader("📐 Estimativa e Calibração do Fator de Conversão (m³/h para cm/h)")
-    st.markdown(
-        """
-        ### 1. Relação Teórica da Geometria do Poço
-        Para um poço cilíndrico ideal de diâmetro interno $D = 1,20\text{ m}$, a área da seção transversal ($A$) é dada por:
-        """
-    )
-    st.latex(r"A = \pi \cdot \left(\frac{D}{2}\right)^2 = \pi \cdot (0,60)^2 \approx 1,131\text{ m}^2")
-    st.markdown(
-        """
-        Teoricamente, a conversão entre uma vazão volumétrica $Q\text{ (m}^3/\text{h)}$ e a variação da coluna d'água no poço $r\text{ (cm/h)}$ seria:
-        """
-    )
-    st.latex(r"F_{\text{teórico}} = \frac{100\text{ cm/m}}{A\text{ m}^2} = \frac{100}{1,131} \approx 88,42\text{ (cm/h por m}^3/\text{h)}")
-
-    st.markdown(
-        """
-        ### 2. O Efeito Real das Galerias Conectadas (*Pipe Storage* & Remanso)
-        Na instalação real, o poço não opera de forma isolada. Ele está conectado a tubulações e galerias de drenagem dispostas com inclinação suave.
-        Quando a bomba desliga ou a chuva entra, ocorre o **efeito de remanso**: a água preenche também o volume contido na rede de tubulações acopladas a montante.
-        
-        Isso expande a **área equivalente de armazenamento** ($A_{\text{efetiva}}$):
-        """
-    )
-    st.latex(r"A_{\text{efetiva}} = \frac{100}{F_{\text{calibrado}}} = \frac{100}{5,471} \approx 18,28\text{ m}^2")
-    st.markdown(
-        """
-        Ou seja, o reservatório físico se comporta hidrostaticamente como se tivesse uma área de superfície de **18,28 m²** (amortecimento muito maior que o poço isolado de 1,20 m).
-        """
-    )
-
-    st.markdown(
-        """
-        ### 3. Estimativa Prática pelos Dados do Sensor Ultrassônico
-        O modelo estima e valida empiricamente o fator de conversão $F$ analisando os ciclos de acionamento da bomba capturados pelo sensor ultrassônico durante períodos sem chuva (quando apenas o lençol freático está ativo):
-
-        1. **Fase de Esvaziamento (Bomba LIGADA):** O sensor mede a velocidade líquida de rebaixamento da água $(\\frac{dd}{dt})_{\\text{desce}} \\approx -75,16\\text{ cm/h}$.
-        2. **Fase de Enchimento (Bomba DESLIGADA):** O sensor mede a velocidade de subida por afluxo do lençol freático $(\\frac{dd}{dt})_{\\text{subida}} \\approx +1,44\\text{ cm/h}$.
-        3. **Vazão Bruta da Bomba ($r_{\\text{bomba}}$):** A soma em módulo das duas velocidades elimina a interferência do lençol freático e fornece a velocidade bruta da bomba registrada no sensor:
-        """
-    )
-    st.latex(r"r_{\text{bomba}} = \left|\left(\frac{dd}{dt}\right)_{\text{desce}}\right| + \left(\frac{dd}{dt}\right)_{\text{subida}} = 75,16 + 1,44 = 76,6\text{ cm/h}")
-    st.markdown(
-        """
-        4. **Cálculo do Fator Calibrado ($F$):** Dividindo essa taxa de variação observada pelo sensor em $\\text{cm/h}$ pela vazão nominal hidráulica da bomba $Q_{\\text{bomba}} = 14,0\\text{ m}^3/\\text{h}$:
-        """
-    )
-    st.latex(r"F_{\text{calibrado}} = \frac{r_{\text{bomba}}\text{ (cm/h)}}{Q_{\text{bomba}}\text{ (m}^3/\text{h)}} = \frac{76,6\text{ cm/h}}{14,0\text{ m}^3/\text{h}} = 5,471\text{ (cm/h por m}^3/\text{h)}")
-
-    st.markdown("---")
-    st.subheader("📈 Comparativo no Momento LIGA → DESLIGA: Esvaziamento Teórico vs. 5+ Séries Reais (Sensor)")
-    st.caption("Alinhamento do instante exato de atracamento da bomba (quando a água atinge d_on, t = 0 min) para comparar a rampa de esvaziamento teórica com múltiplos eventos reais gravados pelo sensor ultrassônico.")
-
-    # 1. Rampa Teórica de Esvaziamento (Bomba Ligada)
-    r_liq_teorico = 76.6 - r_gnd_param
-    t_teorico_min = (d_off - d_on) / r_liq_teorico * 60.0
-    t_teor_arr = np.linspace(0, max(t_teorico_min * 1.4, 35.0), 100)
-    d_teor_arr = [min(d_on + (r_liq_teorico / 60.0) * t, d_off) for t in t_teor_arr]
-
-    fig_comp = go.Figure()
-    fig_comp.add_trace(go.Scatter(
-        x=t_teor_arr, y=d_teor_arr, mode="lines",
-        name=f"Esvaziamento Teórico (-{r_liq_teorico:.1f} cm/h)",
-        line=dict(color="#1f77b4", width=3.5)
-    ))
-
-    # 2. Localizar e alinhar o início EXATO das rampas de esvaziamento (t = 0 onde d atinge d_on e começa a subir)
-    real_cycles = []
-    palette_cycles = ["#e67e22", "#2ecc71", "#9b59b6", "#e74c3c", "#f1c40f", "#1abc9c", "#e84393", "#00cec9"]
-
-    if "filled_df" in locals() or "filled_df" in globals():
-        try:
-            if not filled_df.empty:
-                s_lev = filled_df["nivel_cm"].fillna(filled_df["nivel_imputed"])
-                df_w = filled_df.copy()
-                df_w["val"] = s_lev
-
-                # Identificar pontos onde o nível está alto (val <= d_on + 6.0) E a distância aumenta no curto prazo
-                diff_15m = df_w["val"].shift(-3) - df_w["val"]
-                triggers = df_w[(df_w["val"] <= (d_on + 6.0)) & (diff_15m >= 2.0)].index
-
-                if len(triggers) == 0:
-                    diff_5m = df_w["val"].shift(-1) - df_w["val"]
-                    triggers = df_w[(df_w["val"] <= (d_on + 10.0)) & (diff_5m >= 1.0)].index
-
-                for idx in reversed(triggers):
-                    loc_val = df_w.index.get_loc(idx)
-                    loc = int(loc_val.start if isinstance(loc_val, slice) else (loc_val[0] if isinstance(loc_val, np.ndarray) else loc_val))
-                    t_curr = df_w["dt_round"].iloc[loc]
-
-                    # Evitar duplicatas no mesmo ciclo (separação mínima de 20 min)
-                    if any(abs((t_curr - c["start_dt"]).total_seconds()) < 1200 for c in real_cycles):
-                        continue
-
-                    # Extrair até 24 pontos (2 horas) a partir do início da rampa de desbarrancamento
-                    sub = df_w.iloc[loc:min(loc+24, len(df_w))]
-                    if len(sub) < 2:
-                        continue
-
-                    # Truncar no pico de esvaziamento (quando atinge d_off / distância máxima)
-                    max_dist_loc = sub["val"].idxmax()
-                    end_loc_val = sub.index.get_loc(max_dist_loc)
-                    end_loc = int(end_loc_val.start if isinstance(end_loc_val, slice) else (end_loc_val[0] if isinstance(end_loc_val, np.ndarray) else end_loc_val))
-                    sub_cut = sub.iloc[0:end_loc+1]
-
-                    if len(sub_cut) >= 2 and (sub_cut["val"].iloc[-1] - sub_cut["val"].iloc[0]) >= 3.0:
-                        sub_copy = sub_cut.copy()
-                        t0_ev = sub_copy["dt_round"].iloc[0]
-                        sub_copy["t_min"] = (sub_copy["dt_round"] - t0_ev).dt.total_seconds() / 60.0
-                        dt_h_ev = (sub_copy["dt_round"].iloc[-1] - t0_ev).total_seconds() / 3600.0
-                        real_rate_cmh = (sub_copy["val"].iloc[-1] - sub_copy["val"].iloc[0]) / dt_h_ev if dt_h_ev > 0 else 0.0
-
-                        real_cycles.append({
-                            "start_dt": t0_ev,
-                            "sub_df": sub_copy,
-                            "rate_cmh": real_rate_cmh,
-                            "duration_min": sub_copy["t_min"].iloc[-1],
-                        })
-                        if len(real_cycles) >= 6:
-                            break
-        except Exception:
-            pass
-
-    if real_cycles:
-        for idx_c, c in enumerate(real_cycles, 1):
-            clr = palette_cycles[(idx_c - 1) % len(palette_cycles)]
-            t_label = c["start_dt"].strftime("%d/%m %H:%M")
-            fig_comp.add_trace(go.Scatter(
-                x=c["sub_df"]["t_min"], y=c["sub_df"]["val"],
-                mode="markers+lines",
-                name=f"Ciclo Real {idx_c} ({t_label}) — {c['rate_cmh']:.1f} cm/h",
-                line=dict(color=clr, width=2, dash="dot"),
-                marker=dict(size=6, color=clr)
-            ))
-
-        avg_real_rate = np.mean([c["rate_cmh"] for c in real_cycles])
-        avg_real_dur = np.mean([c["duration_min"] for c in real_cycles])
-
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Taxa Esvaziamento Teórica", f"{r_liq_teorico:.1f} cm/h", help="14 m³/h menos lençol freático")
-        mc2.metric(f"Média Real ({len(real_cycles)} Ciclos Medidos)", f"{avg_real_rate:.1f} cm/h", delta=f"{avg_real_rate - r_liq_teorico:+.1f} cm/h")
-        mc3.metric("Tempo Médio de Rebaixamento", f"{avg_real_dur:.0f} min (Real)", delta=f"Teórico: {t_teorico_min:.1f} min")
-
-        with st.expander(f"📋 Ver Detalhes dos {len(real_cycles)} Ciclos Reais Medidos pelo Sensor"):
-            det_rows = []
-            for i, c in enumerate(real_cycles, 1):
-                det_rows.append({
-                    "Ciclo #": i,
-                    "Data / Hora Ativação (t=0)": c["start_dt"].strftime("%d/%m/%Y %H:%M"),
-                    "Taxa Rebaixamento (cm/h)": f"{c['rate_cmh']:.1f} cm/h",
-                    "Tempo até Desligar (min)": f"{c['duration_min']:.0f} min",
-                    "Diferença vs. Teórico": f"{c['rate_cmh'] - r_liq_teorico:+.1f} cm/h",
-                })
-            st.dataframe(pd.DataFrame(det_rows).set_index("Ciclo #"), width="stretch")
-
-    fig_comp.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=f"Bóia LIGA ({d_on:.1f} cm)", annotation_position="top right")
-    fig_comp.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=f"Bóia DESLIGA ({d_off:.1f} cm)", annotation_position="top right")
-
-    fig_comp.update_layout(
-        title="Rampa de Esvaziamento do Poço: Instante da Ativação da Bomba (t = 0 min, Múltiplos Eventos)",
-        xaxis_title="Tempo Decorrido desde a Ativação da Bomba (Minutos)",
-        yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
-        height=480,
-        margin=dict(l=20, r=20, t=40, b=40)
-    )
-    st.plotly_chart(fig_comp, width="stretch")
-
-    if not real_cycles:
-        st.info("ℹ️ Exibindo rampa teórica de esvaziamento. Conecte ao banco Turso DB para sobrepor dados em tempo real dos eventos de acionamento.")
-
-with tab3:
-    st.subheader("🔮 Simulador de Eventos Pluviométricos e Saturação da Bomba")
-    st.write("Insira a estimativa de volume de chuva (mm) e a duração prevista (horas) para avaliar se a bomba suportará o volume ou se haverá transbordamento.")
-
-    col_input1, col_input2, col_input3 = st.columns(3)
-    with col_input1:
-        chuva_mm = st.number_input("Precipitação Prevista (mm)", min_value=1.0, max_value=300.0, value=60.0, step=5.0)
-    with col_input2:
-        chuva_horas = st.number_input("Duração da Chuva (Horas)", min_value=0.5, max_value=48.0, value=2.0, step=0.5)
-    with col_input3:
-        bomba_status = st.selectbox("Status da Automação da Bomba", ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"])
-
-    intensidade_mm_h = chuva_mm / chuva_horas
-    taxa_entrada_cm_h = intensidade_mm_h * factor_mm_cm
-    intensidade_saturacao_mm_h = r_pump_param / factor_mm_cm
-
-    intensidade_saturacao_mm_h = r_pump_total_param / factor_mm_cm
-
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("Intensidade da Chuva", f"{intensidade_mm_h:.1f} mm/h")
-    col_m2.metric("Entrada Equivalente no Poço", f"{taxa_entrada_cm_h:.1f} cm/h")
-    col_m3.metric(
-        "Capacidade Instalada",
-        f"{r_pump_total_param:.1f} cm/h",
-        help=f"1ª Bomba: {r_pump_param:.1f} cm/h" + (f" | 2ª Bomba: {r_pump_param:.1f} cm/h (Total {vazao_total_m3h:.1f} m³/h)" if tem_bomba2 else "")
-    )
-    col_m4.metric("Limite de Saturação da Bomba", f"{intensidade_saturacao_mm_h:.1f} mm/h")
-
-    st.markdown("---")
-
-    sim_time_steps = np.linspace(0, max(chuva_horas * 1.5, 6.0), 360)
-    dt_h = sim_time_steps[1] - sim_time_steps[0]
-
-    levels = []
-    curr_d = d_off
-    p1_state = False
-    p2_state = False
-    overflow_occurred = False
-    overflow_time = None
-
-    for t in sim_time_steps:
-        if t <= chuva_horas:
-            r_in = taxa_entrada_cm_h
-        else:
-            r_in = 0.0
-
-        if bomba_status == "Falha / Sem Energia (Desligada)":
-            curr_d -= r_in * dt_h
-        else:
-            if not p1_state and curr_d <= d_on:
-                p1_state = True
-            elif p1_state and curr_d >= d_off:
-                p1_state = False
-
-            if tem_bomba2:
-                if not p2_state and curr_d <= d_on2:
-                    p2_state = True
-                elif p2_state and curr_d >= d_off2:
-                    p2_state = False
-            else:
-                p2_state = False
-
-            r_active = (int(p1_state) + int(p2_state)) * r_pump_param
-            curr_d += (r_active - r_in) * dt_h
-
-        levels.append(curr_d)
-        if not overflow_occurred and curr_d <= d_overflow:
-            overflow_occurred = True
-            overflow_time = t
-
-    fig_sim = go.Figure()
-    fig_sim.add_trace(go.Scatter(x=sim_time_steps, y=levels, mode="lines", name="Nível no poço (cm)", line=dict(color="#1f77b4", width=2.5)))
-    fig_sim.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bóia 1 LIGA", annotation_position="top right")
-    fig_sim.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
-    if tem_bomba2:
-        fig_sim.add_hline(y=d_on2, line_dash="dash", line_color="orange", annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
-        fig_sim.add_hline(y=d_off2, line_dash="dash", line_color="teal", annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
-    fig_sim.update_layout(
-        title=f"Simulação Dinâmica para Chuva de {chuva_mm}mm em {chuva_horas}h ({intensidade_mm_h:.1f} mm/h)",
-        xaxis_title="Tempo Decorrido (Horas)",
-        yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
-        height=450,
-    )
-    st.plotly_chart(fig_sim, width="stretch")
-
-    st.subheader("📢 Análise de Capacidade e Risco")
-    if intensidade_mm_h > intensidade_saturacao_mm_h and bomba_status == "Operacional (Ligada)":
-        st.warning(
-            f"⚠️ **SATURAÇÃO DA BOMBA DETECTADA:** A intensidade da chuva ({intensidade_mm_h:.1f} mm/h) supera a capacidade máxima de esvaziamento da bomba ({intensidade_saturacao_mm_h:.1f} mm/h). Mesmo com a bomba ligada 100% do tempo, o poço acumulará água."
-        )
-    elif bomba_status == "Operacional (Ligada)":
-        st.success(
-            f"✅ **BOMBA DÁ CONTA DA CHUVA:** A intensidade ({intensidade_mm_h:.1f} mm/h) é inferior ao limite de saturação ({intensidade_saturacao_mm_h:.1f} mm/h). A bomba conseguirá ciclar e esvaziar o poço."
-        )
-
-    if overflow_occurred and overflow_time is not None:
-        st.error(
-            f"🚨 **ALERTA DE TRANSBORDAMENTO:** O poço atingirá a borda superior "
-            f"(sensor = −{dist_borda_cm:.0f} cm, água {dist_borda_cm:.0f} cm acima do sensor) "
-            f"em **{overflow_time*60:.0f} minutos** ({overflow_time:.2f} horas) após o início da chuva!"
-        )
-    else:
-        st.info("ℹ️ Nenhum transbordamento previsto para este cenário específico.")
-
-    st.markdown("---")
-    st.subheader("⏮️ Simulação e Emulação de Eventos Históricos")
-    st.caption(
-        "Selecione qualquer data do passado para carregar os dados pluviométricos e "
-        "simular a reação exata do poço e do sistema de bombeamento durante o evento. "
-        "Você pode escolher entre medições reais da estação Ponte Adolfo Konder ou modelos ERA5."
-    )
-
-    fonte_dados = st.radio(
-        "Selecione a Fonte de Dados para Simulação:",
-        options=[
-            "🌧️ Estação Real: Ponte Adolfo Konder (Medições Pluviométricas Reais - Blumenau)",
-            "📡 Modelo ERA5 Corregido (Open-Meteo Archive × Fator de Correção)",
-            "📡 Modelo ERA5 Bruto (Open-Meteo Archive sem Fator)",
-        ],
-        index=0,
-        horizontal=True,
-    )
-
-    col_h1, col_h2, col_h3, col_h4 = st.columns(4)
-    with col_h1:
-        data_evento = st.date_input(
-            "Data de Início do Evento",
-            value=_dt.date(2025, 2, 12),
-            min_value=_dt.date(2015, 1, 1),
-            max_value=_dt.date.today(),
-            help="Selecione a data inicial para reconstrução do evento histórico."
-        )
-    with col_h2:
-        duracao_evento_h = st.selectbox(
-            "Janela de Simulação (Horas)",
-            options=[24, 48, 72, 96],
-            index=1,
-            help="Período contínuo a ser simulado a partir da data de início."
-        )
-    with col_h3:
-        nivel_inicial_sim = st.number_input(
-            "Nível Inicial (cm do sensor)",
-            value=d_off,
-            step=1.0,
-            help="Distância do sensor à água no início do evento (ex: d_off = poço esvaziado)."
-        )
-    with col_h4:
-        status_bomba_hist = st.selectbox(
-            "Automação do Sistema",
-            ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"],
-            key="status_bomba_hist"
-        )
-
-    start_hist_str = data_evento.strftime("%Y-%m-%d")
-    end_hist_dt = data_evento + _dt.timedelta(hours=duracao_evento_h)
-    end_hist_str = end_hist_dt.strftime("%Y-%m-%d")
-
-    df_ev = pd.DataFrame()
-    lbl_fonte = ""
-    usando_konder_real = False
-
-    start_ts_ev = pd.Timestamp(data_evento, tz="America/Sao_Paulo")
-    end_ts_ev = start_ts_ev + pd.Timedelta(hours=duracao_evento_h)
-
-    if "Ponte Adolfo Konder" in fonte_dados:
-        df_konder = load_adolfo_konder_dataset()
-        if not df_konder.empty:
-            sub_k = df_konder[(df_konder.index >= start_ts_ev) & (df_konder.index <= end_ts_ev)].copy()
-            if not sub_k.empty:
-                df_ev = sub_k
-                lbl_fonte = "Estação Real Ponte Adolfo Konder (Blumenau)"
-                usando_konder_real = True
-                st.info(f"✅ **Usando dados reais de pluviômetro da Estação Ponte Adolfo Konder:** {len(sub_k)} leituras de 15 minutos registradas no período.")
-            else:
-                st.warning(
-                    f"⚠️ A data **{start_hist_str}** está fora da cobertura da Estação Adolfo Konder "
-                    f"({df_konder.index.min().strftime('%d/%m/%Y')} a {df_konder.index.max().strftime('%d/%m/%Y')}). "
-                    f"Alternando automaticamente para o Modelo ERA5 Corrigido."
-                )
-
-    if df_ev.empty:
-        with st.spinner(f"Buscando chuva histórica ERA5 para {start_hist_str} a {end_hist_str}…"):
-            hist_ev_df, hist_err = fetch_historical_5years_precip(
-                latitude, longitude, start_date_str=start_hist_str, end_date_str=end_hist_str
-            )
-
-        if hist_ev_df.empty:
-            st.warning(f"Não foi possível obter dados para este período. Erro: {hist_err}")
-        else:
-            df_ev = hist_ev_df[(hist_ev_df.index >= start_ts_ev) & (hist_ev_df.index <= end_ts_ev)].copy()
-            if "Corregido" in fonte_dados or "Ponte Adolfo Konder" in fonte_dados:
-                if era5_correction != 1.0:
-                    df_ev["precipitation"] = df_ev["precipitation"] * era5_correction
-                lbl_fonte = f"Modelo ERA5 (Open-Meteo ×{era5_correction:.2f})"
-            else:
-                lbl_fonte = "Modelo ERA5 Bruto (Open-Meteo sem correção)"
-
-    if not df_ev.empty:
-        sim_dt_min = 5.0
-        n_steps_ev = int((duracao_evento_h * 60) / sim_dt_min)
-        sim_times_ev = [start_ts_ev + pd.Timedelta(minutes=i * sim_dt_min) for i in range(n_steps_ev + 1)]
-
-        sim_levels_ev = []
-        sim_pump_active_ev = []
-        sim_rain_rate_ev = []
-
-        curr_d_ev = nivel_inicial_sim
-        p1_ev = curr_d_ev <= d_on
-        p2_ev = tem_bomba2 and (curr_d_ev <= d_on2)
-
-        ovf_ev = False
-        ovf_ev_time = None
-
-        dt_h_ev = sim_dt_min / 60.0
-
-        for i, t_step in enumerate(sim_times_ev):
-            candidates = df_ev.index[df_ev.index <= t_step]
-            if len(candidates) > 0:
-                if usando_konder_real and "precip_mmh" in df_ev.columns:
-                    precip_ev_mmh = float(df_ev.loc[candidates[-1], "precip_mmh"])
-                else:
-                    precip_ev_mmh = float(df_ev.loc[candidates[-1], "precipitation"])
-            else:
-                precip_ev_mmh = 0.0
-
-            r_chuva_cm_h = precip_ev_mmh * factor_mm_cm
-            r_total_in = r_gnd_param + r_chuva_cm_h
-
-            sim_levels_ev.append(curr_d_ev)
-            sim_pump_active_ev.append(int(p1_ev) + int(p2_ev))
-            sim_rain_rate_ev.append(r_chuva_cm_h)
-
-            if not ovf_ev and curr_d_ev <= d_overflow:
-                ovf_ev = True
-                ovf_ev_time = t_step
-
-            if status_bomba_hist == "Falha / Sem Energia (Desligada)":
-                curr_d_ev -= r_total_in * dt_h_ev
-            else:
-                if not p1_ev and curr_d_ev <= d_on:
-                    p1_ev = True
-                elif p1_ev and curr_d_ev >= d_off:
-                    p1_ev = False
-
-                if tem_bomba2:
-                    if not p2_ev and curr_d_ev <= d_on2:
-                        p2_ev = True
-                    elif p2_ev and curr_d_ev >= d_off2:
-                        p2_ev = False
-                else:
-                    p2_ev = False
-
-                r_active_ev = (int(p1_ev) + int(p2_ev)) * r_pump_param
-                curr_d_ev += (r_active_ev - r_total_in) * dt_h_ev
-
-        if usando_konder_real and "precip_15min" in df_ev.columns:
-            precip_total_ev = df_ev["precip_15min"].sum()
-            pico_mmh_ev = df_ev["precip_mmh"].max()
-            pico_15m_val = df_ev["precip_15min"].max()
-        else:
-            precip_total_ev = df_ev["precipitation"].sum()
-            pico_mmh_ev = df_ev["precipitation"].max()
-            pico_15m_val = None
-
-        min_dist_ev = min(sim_levels_ev)
-        dist_ao_sensor_ev = abs(min_dist_ev - dist_borda_cm)
-
-        st.markdown("---")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Precipitação Acumulada", f"{precip_total_ev:.1f} mm", help=f"Fonte: {lbl_fonte}")
-        m2.metric(
-            "Pico de Chuva (Taxa Horária)",
-            f"{pico_mmh_ev:.1f} mm/h",
-            help=f"Maior impulso de chuva. " + (f"Pico de 15min: {pico_15m_val:.1f} mm." if pico_15m_val else "") + f" Entrada no poço: {pico_mmh_ev * factor_mm_cm:.1f} cm/h"
-        )
-        m3.metric("Nível Mais Alto Atingido", f"{min_dist_ev:.1f} cm do topo", help="0 cm = Topo do Poço (Borda Superior)")
-        if ovf_ev:
-            m4.metric("Status do Evento", "❌ TRANSBORDO", delta="Borda Superada!", delta_color="inverse")
-        else:
-            m4.metric("Status do Evento", "✅ SEM TRANSBORDO", delta=f"Folga ao topo: {min_dist_ev:.1f} cm")
-
-        fig_hist = go.Figure()
-
-        if usando_konder_real and "precip_15min" in df_ev.columns:
-            fig_hist.add_trace(
                 go.Bar(
-                    x=df_ev.index,
-                    y=df_ev["precip_15min"] * 4.0,
-                    name="Chuva Inst. (Ponte Adolfo Konder - mm/h eq.)",
-                    marker_color="rgba(46, 204, 113, 0.4)",
-                    yaxis="y2",
-                )
-            )
-        else:
-            fig_hist.add_trace(
-                go.Bar(
-                    x=df_ev.index,
-                    y=df_ev["precipitation"],
-                    name=f"Chuva ({lbl_fonte})",
+                    x=filled_df["dt_round"],
+                    y=precip_mmh,
+                    name="Chuva (mm/h)",
                     marker_color="rgba(30, 144, 255, 0.35)",
                     yaxis="y2",
                 )
             )
-
-        fig_hist.add_trace(
+    
+        fig.add_trace(
             go.Scatter(
-                x=sim_times_ev,
-                y=sim_levels_ev,
-                mode="lines",
-                name="Nível Simulado do Poço",
-                line=dict(color="#1f77b4", width=2.5),
+                x=filled_df["dt_round"],
+                y=filled_df["nivel_cm"],
+                mode="markers",
+                name="Dados Reais (Sensor)",
+                marker=dict(size=4, color="#1f77b4"),
             )
         )
-
-        fig_hist.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bóia 1 LIGA", annotation_position="top right")
-        fig_hist.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
+        fig.add_trace(
+            go.Scatter(
+                x=filled_df["dt_round"],
+                y=filled_df["nivel_imputed"],
+                mode="lines",
+                name="Modelo Estimado (Sem Gaps)",
+                line=dict(color="#ff7f0e", width=1.5),
+            )
+        )
+    
+        if trend and trend["rate_cmh"] > 0:
+            t_latest = trend["latest_time"]
+            t_sensor_dt = t_latest + pd.Timedelta(hours=trend["time_sensor_h"])
+            t_overflow_dt = t_latest + pd.Timedelta(hours=trend["time_overflow_h"])
+    
+            # Projeção Linear Base (Sem Chuva)
+            fig.add_trace(
+                go.Scatter(
+                    x=[t_latest, t_sensor_dt, t_overflow_dt],
+                    y=[trend["curr_d"], 0, d_overflow],
+                    mode="lines+markers",
+                    name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
+                    line=dict(color="#777777", width=2, dash="dash"),
+                    marker=dict(size=5, symbol="circle"),
+                )
+            )
+    
+            # Projeção Corrigida com Previsão ERA5 (Com Chuva Futura)
+            if trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=trend["era5_sim_df"]["dt_round"],
+                        y=trend["era5_sim_df"]["nivel_imputed"],
+                        mode="lines",
+                        name="Projeção Corrigida (ERA5 + Chuva)",
+                        line=dict(color="#d9534f", width=2.5, dash="dot"),
+                    )
+                )
+        b1_on_label = "Bomba 1 Liga (Água Alta)" if tem_bomba2 else "Bomba Liga (Água Alta)"
+        b1_off_label = "Bomba 1 Desliga (Água Baixa)" if tem_bomba2 else "Bomba Desliga (Água Baixa)"
+        fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label)
+        fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label)
         if tem_bomba2:
-            fig_hist.add_hline(y=d_on2, line_dash="dash", line_color="orange", annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
-            fig_hist.add_hline(y=d_off2, line_dash="dash", line_color="teal", annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
-
-        fig_hist.add_hline(y=d_overflow, line_dash="dot", line_color="darkred", annotation_text="Topo do Poço / Borda Superior (0 cm)", annotation_position="top right")
-        fig_hist.add_hrect(y0=0, y1=d_overflow, fillcolor="rgba(231,76,60,0.10)", line_width=0)
-
-        fig_hist.update_layout(
-            title=f"Reconstrução do Evento ({lbl_fonte}): {start_hist_str} ({duracao_evento_h}h) | Chuva Total: {precip_total_ev:.1f} mm | Pico: {pico_mmh_ev:.1f} mm/h",
-            xaxis=dict(title="Data / Hora"),
-            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
+            fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
+            fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
+        fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)")
+        fig.update_layout(
+            yaxis=dict(
+                autorange="reversed",
+                title="Nível da Água (cm abaixo do topo do poço)",
+            ),
             yaxis2=dict(
-                title="Intensidade de Chuva (mm/h)",
-                overlaying="y", side="right", showgrid=False, rangemode="tozero",
+                title="Precipitação (mm/h)",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                rangemode="tozero",
+                tickfont=dict(color="rgba(30, 144, 255, 0.8)"),
+                title_font=dict(color="rgba(30, 144, 255, 0.8)"),
+            ),
+            xaxis=dict(title="Data / Hora"),
+            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+            height=520,
+            margin=dict(l=20, r=60, t=30, b=40),
+            bargap=0,
+        )
+        st.plotly_chart(fig, width="stretch")
+    
+        if not has_rain_data:
+            st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
+    
+        st.subheader("Últimos Registros")
+        df_export = filled_df.copy()
+        num_cols = df_export.select_dtypes(include="number").columns
+        df_export[num_cols] = df_export[num_cols].round(2)
+        st.dataframe(df_export)
+        st.download_button(
+            label="📥 Baixar Registros em CSV",
+            data=df_export.to_csv(index=False, float_format="%.2f").encode("utf-8"),
+            file_name="registros_poco.csv",
+            mime="text/csv",
+        )
+    
+        if trend and trend["rate_cmh"] > 0:
+            t_b1_str = format_hours_status(trend["time_bomba1_h"], trend["curr_d"], d_on)
+            t_b1_era5_str = format_hours_status(trend["time_bomba1_era5_h"], trend["curr_d"], d_on)
+    
+            t_b2_str = format_hours_status(trend["time_bomba2_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
+            t_b2_era5_str = format_hours_status(trend["time_bomba2_era5_h"], trend["curr_d"], d_on2) if tem_bomba2 else "N/A"
+    
+            t_sens_str = format_hours_status(trend["time_sensor_h"], trend["curr_d"], 0.0)
+            t_sens_era5_str = format_hours_status(trend["time_sensor_era5_h"], trend["curr_d"], 0.0)
+    
+            t_ovf_str = format_hours_status(trend["time_overflow_h"], trend["curr_d"], d_overflow)
+            t_ovf_era5_str = format_hours_status(trend["time_overflow_era5_h"], trend["curr_d"], d_overflow)
+    
+            t_start_fmt = trend["start_time"].strftime("%d/%m/%Y às %H:%M")
+            t_dur_fmt = format_hours(trend["duration_h"])
+    
+            st.markdown("---")
+            with st.container(border=True):
+                st.subheader("🧪 Estimativa de Subida Real (Tendência Recente de 20 Leituras + ERA5)")
+    
+                rain_msg = (
+                    f" 🌦️ **Chuva Futura ERA5:** +{trend['total_rain_era5']:.1f} mm previstos no período."
+                    if trend["has_future_rain"]
+                    else " ☀️ **Sem chuva futura prevista.**"
+                )
+                st.markdown(
+                    f"Análise da velocidade atual baseada nas **últimas {trend['num_points']} leituras** ({t_dur_fmt} | desde **{t_start_fmt}**). "
+                    f"Variação na janela: **{trend['start_d']:.1f} cm** → **{trend['curr_d']:.1f} cm** |{rain_msg}"
+                )
+    
+                num_cols = 5 if tem_bomba2 else 4
+                cols = st.columns(num_cols)
+    
+                cols[0].metric(
+                    label="📈 Taxa Recente (Últimas 20)",
+                    value=f"{trend['rate_cmh']:.2f} cm/h",
+                )
+    
+                cols[1].metric(
+                    label=f"🚨 Ligar Bomba 1 ({d_on:.1f} cm)",
+                    value=t_b1_era5_str,
+                    delta=f"Base: {t_b1_str}" if t_b1_era5_str != t_b1_str else None,
+                    delta_color="off",
+                )
+    
+                curr_idx = 2
+                if tem_bomba2:
+                    cols[curr_idx].metric(
+                        label=f"⚡ Ligar Bomba 2 ({d_on2:.1f} cm)",
+                        value=t_b2_era5_str,
+                        delta=f"Base: {t_b2_str}" if t_b2_era5_str != t_b2_str else None,
+                        delta_color="off",
+                    )
+                    curr_idx += 1
+    
+                cols[curr_idx].metric(
+                    label="🎯 Atingir Sensor (0 cm)",
+                    value=t_sens_era5_str,
+                    delta=f"Base: {t_sens_str}" if t_sens_era5_str != t_sens_str else None,
+                    delta_color="off",
+                )
+                curr_idx += 1
+    
+                cols[curr_idx].metric(
+                    label=f"🌊 Transbordar ({d_overflow:.0f} cm)",
+                    value=t_ovf_era5_str,
+                    delta=f"Base: {t_ovf_str}" if t_ovf_era5_str != t_ovf_str else None,
+                    delta_color="inverse",
+                )
+    
+        rate_stats = compute_rate_statistics(filled_df)
+        if rate_stats:
+            with st.container(border=True):
+                st.subheader("📊 Análise Histórica das Taxas Operacionais (Enchimento vs. Esvaziamento)")
+                st.caption(
+                    "Estatísticas calculadas a partir de todas as taxas válidas registradas na série temporal. "
+                    "Separado em **Enchimento** (subida do nível com bomba desligada) e **Esvaziamento** (descida do nível com bombeamento ativo)."
+                )
+    
+                c_ench, c_esv = st.columns(2)
+    
+                with c_ench:
+                    st.markdown("#### 🟢 Regime de Enchimento (Subida de Nível)")
+                    st.caption(f"Amostras: **{rate_stats['ench_count']}** períodos de subida")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Taxa Mediana", f"{rate_stats['ench_media']:.2f} cm/h")
+                    m2.metric("Pico (Máximo)", f"{rate_stats['ench_pico']:.2f} cm/h")
+                    m3.metric("Taxa Mínima", f"{rate_stats['ench_min']:.2f} cm/h")
+    
+                with c_esv:
+                    st.markdown("#### 🔵 Regime de Esvaziamento (Descida por Bombeamento)")
+                    st.caption(f"Amostras: **{rate_stats['esv_count']}** períodos de descida")
+                    m4, m5, m6 = st.columns(3)
+                    m4.metric("Taxa Mediana", f"{rate_stats['esv_media']:.2f} cm/h")
+                    m5.metric("Pico (Máximo)", f"{rate_stats['esv_pico']:.2f} cm/h")
+                    m6.metric("Taxa Mínima", f"{rate_stats['esv_min']:.2f} cm/h")
+    
+        fig_ext, r_max_w, r_min_w, r_pk_rise, r_pk_drop = plot_historical_extremes_chart(filled_df)
+        if fig_ext:
+            with st.container(border=True):
+                st.subheader("📅 Ocorrência Temporal das Máximas e Mínimas Históricas")
+                st.caption(
+                    "Gráfico interativo destacando os exatos momentos da série temporal em que o poço atingiu "
+                    "o seu nível máximo de água, nível mínimo, maior taxa de subida (enchimento) e maior taxa de descida (bombeamento)."
+                )
+                st.plotly_chart(fig_ext, width="stretch")
+    
+                ext_cols = st.columns(4)
+                if r_max_w is not None:
+                    d1 = r_max_w["nivel_imputed"] if "nivel_imputed" in r_max_w else r_max_w["nivel_cm"]
+                    t1 = r_max_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+                    ext_cols[0].metric(
+                        label="🔴 Água Mais Alta (Nível Máx)",
+                        value=f"{d1:.1f} cm",
+                        delta=f"Ocorrido em: {t1}",
+                        delta_color="off",
+                    )
+    
+                if r_min_w is not None:
+                    d2 = r_min_w["nivel_imputed"] if "nivel_imputed" in r_min_w else r_min_w["nivel_cm"]
+                    t2 = r_min_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+                    ext_cols[1].metric(
+                        label="🔵 Água Mais Baixa (Nível Mín)",
+                        value=f"{d2:.1f} cm",
+                        delta=f"Ocorrido em: {t2}",
+                        delta_color="off",
+                    )
+    
+                if r_pk_rise is not None:
+                    r3 = r_pk_rise["rate_cmh"]
+                    t3 = r_pk_rise["t_start"].strftime("%d/%m/%Y às %H:%M")
+                    ext_cols[2].metric(
+                        label="⚡ Pico de Subida (Enchimento)",
+                        value=f"+{r3:.2f} cm/h",
+                        delta=f"Ocorrido em: {t3}",
+                        delta_color="off",
+                    )
+    
+                if r_pk_drop is not None:
+                    r4 = r_pk_drop["rate_cmh"]
+                    t4 = r_pk_drop["t_start"].strftime("%d/%m/%Y às %H:%M")
+                    ext_cols[3].metric(
+                        label="🌊 Pico de Descida (Esvaziamento)",
+                        value=f"-{r4:.2f} cm/h",
+                        delta=f"Ocorrido em: {t4}",
+                        delta_color="off",
+                    )
+    
+        fig_h_ench, fig_h_esv = plot_rate_histograms(filled_df)
+        if fig_h_ench or fig_h_esv:
+            with st.container(border=True):
+                st.subheader("📊 Frequência e Distribuição das Taxas (Histogramas Operacionais)")
+                st.caption(
+                    "Histogramas de frequência das velocidades operacionais (cm/h). "
+                    "Permite identificar a concentração das taxas típicas de subida da água e a capacidade de rebaixamento das bombas."
+                )
+                h_col1, h_col2 = st.columns(2)
+                with h_col1:
+                    if fig_h_ench:
+                        st.plotly_chart(fig_h_ench, width="stretch")
+                    else:
+                        st.info("Sem dados suficientes de subida para gerar o histograma.")
+    
+                with h_col2:
+                    if fig_h_esv:
+                        st.plotly_chart(fig_h_esv, width="stretch")
+                    else:
+                        st.info("Sem dados suficientes de esvaziamento para gerar o histograma.")
+    
+with tab2:
+    if tab2.open:
+        st.header("Formulação do Modelo Matemático")
+        st.markdown("O comportamento hidrodinâmico do poço de drenagem é regido pela **Equação de Balanço de Massa / Continuidade**:")
+        st.latex(r"\frac{dV}{dt} = A \cdot \frac{dh}{dt} = Q_{\text{entrada}}(t) - Q_{\text{saída}}(t)")
+        st.markdown(r"Como o sensor mede a distância $d(t)$ no topo em relação à lâmina d'água ($h(t) = H_{\text{sensor}} - d(t)$), temos $\frac{dh}{dt} = -\frac{dd}{dt}$." )
+        st.markdown("Portanto, a taxa instantânea de variação da distância $d(t)$ é dada por:")
+        st.latex(r"\frac{dd(t)}{dt} = \frac{Q_{\text{saída}}(t) - Q_{\text{entrada}}(t)}{A}")
+        st.subheader("Regimes Operacionais Recalibrados")
+        st.markdown("**1️⃣ Entrada Lenta (Lençol Freático – Estado $S_0$)**")
+        st.markdown("- $Q_{\text{saída}} = 0$ (Bomba desligada)")
+        st.latex(r"\frac{dd}{dt} = -r_{\text{freático}} \approx -1.44\text{ cm/h}")
+        st.markdown("**2️⃣ Entrada por Chuva ($S_1$)**")
+        st.markdown("- Relacionada com a precipitação em mm pela taxa de amplificação do pátio:")
+        st.latex(r"\text{Taxa de Entrada (cm/h)} = \frac{\text{Chuva (mm)}}{\text{Horas}} \times 2.83")
+        st.markdown("**3️⃣ Esvaziamento Forçado (Bomba Ativa – Estado $S_2$)**")
+        st.latex(r"Q_{\text{saída}} = 14.000\text{ L/h} (14\text{ m}^3/h) \Rightarrow r_{\text{bomba}} \approx 76.6\text{ cm/h}")
+    
+        st.markdown("---")
+        st.subheader("📐 Estimativa e Calibração do Fator de Conversão (m³/h para cm/h)")
+        st.markdown(
+            """
+            ### 1. Relação Teórica da Geometria do Poço
+            Para um poço cilíndrico ideal de diâmetro interno $D = 1,20\text{ m}$, a área da seção transversal ($A$) é dada por:
+            """
+        )
+        st.latex(r"A = \pi \cdot \left(\frac{D}{2}\right)^2 = \pi \cdot (0,60)^2 \approx 1,131\text{ m}^2")
+        st.markdown(
+            """
+            Teoricamente, a conversão entre uma vazão volumétrica $Q\text{ (m}^3/\text{h)}$ e a variação da coluna d'água no poço $r\text{ (cm/h)}$ seria:
+            """
+        )
+        st.latex(r"F_{\text{teórico}} = \frac{100\text{ cm/m}}{A\text{ m}^2} = \frac{100}{1,131} \approx 88,42\text{ (cm/h por m}^3/\text{h)}")
+    
+        st.markdown(
+            """
+            ### 2. O Efeito Real das Galerias Conectadas (*Pipe Storage* & Remanso)
+            Na instalação real, o poço não opera de forma isolada. Ele está conectado a tubulações e galerias de drenagem dispostas com inclinação suave.
+            Quando a bomba desliga ou a chuva entra, ocorre o **efeito de remanso**: a água preenche também o volume contido na rede de tubulações acopladas a montante.
+            
+            Isso expande a **área equivalente de armazenamento** ($A_{\text{efetiva}}$):
+            """
+        )
+        st.latex(r"A_{\text{efetiva}} = \frac{100}{F_{\text{calibrado}}} = \frac{100}{5,471} \approx 18,28\text{ m}^2")
+        st.markdown(
+            """
+            Ou seja, o reservatório físico se comporta hidrostaticamente como se tivesse uma área de superfície de **18,28 m²** (amortecimento muito maior que o poço isolado de 1,20 m).
+            """
+        )
+    
+        st.markdown(
+            """
+            ### 3. Estimativa Prática pelos Dados do Sensor Ultrassônico
+            O modelo estima e valida empiricamente o fator de conversão $F$ analisando os ciclos de acionamento da bomba capturados pelo sensor ultrassônico durante períodos sem chuva (quando apenas o lençol freático está ativo):
+    
+            1. **Fase de Esvaziamento (Bomba LIGADA):** O sensor mede a velocidade líquida de rebaixamento da água $(\\frac{dd}{dt})_{\\text{desce}} \\approx -75,16\\text{ cm/h}$.
+            2. **Fase de Enchimento (Bomba DESLIGADA):** O sensor mede a velocidade de subida por afluxo do lençol freático $(\\frac{dd}{dt})_{\\text{subida}} \\approx +1,44\\text{ cm/h}$.
+            3. **Vazão Bruta da Bomba ($r_{\\text{bomba}}$):** A soma em módulo das duas velocidades elimina a interferência do lençol freático e fornece a velocidade bruta da bomba registrada no sensor:
+            """
+        )
+        st.latex(r"r_{\text{bomba}} = \left|\left(\frac{dd}{dt}\right)_{\text{desce}}\right| + \left(\frac{dd}{dt}\right)_{\text{subida}} = 75,16 + 1,44 = 76,6\text{ cm/h}")
+        st.markdown(
+            """
+            4. **Cálculo do Fator Calibrado ($F$):** Dividindo essa taxa de variação observada pelo sensor em $\\text{cm/h}$ pela vazão nominal hidráulica da bomba $Q_{\\text{bomba}} = 14,0\\text{ m}^3/\\text{h}$:
+            """
+        )
+        st.latex(r"F_{\text{calibrado}} = \frac{r_{\text{bomba}}\text{ (cm/h)}}{Q_{\text{bomba}}\text{ (m}^3/\text{h)}} = \frac{76,6\text{ cm/h}}{14,0\text{ m}^3/\text{h}} = 5,471\text{ (cm/h por m}^3/\text{h)}")
+    
+        st.markdown("---")
+        st.subheader("📈 Comparativo no Momento LIGA → DESLIGA: Esvaziamento Teórico vs. 5+ Séries Reais (Sensor)")
+        st.caption("Alinhamento do instante exato de atracamento da bomba (quando a água atinge d_on, t = 0 min) para comparar a rampa de esvaziamento teórica com múltiplos eventos reais gravados pelo sensor ultrassônico.")
+    
+        # 1. Rampa Teórica de Esvaziamento (Bomba Ligada)
+        r_liq_teorico = 76.6 - r_gnd_param
+        t_teorico_min = (d_off - d_on) / r_liq_teorico * 60.0
+        t_teor_arr = np.linspace(0, max(t_teorico_min * 1.4, 35.0), 100)
+        d_teor_arr = [min(d_on + (r_liq_teorico / 60.0) * t, d_off) for t in t_teor_arr]
+    
+        fig_comp = go.Figure()
+        fig_comp.add_trace(go.Scatter(
+            x=t_teor_arr, y=d_teor_arr, mode="lines",
+            name=f"Esvaziamento Teórico (-{r_liq_teorico:.1f} cm/h)",
+            line=dict(color="#1f77b4", width=3.5)
+        ))
+    
+        # 2. Localizar e alinhar o início EXATO das rampas de esvaziamento (t = 0 onde d atinge d_on e começa a subir)
+        real_cycles = []
+        palette_cycles = ["#e67e22", "#2ecc71", "#9b59b6", "#e74c3c", "#f1c40f", "#1abc9c", "#e84393", "#00cec9"]
+    
+        if "filled_df" in locals() or "filled_df" in globals():
+            try:
+                if not filled_df.empty:
+                    s_lev = filled_df["nivel_cm"].fillna(filled_df["nivel_imputed"])
+                    df_w = filled_df.copy()
+                    df_w["val"] = s_lev
+    
+                    # Identificar pontos onde o nível está alto (val <= d_on + 6.0) E a distância aumenta no curto prazo
+                    diff_15m = df_w["val"].shift(-3) - df_w["val"]
+                    triggers = df_w[(df_w["val"] <= (d_on + 6.0)) & (diff_15m >= 2.0)].index
+    
+                    if len(triggers) == 0:
+                        diff_5m = df_w["val"].shift(-1) - df_w["val"]
+                        triggers = df_w[(df_w["val"] <= (d_on + 10.0)) & (diff_5m >= 1.0)].index
+    
+                    for idx in reversed(triggers):
+                        loc_val = df_w.index.get_loc(idx)
+                        loc = int(loc_val.start if isinstance(loc_val, slice) else (loc_val[0] if isinstance(loc_val, np.ndarray) else loc_val))
+                        t_curr = df_w["dt_round"].iloc[loc]
+    
+                        # Evitar duplicatas no mesmo ciclo (separação mínima de 20 min)
+                        if any(abs((t_curr - c["start_dt"]).total_seconds()) < 1200 for c in real_cycles):
+                            continue
+    
+                        # Extrair até 24 pontos (2 horas) a partir do início da rampa de desbarrancamento
+                        sub = df_w.iloc[loc:min(loc+24, len(df_w))]
+                        if len(sub) < 2:
+                            continue
+    
+                        # Truncar no pico de esvaziamento (quando atinge d_off / distância máxima)
+                        max_dist_loc = sub["val"].idxmax()
+                        end_loc_val = sub.index.get_loc(max_dist_loc)
+                        end_loc = int(end_loc_val.start if isinstance(end_loc_val, slice) else (end_loc_val[0] if isinstance(end_loc_val, np.ndarray) else end_loc_val))
+                        sub_cut = sub.iloc[0:end_loc+1]
+    
+                        if len(sub_cut) >= 2 and (sub_cut["val"].iloc[-1] - sub_cut["val"].iloc[0]) >= 3.0:
+                            sub_copy = sub_cut.copy()
+                            t0_ev = sub_copy["dt_round"].iloc[0]
+                            sub_copy["t_min"] = (sub_copy["dt_round"] - t0_ev).dt.total_seconds() / 60.0
+                            dt_h_ev = (sub_copy["dt_round"].iloc[-1] - t0_ev).total_seconds() / 3600.0
+                            real_rate_cmh = (sub_copy["val"].iloc[-1] - sub_copy["val"].iloc[0]) / dt_h_ev if dt_h_ev > 0 else 0.0
+    
+                            real_cycles.append({
+                                "start_dt": t0_ev,
+                                "sub_df": sub_copy,
+                                "rate_cmh": real_rate_cmh,
+                                "duration_min": sub_copy["t_min"].iloc[-1],
+                            })
+                            if len(real_cycles) >= 6:
+                                break
+            except Exception:
+                pass
+    
+        if real_cycles:
+            for idx_c, c in enumerate(real_cycles, 1):
+                clr = palette_cycles[(idx_c - 1) % len(palette_cycles)]
+                t_label = c["start_dt"].strftime("%d/%m %H:%M")
+                fig_comp.add_trace(go.Scatter(
+                    x=c["sub_df"]["t_min"], y=c["sub_df"]["val"],
+                    mode="markers+lines",
+                    name=f"Ciclo Real {idx_c} ({t_label}) — {c['rate_cmh']:.1f} cm/h",
+                    line=dict(color=clr, width=2, dash="dot"),
+                    marker=dict(size=6, color=clr)
+                ))
+    
+            avg_real_rate = np.mean([c["rate_cmh"] for c in real_cycles])
+            avg_real_dur = np.mean([c["duration_min"] for c in real_cycles])
+    
+            mc1, mc2, mc3 = st.columns(3)
+            mc1.metric("Taxa Esvaziamento Teórica", f"{r_liq_teorico:.1f} cm/h", help="14 m³/h menos lençol freático")
+            mc2.metric(f"Média Real ({len(real_cycles)} Ciclos Medidos)", f"{avg_real_rate:.1f} cm/h", delta=f"{avg_real_rate - r_liq_teorico:+.1f} cm/h")
+            mc3.metric("Tempo Médio de Rebaixamento", f"{avg_real_dur:.0f} min (Real)", delta=f"Teórico: {t_teorico_min:.1f} min")
+    
+            with st.expander(f"📋 Ver Detalhes dos {len(real_cycles)} Ciclos Reais Medidos pelo Sensor"):
+                det_rows = []
+                for i, c in enumerate(real_cycles, 1):
+                    det_rows.append({
+                        "Ciclo #": i,
+                        "Data / Hora Ativação (t=0)": c["start_dt"].strftime("%d/%m/%Y %H:%M"),
+                        "Taxa Rebaixamento (cm/h)": f"{c['rate_cmh']:.1f} cm/h",
+                        "Tempo até Desligar (min)": f"{c['duration_min']:.0f} min",
+                        "Diferença vs. Teórico": f"{c['rate_cmh'] - r_liq_teorico:+.1f} cm/h",
+                    })
+                st.dataframe(pd.DataFrame(det_rows).set_index("Ciclo #"), width="stretch")
+    
+        fig_comp.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=f"Bóia LIGA ({d_on:.1f} cm)", annotation_position="top right")
+        fig_comp.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=f"Bóia DESLIGA ({d_off:.1f} cm)", annotation_position="top right")
+    
+        fig_comp.update_layout(
+            title="Rampa de Esvaziamento do Poço: Instante da Ativação da Bomba (t = 0 min, Múltiplos Eventos)",
+            xaxis_title="Tempo Decorrido desde a Ativação da Bomba (Minutos)",
+            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
+            height=480,
+            margin=dict(l=20, r=20, t=40, b=40)
+        )
+        st.plotly_chart(fig_comp, width="stretch")
+    
+        if not real_cycles:
+            st.info("ℹ️ Exibindo rampa teórica de esvaziamento. Conecte ao banco Turso DB para sobrepor dados em tempo real dos eventos de acionamento.")
+    
+with tab3:
+    if tab3.open:
+        st.subheader("🔮 Simulador de Eventos Pluviométricos e Saturação da Bomba")
+        st.write("Insira a estimativa de volume de chuva (mm) e a duração prevista (horas) para avaliar se a bomba suportará o volume ou se haverá transbordamento.")
+    
+        col_input1, col_input2, col_input3 = st.columns(3)
+        with col_input1:
+            chuva_mm = st.number_input("Precipitação Prevista (mm)", min_value=1.0, max_value=300.0, value=60.0, step=5.0)
+        with col_input2:
+            chuva_horas = st.number_input("Duração da Chuva (Horas)", min_value=0.5, max_value=48.0, value=2.0, step=0.5)
+        with col_input3:
+            bomba_status = st.selectbox("Status da Automação da Bomba", ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"])
+    
+        intensidade_mm_h = chuva_mm / chuva_horas
+        taxa_entrada_cm_h = intensidade_mm_h * factor_mm_cm
+        intensidade_saturacao_mm_h = r_pump_param / factor_mm_cm
+    
+        intensidade_saturacao_mm_h = r_pump_total_param / factor_mm_cm
+    
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Intensidade da Chuva", f"{intensidade_mm_h:.1f} mm/h")
+        col_m2.metric("Entrada Equivalente no Poço", f"{taxa_entrada_cm_h:.1f} cm/h")
+        col_m3.metric(
+            "Capacidade Instalada",
+            f"{r_pump_total_param:.1f} cm/h",
+            help=f"1ª Bomba: {r_pump_param:.1f} cm/h" + (f" | 2ª Bomba: {r_pump_param:.1f} cm/h (Total {vazao_total_m3h:.1f} m³/h)" if tem_bomba2 else "")
+        )
+        col_m4.metric("Limite de Saturação da Bomba", f"{intensidade_saturacao_mm_h:.1f} mm/h")
+    
+        st.markdown("---")
+    
+        sim_time_steps = np.linspace(0, max(chuva_horas * 1.5, 6.0), 360)
+        dt_h = sim_time_steps[1] - sim_time_steps[0]
+    
+        levels = []
+        curr_d = d_off
+        p1_state = False
+        p2_state = False
+        overflow_occurred = False
+        overflow_time = None
+    
+        for t in sim_time_steps:
+            if t <= chuva_horas:
+                r_in = taxa_entrada_cm_h
+            else:
+                r_in = 0.0
+    
+            if bomba_status == "Falha / Sem Energia (Desligada)":
+                curr_d -= r_in * dt_h
+            else:
+                if not p1_state and curr_d <= d_on:
+                    p1_state = True
+                elif p1_state and curr_d >= d_off:
+                    p1_state = False
+    
+                if tem_bomba2:
+                    if not p2_state and curr_d <= d_on2:
+                        p2_state = True
+                    elif p2_state and curr_d >= d_off2:
+                        p2_state = False
+                else:
+                    p2_state = False
+    
+                r_active = (int(p1_state) + int(p2_state)) * r_pump_param
+                curr_d += (r_active - r_in) * dt_h
+    
+            levels.append(curr_d)
+            if not overflow_occurred and curr_d <= d_overflow:
+                overflow_occurred = True
+                overflow_time = t
+    
+        fig_sim = go.Figure()
+        fig_sim.add_trace(go.Scatter(x=sim_time_steps, y=levels, mode="lines", name="Nível no poço (cm)", line=dict(color="#1f77b4", width=2.5)))
+        fig_sim.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bóia 1 LIGA", annotation_position="top right")
+        fig_sim.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
+        if tem_bomba2:
+            fig_sim.add_hline(y=d_on2, line_dash="dash", line_color="orange", annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
+            fig_sim.add_hline(y=d_off2, line_dash="dash", line_color="teal", annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
+        fig_sim.update_layout(
+            title=f"Simulação Dinâmica para Chuva de {chuva_mm}mm em {chuva_horas}h ({intensidade_mm_h:.1f} mm/h)",
+            xaxis_title="Tempo Decorrido (Horas)",
+            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
+            height=450,
+        )
+        st.plotly_chart(fig_sim, width="stretch")
+    
+        st.subheader("📢 Análise de Capacidade e Risco")
+        if intensidade_mm_h > intensidade_saturacao_mm_h and bomba_status == "Operacional (Ligada)":
+            st.warning(
+                f"⚠️ **SATURAÇÃO DA BOMBA DETECTADA:** A intensidade da chuva ({intensidade_mm_h:.1f} mm/h) supera a capacidade máxima de esvaziamento da bomba ({intensidade_saturacao_mm_h:.1f} mm/h). Mesmo com a bomba ligada 100% do tempo, o poço acumulará água."
+            )
+        elif bomba_status == "Operacional (Ligada)":
+            st.success(
+                f"✅ **BOMBA DÁ CONTA DA CHUVA:** A intensidade ({intensidade_mm_h:.1f} mm/h) é inferior ao limite de saturação ({intensidade_saturacao_mm_h:.1f} mm/h). A bomba conseguirá ciclar e esvaziar o poço."
+            )
+    
+        if overflow_occurred and overflow_time is not None:
+            st.error(
+                f"🚨 **ALERTA DE TRANSBORDAMENTO:** O poço atingirá a borda superior "
+                f"(sensor = −{dist_borda_cm:.0f} cm, água {dist_borda_cm:.0f} cm acima do sensor) "
+                f"em **{overflow_time*60:.0f} minutos** ({overflow_time:.2f} horas) após o início da chuva!"
+            )
+        else:
+            st.info("ℹ️ Nenhum transbordamento previsto para este cenário específico.")
+    
+        st.markdown("---")
+        st.subheader("⏮️ Simulação e Emulação de Eventos Históricos")
+        st.caption(
+            "Selecione qualquer data do passado para carregar os dados pluviométricos e "
+            "simular a reação exata do poço e do sistema de bombeamento durante o evento. "
+            "Você pode escolher entre medições reais da estação Ponte Adolfo Konder ou modelos ERA5."
+        )
+    
+        fonte_dados = st.radio(
+            "Selecione a Fonte de Dados para Simulação:",
+            options=[
+                "🌧️ Estação Real: Ponte Adolfo Konder (Medições Pluviométricas Reais - Blumenau)",
+                "📡 Modelo ERA5 Corregido (Open-Meteo Archive × Fator de Correção)",
+                "📡 Modelo ERA5 Bruto (Open-Meteo Archive sem Fator)",
+            ],
+            index=0,
+            horizontal=True,
+        )
+    
+        col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+        with col_h1:
+            data_evento = st.date_input(
+                "Data de Início do Evento",
+                value=_dt.date(2025, 2, 12),
+                min_value=_dt.date(2015, 1, 1),
+                max_value=_dt.date.today(),
+                help="Selecione a data inicial para reconstrução do evento histórico."
+            )
+        with col_h2:
+            duracao_evento_h = st.selectbox(
+                "Janela de Simulação (Horas)",
+                options=[24, 48, 72, 96],
+                index=1,
+                help="Período contínuo a ser simulado a partir da data de início."
+            )
+        with col_h3:
+            nivel_inicial_sim = st.number_input(
+                "Nível Inicial (cm do sensor)",
+                value=d_off,
+                step=1.0,
+                help="Distância do sensor à água no início do evento (ex: d_off = poço esvaziado)."
+            )
+        with col_h4:
+            status_bomba_hist = st.selectbox(
+                "Automação do Sistema",
+                ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"],
+                key="status_bomba_hist"
+            )
+    
+        start_hist_str = data_evento.strftime("%Y-%m-%d")
+        end_hist_dt = data_evento + _dt.timedelta(hours=duracao_evento_h)
+        end_hist_str = end_hist_dt.strftime("%Y-%m-%d")
+    
+        df_ev = pd.DataFrame()
+        lbl_fonte = ""
+        usando_konder_real = False
+    
+        start_ts_ev = pd.Timestamp(data_evento, tz="America/Sao_Paulo")
+        end_ts_ev = start_ts_ev + pd.Timedelta(hours=duracao_evento_h)
+    
+        if "Ponte Adolfo Konder" in fonte_dados:
+            df_konder = load_adolfo_konder_dataset()
+            if not df_konder.empty:
+                sub_k = df_konder[(df_konder.index >= start_ts_ev) & (df_konder.index <= end_ts_ev)].copy()
+                if not sub_k.empty:
+                    df_ev = sub_k
+                    lbl_fonte = "Estação Real Ponte Adolfo Konder (Blumenau)"
+                    usando_konder_real = True
+                    st.info(f"✅ **Usando dados reais de pluviômetro da Estação Ponte Adolfo Konder:** {len(sub_k)} leituras de 15 minutos registradas no período.")
+                else:
+                    st.warning(
+                        f"⚠️ A data **{start_hist_str}** está fora da cobertura da Estação Adolfo Konder "
+                        f"({df_konder.index.min().strftime('%d/%m/%Y')} a {df_konder.index.max().strftime('%d/%m/%Y')}). "
+                        f"Alternando automaticamente para o Modelo ERA5 Corrigido."
+                    )
+    
+        if df_ev.empty:
+            with st.spinner(f"Buscando chuva histórica ERA5 para {start_hist_str} a {end_hist_str}…"):
+                hist_ev_df, hist_err = fetch_historical_5years_precip(
+                    latitude, longitude, start_date_str=start_hist_str, end_date_str=end_hist_str
+                )
+    
+            if hist_ev_df.empty:
+                st.warning(f"Não foi possível obter dados para este período. Erro: {hist_err}")
+            else:
+                df_ev = hist_ev_df[(hist_ev_df.index >= start_ts_ev) & (hist_ev_df.index <= end_ts_ev)].copy()
+                if "Corregido" in fonte_dados or "Ponte Adolfo Konder" in fonte_dados:
+                    if era5_correction != 1.0:
+                        df_ev["precipitation"] = df_ev["precipitation"] * era5_correction
+                    lbl_fonte = f"Modelo ERA5 (Open-Meteo ×{era5_correction:.2f})"
+                else:
+                    lbl_fonte = "Modelo ERA5 Bruto (Open-Meteo sem correção)"
+    
+        if not df_ev.empty:
+            sim_dt_min = 5.0
+            n_steps_ev = int((duracao_evento_h * 60) / sim_dt_min)
+            sim_times_ev = [start_ts_ev + pd.Timedelta(minutes=i * sim_dt_min) for i in range(n_steps_ev + 1)]
+    
+            sim_levels_ev = []
+            sim_pump_active_ev = []
+            sim_rain_rate_ev = []
+    
+            curr_d_ev = nivel_inicial_sim
+            p1_ev = curr_d_ev <= d_on
+            p2_ev = tem_bomba2 and (curr_d_ev <= d_on2)
+    
+            ovf_ev = False
+            ovf_ev_time = None
+    
+            dt_h_ev = sim_dt_min / 60.0
+    
+            for i, t_step in enumerate(sim_times_ev):
+                candidates = df_ev.index[df_ev.index <= t_step]
+                if len(candidates) > 0:
+                    if usando_konder_real and "precip_mmh" in df_ev.columns:
+                        precip_ev_mmh = float(df_ev.loc[candidates[-1], "precip_mmh"])
+                    else:
+                        precip_ev_mmh = float(df_ev.loc[candidates[-1], "precipitation"])
+                else:
+                    precip_ev_mmh = 0.0
+    
+                r_chuva_cm_h = precip_ev_mmh * factor_mm_cm
+                r_total_in = r_gnd_param + r_chuva_cm_h
+    
+                sim_levels_ev.append(curr_d_ev)
+                sim_pump_active_ev.append(int(p1_ev) + int(p2_ev))
+                sim_rain_rate_ev.append(r_chuva_cm_h)
+    
+                if not ovf_ev and curr_d_ev <= d_overflow:
+                    ovf_ev = True
+                    ovf_ev_time = t_step
+    
+                if status_bomba_hist == "Falha / Sem Energia (Desligada)":
+                    curr_d_ev -= r_total_in * dt_h_ev
+                else:
+                    if not p1_ev and curr_d_ev <= d_on:
+                        p1_ev = True
+                    elif p1_ev and curr_d_ev >= d_off:
+                        p1_ev = False
+    
+                    if tem_bomba2:
+                        if not p2_ev and curr_d_ev <= d_on2:
+                            p2_ev = True
+                        elif p2_ev and curr_d_ev >= d_off2:
+                            p2_ev = False
+                    else:
+                        p2_ev = False
+    
+                    r_active_ev = (int(p1_ev) + int(p2_ev)) * r_pump_param
+                    curr_d_ev += (r_active_ev - r_total_in) * dt_h_ev
+    
+            if usando_konder_real and "precip_15min" in df_ev.columns:
+                precip_total_ev = df_ev["precip_15min"].sum()
+                pico_mmh_ev = df_ev["precip_mmh"].max()
+                pico_15m_val = df_ev["precip_15min"].max()
+            else:
+                precip_total_ev = df_ev["precipitation"].sum()
+                pico_mmh_ev = df_ev["precipitation"].max()
+                pico_15m_val = None
+    
+            min_dist_ev = min(sim_levels_ev)
+            dist_ao_sensor_ev = abs(min_dist_ev - dist_borda_cm)
+    
+            st.markdown("---")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Precipitação Acumulada", f"{precip_total_ev:.1f} mm", help=f"Fonte: {lbl_fonte}")
+            m2.metric(
+                "Pico de Chuva (Taxa Horária)",
+                f"{pico_mmh_ev:.1f} mm/h",
+                help=f"Maior impulso de chuva. " + (f"Pico de 15min: {pico_15m_val:.1f} mm." if pico_15m_val else "") + f" Entrada no poço: {pico_mmh_ev * factor_mm_cm:.1f} cm/h"
+            )
+            m3.metric("Nível Mais Alto Atingido", f"{min_dist_ev:.1f} cm do topo", help="0 cm = Topo do Poço (Borda Superior)")
+            if ovf_ev:
+                m4.metric("Status do Evento", "❌ TRANSBORDO", delta="Borda Superada!", delta_color="inverse")
+            else:
+                m4.metric("Status do Evento", "✅ SEM TRANSBORDO", delta=f"Folga ao topo: {min_dist_ev:.1f} cm")
+    
+            fig_hist = go.Figure()
+    
+            if usando_konder_real and "precip_15min" in df_ev.columns:
+                fig_hist.add_trace(
+                    go.Bar(
+                        x=df_ev.index,
+                        y=df_ev["precip_15min"] * 4.0,
+                        name="Chuva Inst. (Ponte Adolfo Konder - mm/h eq.)",
+                        marker_color="rgba(46, 204, 113, 0.4)",
+                        yaxis="y2",
+                    )
+                )
+            else:
+                fig_hist.add_trace(
+                    go.Bar(
+                        x=df_ev.index,
+                        y=df_ev["precipitation"],
+                        name=f"Chuva ({lbl_fonte})",
+                        marker_color="rgba(30, 144, 255, 0.35)",
+                        yaxis="y2",
+                    )
+                )
+    
+            fig_hist.add_trace(
+                go.Scatter(
+                    x=sim_times_ev,
+                    y=sim_levels_ev,
+                    mode="lines",
+                    name="Nível Simulado do Poço",
+                    line=dict(color="#1f77b4", width=2.5),
+                )
+            )
+    
+            fig_hist.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text="Bóia 1 LIGA", annotation_position="top right")
+            fig_hist.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
+            if tem_bomba2:
+                fig_hist.add_hline(y=d_on2, line_dash="dash", line_color="orange", annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
+                fig_hist.add_hline(y=d_off2, line_dash="dash", line_color="teal", annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
+    
+            fig_hist.add_hline(y=d_overflow, line_dash="dot", line_color="darkred", annotation_text="Topo do Poço / Borda Superior (0 cm)", annotation_position="top right")
+            fig_hist.add_hrect(y0=0, y1=d_overflow, fillcolor="rgba(231,76,60,0.10)", line_width=0)
+    
+            fig_hist.update_layout(
+                title=f"Reconstrução do Evento ({lbl_fonte}): {start_hist_str} ({duracao_evento_h}h) | Chuva Total: {precip_total_ev:.1f} mm | Pico: {pico_mmh_ev:.1f} mm/h",
+                xaxis=dict(title="Data / Hora"),
+                yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
+                yaxis2=dict(
+                    title="Intensidade de Chuva (mm/h)",
+                    overlaying="y", side="right", showgrid=False, rangemode="tozero",
+                    tickfont=dict(color="rgba(30, 144, 255, 0.7)"),
+                    title_font=dict(color="rgba(30, 144, 255, 0.7)"),
+                ),
+                legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
+                height=520,
+                margin=dict(l=20, r=70, t=50, b=50),
+            )
+            st.plotly_chart(fig_hist, width="stretch")
+    
+            if ovf_ev and ovf_ev_time is not None:
+                t_ovf_str = ovf_ev_time.strftime("%d/%m/%Y às %H:%M")
+                st.error(
+                    f"🚨 **ALERTA DE TRANSBORDO REGISTRADO NA SIMULAÇÃO:**\n\n"
+                    f"Na data de **{t_ovf_str}**, o nível da água ultrapassou a borda superior do poço.\n"
+                    f"O pico de chuva de **{pico_mmh_ev:.1f} mm/h** ({pico_mmh_ev * factor_mm_cm:.1f} cm/h no poço) "
+                    f"superou a capacidade instalada de remoção das bombas ({r_pump_total_param:.1f} cm/h)."
+                )
+            else:
+                st.success(
+                    f"✅ **SISTEMA SUPORTOU O EVENTO HISTÓRICO ({lbl_fonte}):**\n\n"
+                    f"Durante todo o período de {duracao_evento_h}h a partir de {start_hist_str}, "
+                    f"o nível máximo atingido ficou a **{min_dist_ev:.1f} cm da borda superior (topo do poço)** "
+                    f"(distância de **{dist_ao_sensor_ev:.1f} cm** em relação ao sensor físico)."
+                )
+    
+with tab4:
+    if tab4.open:
+        st.subheader("🌦️ Dados de Precipitação – Open-Meteo")
+        st.caption(f"Localização: lat {latitude:.4f}, lon {longitude:.4f} | Fonte: Open-Meteo (histórico + previsão 7 dias)")
+    
+        if weather_df.empty:
+            st.error("Não foi possível obter dados de precipitação da API Open-Meteo. Verifique a conexão ou as coordenadas.")
+        else:
+            now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+    
+            # Separar histórico e previsão
+            hist_df = weather_df[weather_df.index <= now_tz].copy()
+            fcast_df = weather_df[weather_df.index > now_tz].copy()
+    
+            # Métricas principais
+            last_24h = weather_df[weather_df.index >= (now_tz - pd.Timedelta(hours=24))]
+            next_24h = weather_df[
+                (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=24)))
+            ]
+            next_48h = weather_df[
+                (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=48)))
+            ]
+            next_7d = weather_df[
+                (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(days=7)))
+            ]
+            total_7d_precip = next_7d["precipitation"].sum() if not next_7d.empty else 0.0
+            max_intensity = weather_df["precipitation"].max()
+    
+            col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
+            col_w1.metric("Acumulado últimas 24h", f"{last_24h['precipitation'].sum():.1f} mm")
+            col_w2.metric("Previsão próximas 24h", f"{next_24h['precipitation'].sum():.1f} mm")
+            col_w3.metric("Previsão próximas 48h", f"{next_48h['precipitation'].sum():.1f} mm")
+            col_w4.metric("Previsão próximos 7 dias", f"{total_7d_precip:.1f} mm")
+            col_w5.metric("Intensidade máx.", f"{max_intensity:.1f} mm/h")
+    
+            st.markdown("---")
+    
+            # Gráfico de precipitação horária completo
+            st.subheader("Precipitação Horária – Histórico e Previsão (7 Dias)")
+            fig_rain = go.Figure()
+    
+            if not hist_df.empty:
+                fig_rain.add_trace(
+                    go.Bar(
+                        x=hist_df.index,
+                        y=hist_df["precipitation"],
+                        name="Histórico (mm/h)",
+                        marker_color="rgba(30, 100, 220, 0.7)",
+                    )
+                )
+    
+            if not fcast_df.empty:
+                fig_rain.add_trace(
+                    go.Bar(
+                        x=fcast_df.index,
+                        y=fcast_df["precipitation"],
+                        name="Previsão (mm/h)",
+                        marker_color="rgba(100, 200, 100, 0.7)",
+                    )
+                )
+    
+            _now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
+            fig_rain.add_shape(
+                type="line",
+                x0=_now_str,
+                x1=_now_str,
+                y0=0,
+                y1=1,
+                yref="paper",
+                line=dict(dash="dash", color="orange", width=1.5),
+            )
+            fig_rain.add_annotation(
+                x=_now_str,
+                y=1,
+                yref="paper",
+                text="Agora",
+                showarrow=False,
+                xanchor="left",
+                font=dict(color="orange"),
+            )
+            fig_rain.update_layout(
+                xaxis_title="Data / Hora",
+                yaxis_title="Precipitação (mm/h)",
+                legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                height=420,
+                bargap=0,
+                margin=dict(l=20, r=20, t=20, b=40),
+            )
+            st.plotly_chart(fig_rain, width="stretch")
+    
+            # Resumo Diário da Previsão dos Próximos 7 Dias
+            st.subheader("📅 Resumo Diário da Previsão – Próximos 7 Dias")
+            if not fcast_df.empty:
+                daily_grp = fcast_df.groupby(pd.DatetimeIndex(fcast_df.index).date)
+                daily_rows = []
+                for date_val, group in daily_grp:
+                    p_tot = group["precipitation"].sum()
+                    p_max = group["precipitation"].max()
+    
+                    if p_tot == 0:
+                        cond = "☀️ Sem chuva"
+                    elif p_tot < 5.0:
+                        cond = "🌦️ Chuva fraca"
+                    elif p_tot < 25.0:
+                        cond = "🌧️ Chuva moderada"
+                    else:
+                        cond = "⛈️ Chuva forte"
+    
+                    d_item = date_val[0] if isinstance(date_val, tuple) else date_val
+                    day_str = pd.Timestamp(d_item).strftime("%d/%m/%Y (%A)")
+                    day_str_pt = (
+                        day_str.replace("Monday", "Segunda-feira")
+                        .replace("Tuesday", "Terça-feira")
+                        .replace("Wednesday", "Quarta-feira")
+                        .replace("Thursday", "Quinta-feira")
+                        .replace("Friday", "Sexta-feira")
+                        .replace("Saturday", "Sábado")
+                        .replace("Sunday", "Domingo")
+                    )
+                    daily_rows.append({
+                        "Data / Dia": day_str_pt,
+                        "Precipitação Acumulada (mm)": round(p_tot, 1),
+                        "Intensidade Máxima (mm/h)": round(p_max, 1),
+                        "Condição Estimada": cond,
+                    })
+    
+                if daily_rows:
+                    df_daily = pd.DataFrame(daily_rows)
+                    st.dataframe(df_daily, width="stretch", hide_index=True)
+                    if total_7d_precip > 0:
+                        nivel_equiv_7d = total_7d_precip * factor_mm_cm
+                        st.info(
+                            f"📊 Acumulado total previsto nos 7 dias: **{total_7d_precip:.1f} mm**, "
+                            f"equivalente a um aporte estimado de **{nivel_equiv_7d:.1f} cm** no nível do poço."
+                        )
+            else:
+                st.info("Sem dados de previsão diária disponíveis.")
+    
+            # Previsão detalhada próximas 48h
+            st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
+            if not next_48h.empty:
+                fcast_table = next_48h.copy()
+                fcast_table.index = pd.to_datetime(fcast_table.index).strftime("%d/%m/%Y %H:%M")
+                fcast_table.columns = ["Precipitação (mm/h)"]
+                fcast_table = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
+                if fcast_table.empty:
+                    st.success("✅ Nenhuma precipitação prevista nas próximas 48 horas.")
+                else:
+                    st.dataframe(fcast_table, width="stretch")
+                    total_prev = next_48h["precipitation"].sum()
+                    nivel_equiv_cm = total_prev * factor_mm_cm
+                    st.info(
+                        f"📈 Volume previsto nas próximas 48h: **{total_prev:.1f} mm** (variação estimada de "
+                        f"**{nivel_equiv_cm:.1f} cm** no poço com fator {factor_mm_cm:.2f} cm/mm)."
+                    )
+            else:
+                st.info("Dados de previsão não disponíveis.")
+    
+            # Previsão Horária Completa (7 dias)
+            with st.expander("Ver previsão horária completa (próximos 7 dias)", icon=":material/calendar_month:"):
+                if not fcast_df.empty:
+                    show_fcast_7d = fcast_df.copy()
+                    show_fcast_7d.index = pd.to_datetime(show_fcast_7d.index).strftime("%d/%m/%Y %H:%M")
+                    show_fcast_7d.columns = ["Precipitação (mm/h)"]
+                    st.dataframe(show_fcast_7d, width="stretch")
+                else:
+                    st.write("Sem previsão horária disponível.")
+    
+            # Histórico completo dos últimos dias
+            with st.expander("Ver histórico de precipitação (últimos dias)", icon=":material/folder:"):
+                if not hist_df.empty:
+                    show_hist = hist_df.copy()
+                    show_hist.index = pd.to_datetime(show_hist.index).strftime("%d/%m/%Y %H:%M")
+                    show_hist.columns = ["Precipitação (mm/h)"]
+                    st.dataframe(show_hist, width="stretch")
+                else:
+                    st.write("Sem dados históricos disponíveis.")
+    
+with tab5:
+    if tab5.open:
+        st.subheader("🔮 Previsão do Nível do Poço – Próximas 48 Horas")
+        st.caption(
+            "Simulação a partir do nível atual real do sensor, aplicando o modelo de balanço de massa "
+            "com a previsão horária de precipitação da Open-Meteo."
+        )
+    
+        now_tz5 = pd.Timestamp.now(tz="America/Sao_Paulo")
+    
+        # Previsão de precipitação nas próximas 48h (dados horários)
+        fcast_48h = pd.DataFrame()
+        if not weather_df.empty:
+            fcast_48h = weather_df[
+                (weather_df.index > now_tz5) &
+                (weather_df.index <= now_tz5 + pd.Timedelta(hours=48))
+            ].copy()
+    
+        # Controles da simulação
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            bomba_status5 = st.selectbox(
+                "Status da Bomba para Previsão",
+                ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"],
+                key="bomba_status_tab5",
+            )
+        with col_s2:
+            horizonte_h = st.slider(
+                "Horizonte da Previsão (horas)", min_value=6, max_value=48, value=24, step=6,
+                key="horizonte_tab5",
+            )
+    
+        # Nível inicial = último valor real do sensor
+        nivel_inicial_cm = latest_distance if latest_distance is not None else d_off
+        st.info(
+            f"📍 Nível de partida: **{nivel_inicial_cm:.1f} cm** (distância sensor→água) "
+            f"| Leitura de: **{latest_row['dt_round'].strftime('%d/%m/%Y %H:%M') if 'dt_round' in latest_row and not pd.isna(latest_row.get('dt_round')) else 'última leitura'}**"
+        )
+    
+        # Simular em passos de 5 minutos usando a previsão horária
+        dt_min = 5.0  # minutos por passo
+        dt_h_step = dt_min / 60.0
+        n_steps = int(horizonte_h * 60 / dt_min)
+    
+        sim_times = [now_tz5 + pd.Timedelta(minutes=dt_min * i) for i in range(n_steps + 1)]
+        sim_levels = []
+        sim_pump_state = []
+        sim_rain_rate = []  # cm/h de entrada por chuva em cada passo
+    
+        curr_d5 = nivel_inicial_cm
+        p1_on = curr_d5 <= d_on
+        p2_on = tem_bomba2 and (curr_d5 <= d_on2)
+        overflow5 = False
+        overflow5_time = None
+    
+        for i, t in enumerate(sim_times):
+            # Precipitação horária correspondente ao instante t
+            if not fcast_48h.empty:
+                # pegar a hora exata ou anterior mais próxima
+                idx_candidates = fcast_48h.index[fcast_48h.index <= t]
+                if len(idx_candidates) > 0:
+                    precip_mmh = float(fcast_48h.loc[idx_candidates[-1], "precipitation"])
+                else:
+                    precip_mmh = 0.0
+            else:
+                precip_mmh = 0.0
+    
+            # Taxa de entrada no poço (lençol + chuva)
+            r_chuva_cm_h = precip_mmh * factor_mm_cm
+            r_total_entrada = r_gnd_param + r_chuva_cm_h  # cm/h
+            sim_rain_rate.append(r_chuva_cm_h)
+    
+            # Gravar o nível antes de avançar
+            sim_levels.append(curr_d5)
+            sim_pump_state.append(p1_on or p2_on)
+    
+            # Checar transbordo
+            if not overflow5 and curr_d5 <= d_overflow:
+                overflow5 = True
+                overflow5_time = t
+    
+            if i == n_steps:
+                break
+    
+            # Avançar o nível
+            if bomba_status5 == "Falha / Sem Energia (Desligada)":
+                curr_d5 -= r_total_entrada * dt_h_step
+            else:
+                if not p1_on and curr_d5 <= d_on:
+                    p1_on = True
+                elif p1_on and curr_d5 >= d_off:
+                    p1_on = False
+    
+                if tem_bomba2:
+                    if not p2_on and curr_d5 <= d_on2:
+                        p2_on = True
+                    elif p2_on and curr_d5 >= d_off2:
+                        p2_on = False
+                else:
+                    p2_on = False
+    
+                r_active5 = (int(p1_on) + int(p2_on)) * r_pump_param
+                curr_d5 += (r_active5 - r_total_entrada) * dt_h_step
+            curr_d5 = max(curr_d5, d_overflow - 10)  # limitar para não sair do gráfico
+    
+        sim_df = pd.DataFrame({
+            "datetime": sim_times[:len(sim_levels)],
+            "nivel_cm": sim_levels,
+            "bomba_ligada": sim_pump_state,
+            "r_chuva_cm_h": sim_rain_rate,
+        })
+    
+        # ── Métricas resumo ──
+        nivel_final = sim_levels[-1]
+        nivel_min = min(sim_levels)
+        chuva_total_prev = fcast_48h["precipitation"].sum() if not fcast_48h.empty else 0.0
+        chuva_periodo = (
+            weather_df[
+                (weather_df.index > now_tz5) &
+                (weather_df.index <= now_tz5 + pd.Timedelta(hours=horizonte_h))
+            ]["precipitation"].sum()
+            if not weather_df.empty else 0.0
+        )
+    
+        col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+        col_m1.metric("Nível Atual (Partida)", f"{nivel_inicial_cm:.1f} cm")
+        col_m2.metric(f"Nível Previsto em {horizonte_h}h", f"{nivel_final:.1f} cm",
+                      delta=f"{nivel_final - nivel_inicial_cm:+.1f} cm",
+                      delta_color="inverse")
+        col_m3.metric("Nível Mais Crítico Previsto", f"{nivel_min:.1f} cm")
+        col_m4.metric(f"Chuva prevista ({horizonte_h}h)", f"{chuva_periodo:.1f} mm")
+    
+        st.markdown("---")
+    
+        # ── Gráfico principal ──
+        fig5 = go.Figure()
+    
+        # Barras de chuva prevista (eixo secundário)
+        if not fcast_48h.empty:
+            fcast_plot = fcast_48h[fcast_48h.index <= now_tz5 + pd.Timedelta(hours=horizonte_h)]
+            if not fcast_plot.empty:
+                fig5.add_trace(
+                    go.Bar(
+                        x=fcast_plot.index,
+                        y=fcast_plot["precipitation"],
+                        name="Precipitação Prevista (mm/h)",
+                        marker_color="rgba(30, 144, 255, 0.3)",
+                        yaxis="y2",
+                    )
+                )
+    
+        # Linha do nível simulado colorida por estado da bomba
+        # Segmentos: bomba ligada = vermelho, desligada = azul
+        colors_pump = ["#e74c3c" if b else "#2980b9" for b in sim_df["bomba_ligada"]]
+        # Plotar como scatter com cores contínuas
+        fig5.add_trace(
+            go.Scatter(
+                x=sim_df["datetime"],
+                y=sim_df["nivel_cm"],
+                mode="lines",
+                name="Nível Simulado",
+                line=dict(color="#2980b9", width=2.5),
+                hovertemplate="<b>%{x|%d/%m %H:%M}</b><br>Dist. sensor: %{y:.1f} cm<extra></extra>",
+            )
+        )
+    
+        # Ponto de partida
+        fig5.add_trace(
+            go.Scatter(
+                x=[now_tz5],
+                y=[nivel_inicial_cm],
+                mode="markers",
+                name="Nível Atual (Real)",
+                marker=dict(size=12, color="#f39c12", symbol="star"),
+            )
+        )
+    
+        # Linhas de referência
+        fig5.add_hline(y=d_on, line_dash="dash", line_color="red",
+                       annotation_text="Bóia 1 LIGA", annotation_position="top right")
+        fig5.add_hline(y=d_off, line_dash="dash", line_color="green",
+                       annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
+        if tem_bomba2:
+            fig5.add_hline(y=d_on2, line_dash="dash", line_color="orange",
+                           annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
+            fig5.add_hline(y=d_off2, line_dash="dash", line_color="teal",
+                           annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
+        fig5.add_hline(y=d_overflow, line_dash="dot", line_color="darkred",
+                       annotation_text=f"Borda do Poço (−{dist_borda_cm:.0f} cm)",
+                       annotation_position="top right")
+    
+        # Linha vertical "Agora"
+        _now5_str = now_tz5.strftime("%Y-%m-%d %H:%M:%S")
+        fig5.add_shape(
+            type="line", x0=_now5_str, x1=_now5_str, y0=0, y1=1, yref="paper",
+            line=dict(dash="dash", color="orange", width=1.5),
+        )
+        fig5.add_annotation(
+            x=_now5_str, y=0.98, yref="paper", text="Agora",
+            showarrow=False, xanchor="left", font=dict(color="orange", size=11),
+        )
+    
+        # Zona crítica de transbordo (faixa cinza)
+        fig5.add_hrect(
+            y0=0, y1=d_overflow,
+            fillcolor="rgba(231,76,60,0.08)",
+            line_width=0,
+            annotation_text="Zona de Transbordo",
+            annotation_position="top left",
+            annotation_font_color="#e74c3c",
+        )
+    
+        fig5.update_layout(
+            yaxis=dict(
+                autorange="reversed",
+                title="Nível da Água (cm abaixo do topo do poço)",
+            ),
+            yaxis2=dict(
+                title="Precipitação (mm/h)",
+                overlaying="y",
+                side="right",
+                showgrid=False,
+                rangemode="tozero",
                 tickfont=dict(color="rgba(30, 144, 255, 0.7)"),
                 title_font=dict(color="rgba(30, 144, 255, 0.7)"),
             ),
+            xaxis=dict(title="Data / Hora"),
             legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
-            height=520,
-            margin=dict(l=20, r=70, t=50, b=50),
-        )
-        st.plotly_chart(fig_hist, width="stretch")
-
-        if ovf_ev and ovf_ev_time is not None:
-            t_ovf_str = ovf_ev_time.strftime("%d/%m/%Y às %H:%M")
-            st.error(
-                f"🚨 **ALERTA DE TRANSBORDO REGISTRADO NA SIMULAÇÃO:**\n\n"
-                f"Na data de **{t_ovf_str}**, o nível da água ultrapassou a borda superior do poço.\n"
-                f"O pico de chuva de **{pico_mmh_ev:.1f} mm/h** ({pico_mmh_ev * factor_mm_cm:.1f} cm/h no poço) "
-                f"superou a capacidade instalada de remoção das bombas ({r_pump_total_param:.1f} cm/h)."
-            )
-        else:
-            st.success(
-                f"✅ **SISTEMA SUPORTOU O EVENTO HISTÓRICO ({lbl_fonte}):**\n\n"
-                f"Durante todo o período de {duracao_evento_h}h a partir de {start_hist_str}, "
-                f"o nível máximo atingido ficou a **{min_dist_ev:.1f} cm da borda superior (topo do poço)** "
-                f"(distância de **{dist_ao_sensor_ev:.1f} cm** em relação ao sensor físico)."
-            )
-
-with tab4:
-    st.subheader("🌦️ Dados de Precipitação – Open-Meteo")
-    st.caption(f"Localização: lat {latitude:.4f}, lon {longitude:.4f} | Fonte: Open-Meteo (histórico + previsão 7 dias)")
-
-    if weather_df.empty:
-        st.error("Não foi possível obter dados de precipitação da API Open-Meteo. Verifique a conexão ou as coordenadas.")
-    else:
-        now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
-
-        # Separar histórico e previsão
-        hist_df = weather_df[weather_df.index <= now_tz].copy()
-        fcast_df = weather_df[weather_df.index > now_tz].copy()
-
-        # Métricas principais
-        last_24h = weather_df[weather_df.index >= (now_tz - pd.Timedelta(hours=24))]
-        next_24h = weather_df[
-            (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=24)))
-        ]
-        next_48h = weather_df[
-            (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=48)))
-        ]
-        max_intensity = weather_df["precipitation"].max()
-
-        col_w1, col_w2, col_w3, col_w4 = st.columns(4)
-        col_w1.metric("Acumulado últimas 24h", f"{last_24h['precipitation'].sum():.1f} mm")
-        col_w2.metric("Previsão próximas 24h", f"{next_24h['precipitation'].sum():.1f} mm")
-        col_w3.metric("Previsão próximas 48h", f"{next_48h['precipitation'].sum():.1f} mm")
-        col_w4.metric("Intensidade máxima (período)", f"{max_intensity:.1f} mm/h")
-
-        st.markdown("---")
-
-        # Gráfico de precipitação horária completo
-        st.subheader("Precipitação Horária – Histórico e Previsão")
-        fig_rain = go.Figure()
-
-        if not hist_df.empty:
-            fig_rain.add_trace(
-                go.Bar(
-                    x=hist_df.index,
-                    y=hist_df["precipitation"],
-                    name="Histórico (mm/h)",
-                    marker_color="rgba(30, 100, 220, 0.7)",
-                )
-            )
-
-        if not fcast_df.empty:
-            fig_rain.add_trace(
-                go.Bar(
-                    x=fcast_df.index,
-                    y=fcast_df["precipitation"],
-                    name="Previsão (mm/h)",
-                    marker_color="rgba(100, 200, 100, 0.7)",
-                )
-            )
-
-        _now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
-        fig_rain.add_shape(
-            type="line",
-            x0=_now_str,
-            x1=_now_str,
-            y0=0,
-            y1=1,
-            yref="paper",
-            line=dict(dash="dash", color="orange", width=1.5),
-        )
-        fig_rain.add_annotation(
-            x=_now_str,
-            y=1,
-            yref="paper",
-            text="Agora",
-            showarrow=False,
-            xanchor="left",
-            font=dict(color="orange"),
-        )
-        fig_rain.update_layout(
-            xaxis_title="Data / Hora",
-            yaxis_title="Precipitação (mm/h)",
-            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
-            height=420,
+            height=540,
+            margin=dict(l=20, r=70, t=30, b=50),
             bargap=0,
-            margin=dict(l=20, r=20, t=20, b=40),
         )
-        st.plotly_chart(fig_rain, width="stretch")
-
-        # Previsão detalhada próximas 48h
-        st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
-        if not next_48h.empty:
-            fcast_table = next_48h.copy()
-            fcast_table.index = pd.to_datetime(fcast_table.index).strftime("%d/%m/%Y %H:%M")
-            fcast_table.columns = ["Precipitação (mm/h)"]
-            fcast_table = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
-            if fcast_table.empty:
-                st.success("✅ Nenhuma precipitação prevista nas próximas 48 horas.")
-            else:
-                st.dataframe(fcast_table, width="stretch")
-                total_prev = next_48h["precipitation"].sum()
-                nivel_equiv_cm = total_prev * factor_mm_cm
-                st.info(
-                    f"📈 Volume previsto de **{total_prev:.1f} mm** equivale a uma variação estimada de "
-                    f"**{nivel_equiv_cm:.1f} cm** no nível do poço (fator {factor_mm_cm:.2f} cm/mm)."
-                )
-        else:
-            st.info("Dados de previsão não disponíveis.")
-
-        # Histórico completo dos últimos 7 dias
-        with st.expander("📂 Ver histórico completo de precipitação (últimos 7 dias)"):
-            if not hist_df.empty:
-                show_hist = hist_df.copy()
-                show_hist.index = pd.to_datetime(show_hist.index).strftime("%d/%m/%Y %H:%M")
-                show_hist.columns = ["Precipitação (mm/h)"]
-                st.dataframe(show_hist, width="stretch")
-            else:
-                st.write("Sem dados históricos disponíveis.")
-
-with tab5:
-    st.subheader("🔮 Previsão do Nível do Poço – Próximas 48 Horas")
-    st.caption(
-        "Simulação a partir do nível atual real do sensor, aplicando o modelo de balanço de massa "
-        "com a previsão horária de precipitação da Open-Meteo."
-    )
-
-    now_tz5 = pd.Timestamp.now(tz="America/Sao_Paulo")
-
-    # Previsão de precipitação nas próximas 48h (dados horários)
-    fcast_48h = pd.DataFrame()
-    if not weather_df.empty:
-        fcast_48h = weather_df[
-            (weather_df.index > now_tz5) &
-            (weather_df.index <= now_tz5 + pd.Timedelta(hours=48))
-        ].copy()
-
-    # Controles da simulação
-    col_s1, col_s2 = st.columns(2)
-    with col_s1:
-        bomba_status5 = st.selectbox(
-            "Status da Bomba para Previsão",
-            ["Operacional (Ligada)", "Falha / Sem Energia (Desligada)"],
-            key="bomba_status_tab5",
-        )
-    with col_s2:
-        horizonte_h = st.slider(
-            "Horizonte da Previsão (horas)", min_value=6, max_value=48, value=24, step=6,
-            key="horizonte_tab5",
-        )
-
-    # Nível inicial = último valor real do sensor
-    nivel_inicial_cm = latest_distance if latest_distance is not None else d_off
-    st.info(
-        f"📍 Nível de partida: **{nivel_inicial_cm:.1f} cm** (distância sensor→água) "
-        f"| Leitura de: **{latest_row['dt_round'].strftime('%d/%m/%Y %H:%M') if 'dt_round' in latest_row and not pd.isna(latest_row.get('dt_round')) else 'última leitura'}**"
-    )
-
-    # Simular em passos de 5 minutos usando a previsão horária
-    dt_min = 5.0  # minutos por passo
-    dt_h_step = dt_min / 60.0
-    n_steps = int(horizonte_h * 60 / dt_min)
-
-    sim_times = [now_tz5 + pd.Timedelta(minutes=dt_min * i) for i in range(n_steps + 1)]
-    sim_levels = []
-    sim_pump_state = []
-    sim_rain_rate = []  # cm/h de entrada por chuva em cada passo
-
-    curr_d5 = nivel_inicial_cm
-    p1_on = curr_d5 <= d_on
-    p2_on = tem_bomba2 and (curr_d5 <= d_on2)
-    overflow5 = False
-    overflow5_time = None
-
-    for i, t in enumerate(sim_times):
-        # Precipitação horária correspondente ao instante t
-        if not fcast_48h.empty:
-            # pegar a hora exata ou anterior mais próxima
-            idx_candidates = fcast_48h.index[fcast_48h.index <= t]
-            if len(idx_candidates) > 0:
-                precip_mmh = float(fcast_48h.loc[idx_candidates[-1], "precipitation"])
-            else:
-                precip_mmh = 0.0
-        else:
-            precip_mmh = 0.0
-
-        # Taxa de entrada no poço (lençol + chuva)
-        r_chuva_cm_h = precip_mmh * factor_mm_cm
-        r_total_entrada = r_gnd_param + r_chuva_cm_h  # cm/h
-        sim_rain_rate.append(r_chuva_cm_h)
-
-        # Gravar o nível antes de avançar
-        sim_levels.append(curr_d5)
-        sim_pump_state.append(p1_on or p2_on)
-
-        # Checar transbordo
-        if not overflow5 and curr_d5 <= d_overflow:
-            overflow5 = True
-            overflow5_time = t
-
-        if i == n_steps:
-            break
-
-        # Avançar o nível
-        if bomba_status5 == "Falha / Sem Energia (Desligada)":
-            curr_d5 -= r_total_entrada * dt_h_step
-        else:
-            if not p1_on and curr_d5 <= d_on:
-                p1_on = True
-            elif p1_on and curr_d5 >= d_off:
-                p1_on = False
-
-            if tem_bomba2:
-                if not p2_on and curr_d5 <= d_on2:
-                    p2_on = True
-                elif p2_on and curr_d5 >= d_off2:
-                    p2_on = False
-            else:
-                p2_on = False
-
-            r_active5 = (int(p1_on) + int(p2_on)) * r_pump_param
-            curr_d5 += (r_active5 - r_total_entrada) * dt_h_step
-        curr_d5 = max(curr_d5, d_overflow - 10)  # limitar para não sair do gráfico
-
-    sim_df = pd.DataFrame({
-        "datetime": sim_times[:len(sim_levels)],
-        "nivel_cm": sim_levels,
-        "bomba_ligada": sim_pump_state,
-        "r_chuva_cm_h": sim_rain_rate,
-    })
-
-    # ── Métricas resumo ──
-    nivel_final = sim_levels[-1]
-    nivel_min = min(sim_levels)
-    chuva_total_prev = fcast_48h["precipitation"].sum() if not fcast_48h.empty else 0.0
-    chuva_periodo = (
-        weather_df[
-            (weather_df.index > now_tz5) &
-            (weather_df.index <= now_tz5 + pd.Timedelta(hours=horizonte_h))
-        ]["precipitation"].sum()
-        if not weather_df.empty else 0.0
-    )
-
-    col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-    col_m1.metric("Nível Atual (Partida)", f"{nivel_inicial_cm:.1f} cm")
-    col_m2.metric(f"Nível Previsto em {horizonte_h}h", f"{nivel_final:.1f} cm",
-                  delta=f"{nivel_final - nivel_inicial_cm:+.1f} cm",
-                  delta_color="inverse")
-    col_m3.metric("Nível Mais Crítico Previsto", f"{nivel_min:.1f} cm")
-    col_m4.metric(f"Chuva prevista ({horizonte_h}h)", f"{chuva_periodo:.1f} mm")
-
-    st.markdown("---")
-
-    # ── Gráfico principal ──
-    fig5 = go.Figure()
-
-    # Barras de chuva prevista (eixo secundário)
-    if not fcast_48h.empty:
-        fcast_plot = fcast_48h[fcast_48h.index <= now_tz5 + pd.Timedelta(hours=horizonte_h)]
-        if not fcast_plot.empty:
-            fig5.add_trace(
-                go.Bar(
-                    x=fcast_plot.index,
-                    y=fcast_plot["precipitation"],
-                    name="Precipitação Prevista (mm/h)",
-                    marker_color="rgba(30, 144, 255, 0.3)",
-                    yaxis="y2",
-                )
-            )
-
-    # Linha do nível simulado colorida por estado da bomba
-    # Segmentos: bomba ligada = vermelho, desligada = azul
-    colors_pump = ["#e74c3c" if b else "#2980b9" for b in sim_df["bomba_ligada"]]
-    # Plotar como scatter com cores contínuas
-    fig5.add_trace(
-        go.Scatter(
-            x=sim_df["datetime"],
-            y=sim_df["nivel_cm"],
-            mode="lines",
-            name="Nível Simulado",
-            line=dict(color="#2980b9", width=2.5),
-            hovertemplate="<b>%{x|%d/%m %H:%M}</b><br>Dist. sensor: %{y:.1f} cm<extra></extra>",
-        )
-    )
-
-    # Ponto de partida
-    fig5.add_trace(
-        go.Scatter(
-            x=[now_tz5],
-            y=[nivel_inicial_cm],
-            mode="markers",
-            name="Nível Atual (Real)",
-            marker=dict(size=12, color="#f39c12", symbol="star"),
-        )
-    )
-
-    # Linhas de referência
-    fig5.add_hline(y=d_on, line_dash="dash", line_color="red",
-                   annotation_text="Bóia 1 LIGA", annotation_position="top right")
-    fig5.add_hline(y=d_off, line_dash="dash", line_color="green",
-                   annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
-    if tem_bomba2:
-        fig5.add_hline(y=d_on2, line_dash="dash", line_color="orange",
-                       annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
-        fig5.add_hline(y=d_off2, line_dash="dash", line_color="teal",
-                       annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
-    fig5.add_hline(y=d_overflow, line_dash="dot", line_color="darkred",
-                   annotation_text=f"Borda do Poço (−{dist_borda_cm:.0f} cm)",
-                   annotation_position="top right")
-
-    # Linha vertical "Agora"
-    _now5_str = now_tz5.strftime("%Y-%m-%d %H:%M:%S")
-    fig5.add_shape(
-        type="line", x0=_now5_str, x1=_now5_str, y0=0, y1=1, yref="paper",
-        line=dict(dash="dash", color="orange", width=1.5),
-    )
-    fig5.add_annotation(
-        x=_now5_str, y=0.98, yref="paper", text="Agora",
-        showarrow=False, xanchor="left", font=dict(color="orange", size=11),
-    )
-
-    # Zona crítica de transbordo (faixa cinza)
-    fig5.add_hrect(
-        y0=0, y1=d_overflow,
-        fillcolor="rgba(231,76,60,0.08)",
-        line_width=0,
-        annotation_text="Zona de Transbordo",
-        annotation_position="top left",
-        annotation_font_color="#e74c3c",
-    )
-
-    fig5.update_layout(
-        yaxis=dict(
-            autorange="reversed",
-            title="Nível da Água (cm abaixo do topo do poço)",
-        ),
-        yaxis2=dict(
-            title="Precipitação (mm/h)",
-            overlaying="y",
-            side="right",
-            showgrid=False,
-            rangemode="tozero",
-            tickfont=dict(color="rgba(30, 144, 255, 0.7)"),
-            title_font=dict(color="rgba(30, 144, 255, 0.7)"),
-        ),
-        xaxis=dict(title="Data / Hora"),
-        legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
-        height=540,
-        margin=dict(l=20, r=70, t=30, b=50),
-        bargap=0,
-    )
-    st.plotly_chart(fig5, width="stretch")
-
-    # ── Alertas ──
-    if overflow5 and overflow5_time is not None:
-        delta_t = overflow5_time - now_tz5
-        delta_h = int(delta_t.total_seconds() // 3600)
-        delta_m = int((delta_t.total_seconds() % 3600) // 60)
-        st.error(
-            f"🚨 **ALERTA DE TRANSBORDO PREVISTO:** o poço deve atingir a borda superior "
-            f"(água {dist_borda_cm:.0f} cm acima do sensor) "
-            f"em **{overflow5_time.strftime('%d/%m %H:%M')}** "
-            f"({delta_h}h {delta_m}min a partir de agora)."
-        )
-    else:
-        intensidade_max_prev = fcast_48h["precipitation"].max() if not fcast_48h.empty else 0.0
-        intensidade_sat = r_pump_param / factor_mm_cm
-        if intensidade_max_prev > intensidade_sat and bomba_status5 == "Operacional (Ligada)":
-            st.warning(
-                f"⚠️ **Atenção:** a previsão inclui intensidades de até **{intensidade_max_prev:.1f} mm/h**, "
-                f"acima do limite de saturação da bomba ({intensidade_sat:.1f} mm/h). "
-                "Monitorar de perto."
+        st.plotly_chart(fig5, width="stretch")
+    
+        # ── Alertas ──
+        if overflow5 and overflow5_time is not None:
+            delta_t = overflow5_time - now_tz5
+            delta_h = int(delta_t.total_seconds() // 3600)
+            delta_m = int((delta_t.total_seconds() % 3600) // 60)
+            st.error(
+                f"🚨 **ALERTA DE TRANSBORDO PREVISTO:** o poço deve atingir a borda superior "
+                f"(água {dist_borda_cm:.0f} cm acima do sensor) "
+                f"em **{overflow5_time.strftime('%d/%m %H:%M')}** "
+                f"({delta_h}h {delta_m}min a partir de agora)."
             )
         else:
-            st.success("✅ Nenhum transbordo previsto no horizonte selecionado.")
-
-    # ── Tabela de detalhes horáros ──
-    with st.expander("📋 Ver tabela de evolução horária simulada"):
-        hourly_sim = sim_df.set_index("datetime").resample("1h").first()
-        hourly_sim["Bomba"] = hourly_sim["bomba_ligada"].map({True: "🔴 Ligada", False: "🟢 Desligada"})
-        hourly_sim["Entrada por Chuva (cm/h)"] = hourly_sim["r_chuva_cm_h"].round(2)
-        hourly_sim["Nível (dist. sensor, cm)"] = hourly_sim["nivel_cm"].round(1)
-        hourly_sim["Altura Água (cm)"] = (FUNDODOPOCO - hourly_sim["nivel_cm"]).clip(lower=0).round(1)
-
-        # Merge com precipitação horária prevista
-        if not fcast_48h.empty:
-            fcast_merge = fcast_48h.resample("1h").sum().rename(columns={"precipitation": "Chuva Prevista (mm/h)"})
-            hourly_sim = hourly_sim.join(fcast_merge, how="left")
-            hourly_sim["Chuva Prevista (mm/h)"] = hourly_sim["Chuva Prevista (mm/h)"].fillna(0.0).round(2)
-
-        display_cols = ["Nível (dist. sensor, cm)", "Altura Água (cm)", "Bomba", "Entrada por Chuva (cm/h)"]
-        if "Chuva Prevista (mm/h)" in hourly_sim.columns:
-            display_cols.append("Chuva Prevista (mm/h)")
-
-        hourly_sim.index = pd.DatetimeIndex(hourly_sim.index).strftime("%d/%m/%Y %H:%M")
-        st.dataframe(hourly_sim[display_cols], width="stretch")
-
-# ──────────────────────────────────────────────────────────────────────────────────
+            intensidade_max_prev = fcast_48h["precipitation"].max() if not fcast_48h.empty else 0.0
+            intensidade_sat = r_pump_param / factor_mm_cm
+            if intensidade_max_prev > intensidade_sat and bomba_status5 == "Operacional (Ligada)":
+                st.warning(
+                    f"⚠️ **Atenção:** a previsão inclui intensidades de até **{intensidade_max_prev:.1f} mm/h**, "
+                    f"acima do limite de saturação da bomba ({intensidade_sat:.1f} mm/h). "
+                    "Monitorar de perto."
+                )
+            else:
+                st.success("✅ Nenhum transbordo previsto no horizonte selecionado.")
+    
+        # ── Tabela de detalhes horáros ──
+        with st.expander("Ver tabela de evolução horária simulada", icon=":material/table_chart:"):
+            hourly_sim = sim_df.set_index("datetime").resample("1h").first()
+            hourly_sim["Bomba"] = hourly_sim["bomba_ligada"].map({True: "🔴 Ligada", False: "🟢 Desligada"})
+            hourly_sim["Entrada por Chuva (cm/h)"] = hourly_sim["r_chuva_cm_h"].round(2)
+            hourly_sim["Nível (dist. sensor, cm)"] = hourly_sim["nivel_cm"].round(1)
+            hourly_sim["Altura Água (cm)"] = (FUNDODOPOCO - hourly_sim["nivel_cm"]).clip(lower=0).round(1)
+    
+            # Merge com precipitação horária prevista
+            if not fcast_48h.empty:
+                fcast_merge = fcast_48h.resample("1h").sum().rename(columns={"precipitation": "Chuva Prevista (mm/h)"})
+                hourly_sim = hourly_sim.join(fcast_merge, how="left")
+                hourly_sim["Chuva Prevista (mm/h)"] = hourly_sim["Chuva Prevista (mm/h)"].fillna(0.0).round(2)
+    
+            display_cols = ["Nível (dist. sensor, cm)", "Altura Água (cm)", "Bomba", "Entrada por Chuva (cm/h)"]
+            if "Chuva Prevista (mm/h)" in hourly_sim.columns:
+                display_cols.append("Chuva Prevista (mm/h)")
+    
+            hourly_sim.index = pd.DatetimeIndex(hourly_sim.index).strftime("%d/%m/%Y %H:%M")
+            st.dataframe(hourly_sim[display_cols], width="stretch")
+    
+    # ──────────────────────────────────────────────────────────────────────────────────
 with tab6:
-    st.subheader("📊 Análise Histórica de Chuvas & Curva IDF")
-
-    # Limiar de saturação da bomba em mm/h
-    intensidade_sat_mmh = r_pump_param / factor_mm_cm
-
-    # ── Controle do período de análise ──
-    col_anos, col_btn = st.columns([3, 1])
-    with col_anos:
-        anos_analise = st.slider(
-            "Período de análise (anos)",
-            min_value=1, max_value=15, value=5, step=1,
-            key="hist_anos_slider",
-            help="Número de anos de dados do Open-Meteo Archive API a buscar. "
-                 "Mais anos = curva IDF mais robusta, mas requisição maior (pode levar até 30s na 1ª vez).",
-        )
-    with col_btn:
-        st.write("")
-        if st.button("🔄 Limpar cache", key="clear_hist_cache", help="Força novo download dos dados históricos"):
-            fetch_historical_5years_precip.clear()
-            st.rerun()
-
-    end_ref = pd.Timestamp.now(tz="America/Sao_Paulo").normalize() - pd.Timedelta(days=1)
-    hist_start_str = (end_ref - pd.DateOffset(years=anos_analise)).strftime("%Y-%m-%d")
-    hist_start_label = f"{anos_analise} ano{'s' if anos_analise != 1 else ''} (desde {hist_start_str})"
-
-    # Informação de referência da Defesa Civil
-    dc_early = fetch_defesa_civil_rankings()
-    if dc_early:
-        all_dc_dates = []
-        for _df_dur in dc_early.values():
-            for _raw in _df_dur["Data/Hora"]:
-                try:
-                    all_dc_dates.append(pd.to_datetime(_raw, dayfirst=True))
-                except Exception:
-                    pass
-        if all_dc_dates:
-            oldest_dc = min(all_dc_dates)
-            n_anos_dc = (pd.Timestamp.now() - oldest_dc).days / 365.25
-            st.caption(
-                f"💡 O evento mais antigo registrado pela Defesa Civil é de "
-                f"**{oldest_dc.strftime('%d/%m/%Y')}** (~{n_anos_dc:.0f} anos). "
-                f"Selecionar **{n_anos_dc:.0f}+ anos** permite comparar os eventos históricos oficiais com o ERA5."
+    if tab6.open:
+        st.subheader("📊 Análise Histórica de Chuvas & Curva IDF")
+    
+        # Limiar de saturação da bomba em mm/h
+        intensidade_sat_mmh = r_pump_param / factor_mm_cm
+    
+        # ── Controle do período de análise ──
+        col_anos, col_btn = st.columns([3, 1])
+        with col_anos:
+            anos_analise = st.slider(
+                "Período de análise (anos)",
+                min_value=1, max_value=15, value=5, step=1,
+                key="hist_anos_slider",
+                help="Número de anos de dados do Open-Meteo Archive API a buscar. "
+                     "Mais anos = curva IDF mais robusta, mas requisição maior (pode levar até 30s na 1ª vez).",
             )
-
-    with st.spinner(f"⏳ Buscando dados históricos de precipitação ({hist_start_label})..."):
-        hist5_df, hist_err = fetch_historical_5years_precip(latitude, longitude, start_date_str=hist_start_str)
-
-    # Fallback para 5 anos se o fetch estendido falhou
-    if hist5_df.empty and hist_start_str:
-        st.warning(
-            f"⚠️ Falha ao buscar dados desde {hist_start_str}: `{hist_err}`. "
-            "Tentando janela padrão de 5 anos..."
+        with col_btn:
+            st.write("")
+            if st.button("🔄 Limpar cache", key="clear_hist_cache", help="Força novo download dos dados históricos"):
+                fetch_historical_5years_precip.clear()
+                st.rerun()
+    
+        end_ref = pd.Timestamp.now(tz="America/Sao_Paulo").normalize() - pd.Timedelta(days=1)
+        hist_start_str = (end_ref - pd.DateOffset(years=anos_analise)).strftime("%Y-%m-%d")
+        hist_start_label = f"{anos_analise} ano{'s' if anos_analise != 1 else ''} (desde {hist_start_str})"
+    
+        # Informação de referência da Defesa Civil
+        dc_early = fetch_defesa_civil_rankings()
+        if dc_early:
+            all_dc_dates = []
+            for _df_dur in dc_early.values():
+                for _raw in _df_dur["Data/Hora"]:
+                    try:
+                        all_dc_dates.append(pd.to_datetime(_raw, dayfirst=True))
+                    except Exception:
+                        pass
+            if all_dc_dates:
+                oldest_dc = min(all_dc_dates)
+                n_anos_dc = (pd.Timestamp.now() - oldest_dc).days / 365.25
+                st.caption(
+                    f"💡 O evento mais antigo registrado pela Defesa Civil é de "
+                    f"**{oldest_dc.strftime('%d/%m/%Y')}** (~{n_anos_dc:.0f} anos). "
+                    f"Selecionar **{n_anos_dc:.0f}+ anos** permite comparar os eventos históricos oficiais com o ERA5."
+                )
+    
+        with st.spinner(f"⏳ Buscando dados históricos de precipitação ({hist_start_label})..."):
+            hist5_df, hist_err = fetch_historical_5years_precip(latitude, longitude, start_date_str=hist_start_str)
+    
+        # Fallback para 5 anos se o fetch estendido falhou
+        if hist5_df.empty and hist_start_str:
+            st.warning(
+                f"⚠️ Falha ao buscar dados desde {hist_start_str}: `{hist_err}`. "
+                "Tentando janela padrão de 5 anos..."
+            )
+            with st.spinner("⏳ Buscando 5 anos de dados (fallback)..."):
+                hist5_df, hist_err = fetch_historical_5years_precip(latitude, longitude, start_date_str="")
+    
+        if hist5_df.empty:
+            st.error(
+                f"Não foi possível obter dados históricos da Open-Meteo Archive API. "
+                f"Erro: `{hist_err}`. Verifique a conexão com a internet e as coordenadas."
+            )
+    
+        fonte_tab6 = st.radio(
+            "Selecione a Base de Dados para Análise Histórica & IDF:",
+            options=[
+                "📡 Modelo ERA5 Corregido (Série Histórica com Fator de Correção)",
+                "🌧️ Estação Real: Ponte Adolfo Konder (Dados Pluviométricos Reais 2021-2025)",
+            ],
+            index=0,
+            horizontal=True,
         )
-        with st.spinner("⏳ Buscando 5 anos de dados (fallback)..."):
-            hist5_df, hist_err = fetch_historical_5years_precip(latitude, longitude, start_date_str="")
-
-    if hist5_df.empty:
-        st.error(
-            f"Não foi possível obter dados históricos da Open-Meteo Archive API. "
-            f"Erro: `{hist_err}`. Verifique a conexão com a internet e as coordenadas."
-        )
-
-    fonte_tab6 = st.radio(
-        "Selecione a Base de Dados para Análise Histórica & IDF:",
-        options=[
-            "📡 Modelo ERA5 Corregido (Série Histórica com Fator de Correção)",
-            "🌧️ Estação Real: Ponte Adolfo Konder (Dados Pluviométricos Reais 2021-2025)",
-        ],
-        index=0,
-        horizontal=True,
-    )
-
-    hist5_raw_df = hist5_df.copy()
-
-    if "Ponte Adolfo Konder" in fonte_tab6:
-        konder_df = load_adolfo_konder_dataset()
-        if not konder_df.empty:
-            hist5_df = pd.DataFrame({"precipitation": konder_df["precip_15min"].resample("1h").sum()}).dropna()
-            st.info("✅ **Análise baseada nas medições reais da Estação Ponte Adolfo Konder (2021–2025).** Fator ERA5 desativado para dados reais de pluviômetro.")
+    
+        hist5_raw_df = hist5_df.copy()
+    
+        if "Ponte Adolfo Konder" in fonte_tab6:
+            konder_df = load_adolfo_konder_dataset()
+            if not konder_df.empty:
+                hist5_df = pd.DataFrame({"precipitation": konder_df["precip_15min"].resample("1h").sum()}).dropna()
+                st.info("✅ **Análise baseada nas medições reais da Estação Ponte Adolfo Konder (2021–2025).** Fator ERA5 desativado para dados reais de pluviômetro.")
+            else:
+                st.warning("⚠️ Dados da Estação Ponte Adolfo Konder não encontrados. Utilizando ERA5 Corrigido.")
+                if era5_correction != 1.0:
+                    hist5_df = hist5_df.copy()
+                    hist5_df["precipitation"] = hist5_df["precipitation"] * era5_correction
         else:
-            st.warning("⚠️ Dados da Estação Ponte Adolfo Konder não encontrados. Utilizando ERA5 Corrigido.")
             if era5_correction != 1.0:
                 hist5_df = hist5_df.copy()
                 hist5_df["precipitation"] = hist5_df["precipitation"] * era5_correction
-    else:
-        if era5_correction != 1.0:
-            hist5_df = hist5_df.copy()
-            hist5_df["precipitation"] = hist5_df["precipitation"] * era5_correction
-
-    anos_disponiveis = sorted(hist5_df.index.year.unique())
-    n_anos = len(anos_disponiveis)
-    total_horas = len(hist5_df)
-
-    # Caption dinâmico com o período real obtido
-    periodo_real = f"{anos_disponiveis[0]}–{anos_disponiveis[-1]} ({n_anos} anos)"
-    correcao_txt = f" | Fator ERA5: ×{era5_correction:.2f}" if era5_correction != 1.0 else ""
-    st.caption(
-        f"Dados horários de {periodo_real} | lat {latitude:.4f}, lon {longitude:.4f} "
-        f"| Fonte: Open-Meteo Archive API (ERA5){correcao_txt} | Distribuição: Gumbel (método dos momentos)"
-    )
-
-    # ── Métricas gerais ──
-    chuva_anual_media = hist5_df["precipitation"].sum() / n_anos
-    max_horario = hist5_df["precipitation"].max()
-    n_eventos_sat = (hist5_df["precipitation"] >= intensidade_sat_mmh).sum()
-    freq_sat_ano = n_eventos_sat / n_anos
-
-    col_h1, col_h2, col_h3, col_h4 = st.columns(4)
-    col_h1.metric("Período analisado", f"{n_anos} anos ({anos_disponiveis[0]}–{anos_disponiveis[-1]})",
-                   help="Período obtido alinhado ao evento mais antigo registrado pela Defesa Civil de Blumenau")
-    col_h2.metric("Chuva média anual", f"{chuva_anual_media:.0f} mm/ano")
-    col_h3.metric("Máx. intensidade horária", f"{max_horario:.1f} mm/h")
-    col_h4.metric(
-        "Eventos saturantes (1h)",
-        f"{n_eventos_sat} total | {freq_sat_ano:.1f}/ano",
-        help=f"Horas com precipitação ≥ {intensidade_sat_mmh:.1f} mm/h (limite de saturação da bomba)",
-    )
-
-    st.markdown("---")
-
-    # ── Configuração das durações para análise IDF ──
-    duracoes_h = [1, 2, 3, 6, 12, 24]  # horas
-    trs = [2, 5, 10, 25, 50, 100]       # períodos de retorno
-
-    # Calcular máximas anuais para cada duração via janela deslizante
-    idf_results = {}  # {dur: {tr: intensidade_mm_h}}
-    gumbel_params = {}  # {dur: (alpha, u, annual_max_array)}
-
-    for dur in duracoes_h:
-        # Máximo acumulado em janela de `dur` horas
-        rolled = hist5_df["precipitation"].rolling(window=dur, min_periods=dur).sum()
-        rolled_intensity = rolled / dur  # converter para mm/h
-        # Máxima anual
-        annual_max = rolled_intensity.groupby(hist5_df.index.year).max().dropna().values
-        if len(annual_max) < 2:
-            continue
-        alpha, u = fit_gumbel(annual_max)
-        gumbel_params[dur] = (alpha, u, annual_max)
-        idf_results[dur] = {}
-        for tr in trs:
-            idf_results[dur][tr] = max(gumbel_quantile(alpha, u, tr), 0.0)
-
-    # ── Gráfico 1 – Precipitação anual acumulada ──
-    st.subheader("🌧️ Precipitação Anual Acumulada")
-    anual_acc = hist5_df["precipitation"].groupby(hist5_df.index.year).sum().reset_index()
-    anual_acc.columns = ["Ano", "Precipitação (mm)"]
-    fig_anual = go.Figure()
-    fig_anual.add_trace(go.Bar(
-        x=anual_acc["Ano"].astype(str),
-        y=anual_acc["Precipitação (mm)"],
-        marker_color="rgba(30, 100, 220, 0.75)",
-        name="Acumulado anual",
-    ))
-    fig_anual.add_hline(
-        y=chuva_anual_media,
-        line_dash="dash", line_color="orange",
-        annotation_text=f"Média: {chuva_anual_media:.0f} mm",
-        annotation_position="top right",
-    )
-    fig_anual.update_layout(
-        xaxis_title="Ano", yaxis_title="Precipitação acumulada (mm)",
-        height=320, margin=dict(l=20, r=20, t=20, b=30),
-    )
-    st.plotly_chart(fig_anual, width="stretch")
-
-    # ── Gráfico 2 – Histograma de intensidades horárias + limiar de saturação ──
-    st.subheader("📊 Distribuição de Intensidades Horárias")
-    precip_positivo = hist5_df["precipitation"][hist5_df["precipitation"] > 0]
-    fig_hist = go.Figure()
-    fig_hist.add_trace(go.Histogram(
-        x=precip_positivo,
-        nbinsx=60,
-        name="Horas com chuva",
-        marker_color="rgba(30, 100, 220, 0.6)",
-        xbins=dict(start=0, end=max(precip_positivo.max(), intensidade_sat_mmh * 1.5), size=2),
-    ))
-    fig_hist.add_vline(
-        x=intensidade_sat_mmh,
-        line_dash="dash", line_color="red",
-    )
-    fig_hist.add_annotation(
-        x=intensidade_sat_mmh, y=1, yref="paper",
-        text=f"Saturação bomba<br>{intensidade_sat_mmh:.1f} mm/h",
-        showarrow=True, arrowhead=2, arrowcolor="red",
-        font=dict(color="red", size=11), xanchor="left",
-    )
-    fig_hist.update_layout(
-        xaxis_title="Intensidade (mm/h)",
-        yaxis_title="Número de horas",
-        height=320, margin=dict(l=20, r=20, t=20, b=30),
-    )
-    st.plotly_chart(fig_hist, width="stretch")
-
-    n_eventos_sat_5anos = int((hist5_df["precipitation"] >= intensidade_sat_mmh).sum())
-    if n_eventos_sat_5anos > 0:
-        st.warning(
-            f"⚠️ Em **{n_anos} anos** ocorreram **{n_eventos_sat_5anos} horas** com intensidade ≥ {intensidade_sat_mmh:.1f} mm/h "
-            f"(limite de saturação da bomba) – média de **{freq_sat_ano:.1f} evento(s)/ano**. "
-            "Nesses momentos o poço enche mais rápido do que a bomba consegue esvaziar."
+    
+        anos_disponiveis = sorted(hist5_df.index.year.unique())
+        n_anos = len(anos_disponiveis)
+        total_horas = len(hist5_df)
+    
+        # Caption dinâmico com o período real obtido
+        periodo_real = f"{anos_disponiveis[0]}–{anos_disponiveis[-1]} ({n_anos} anos)"
+        correcao_txt = f" | Fator ERA5: ×{era5_correction:.2f}" if era5_correction != 1.0 else ""
+        st.caption(
+            f"Dados horários de {periodo_real} | lat {latitude:.4f}, lon {longitude:.4f} "
+            f"| Fonte: Open-Meteo Archive API (ERA5){correcao_txt} | Distribuição: Gumbel (método dos momentos)"
         )
-    else:
-        st.success(
-            f"✅ Nenhuma hora com intensidade ≥ {intensidade_sat_mmh:.1f} mm/h nos últimos {n_anos} anos. "
-            "O sistema não foi saturado no período analisado."
+    
+        # ── Métricas gerais ──
+        chuva_anual_media = hist5_df["precipitation"].sum() / n_anos
+        max_horario = hist5_df["precipitation"].max()
+        n_eventos_sat = (hist5_df["precipitation"] >= intensidade_sat_mmh).sum()
+        freq_sat_ano = n_eventos_sat / n_anos
+    
+        col_h1, col_h2, col_h3, col_h4 = st.columns(4)
+        col_h1.metric("Período analisado", f"{n_anos} anos ({anos_disponiveis[0]}–{anos_disponiveis[-1]})",
+                       help="Período obtido alinhado ao evento mais antigo registrado pela Defesa Civil de Blumenau")
+        col_h2.metric("Chuva média anual", f"{chuva_anual_media:.0f} mm/ano")
+        col_h3.metric("Máx. intensidade horária", f"{max_horario:.1f} mm/h")
+        col_h4.metric(
+            "Eventos saturantes (1h)",
+            f"{n_eventos_sat} total | {freq_sat_ano:.1f}/ano",
+            help=f"Horas com precipitação ≥ {intensidade_sat_mmh:.1f} mm/h (limite de saturação da bomba)",
         )
-
-    st.markdown("---")
-
-    # ── Gráfico 3 – Curva IDF ──
-    st.subheader("📈 Curva IDF – Intensidade–Duração–Frequência")
-    st.caption(
-        "Distribuição de Gumbel ajustada às máximas anuais horárias. "
-        "Cada curva representa um período de retorno (Tr)."
-    )
-
-    if idf_results:
-        palette = [
-            "#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"
-        ]
-        fig_idf = go.Figure()
-        for i, tr in enumerate(trs):
-            y_idf = [idf_results.get(d, {}).get(tr, None) for d in duracoes_h]
-            fig_idf.add_trace(go.Scatter(
-                x=duracoes_h,
-                y=y_idf,
-                mode="lines+markers",
-                name=f"Tr = {tr} anos",
-                line=dict(color=palette[i % len(palette)], width=2.5 if tr == 25 else 1.5,
-                          dash="solid" if tr == 25 else "dot" if tr >= 50 else "solid"),
-                marker=dict(size=7),
-            ))
-        # Linha de saturação da bomba (capacidade 1h)
-        fig_idf.add_hline(
-            y=intensidade_sat_mmh,
-            line_dash="dash", line_color="red",
-            annotation_text=f"Saturação bomba ({intensidade_sat_mmh:.1f} mm/h)",
+    
+        st.markdown("---")
+    
+        # ── Configuração das durações para análise IDF ──
+        duracoes_h = [1, 2, 3, 6, 12, 24]  # horas
+        trs = [2, 5, 10, 25, 50, 100]       # períodos de retorno
+    
+        # Calcular máximas anuais para cada duração via janela deslizante
+        idf_results = {}  # {dur: {tr: intensidade_mm_h}}
+        gumbel_params = {}  # {dur: (alpha, u, annual_max_array)}
+    
+        for dur in duracoes_h:
+            # Máximo acumulado em janela de `dur` horas
+            rolled = hist5_df["precipitation"].rolling(window=dur, min_periods=dur).sum()
+            rolled_intensity = rolled / dur  # converter para mm/h
+            # Máxima anual
+            annual_max = rolled_intensity.groupby(hist5_df.index.year).max().dropna().values
+            if len(annual_max) < 2:
+                continue
+            alpha, u = fit_gumbel(annual_max)
+            gumbel_params[dur] = (alpha, u, annual_max)
+            idf_results[dur] = {}
+            for tr in trs:
+                idf_results[dur][tr] = max(gumbel_quantile(alpha, u, tr), 0.0)
+    
+        # ── Gráfico 1 – Precipitação anual acumulada ──
+        st.subheader("🌧️ Precipitação Anual Acumulada")
+        anual_acc = hist5_df["precipitation"].groupby(hist5_df.index.year).sum().reset_index()
+        anual_acc.columns = ["Ano", "Precipitação (mm)"]
+        fig_anual = go.Figure()
+        fig_anual.add_trace(go.Bar(
+            x=anual_acc["Ano"].astype(str),
+            y=anual_acc["Precipitação (mm)"],
+            marker_color="rgba(30, 100, 220, 0.75)",
+            name="Acumulado anual",
+        ))
+        fig_anual.add_hline(
+            y=chuva_anual_media,
+            line_dash="dash", line_color="orange",
+            annotation_text=f"Média: {chuva_anual_media:.0f} mm",
             annotation_position="top right",
         )
-        fig_idf.update_layout(
-            xaxis=dict(title="Duração (horas)", tickvals=duracoes_h,
-                       ticktext=[f"{d}h" for d in duracoes_h]),
-            yaxis_title="Intensidade média (mm/h)",
-            legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-            height=420, margin=dict(l=20, r=20, t=20, b=60),
+        fig_anual.update_layout(
+            xaxis_title="Ano", yaxis_title="Precipitação acumulada (mm)",
+            height=320, margin=dict(l=20, r=20, t=20, b=30),
         )
-        st.plotly_chart(fig_idf, width="stretch")
-
-    # ── Tabela IDF completa ──
-    st.subheader("📋 Tabela IDF – Intensidades por Duração e Período de Retorno (mm/h)")
-    if idf_results:
-        idf_table = pd.DataFrame(
-            {f"Tr={tr}a": [idf_results.get(d, {}).get(tr, None) for d in duracoes_h] for tr in trs},
-            index=[f"{d}h" for d in duracoes_h],
-        ).round(1)
-        idf_table.index.name = "Duração"
-
-        def highlight_tr25(col):
-            return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
-
-        st.dataframe(idf_table.style.apply(highlight_tr25), width="stretch")
-
-    st.markdown("---")
-
-    # ── Destaque: Chuva de projeto Tr=25 anos ──
-    st.subheader("🚨 Chuva de Projeto – Tr = 25 anos")
-    tr25_1h = idf_results.get(1, {}).get(25, None)
-    tr25_24h = idf_results.get(24, {}).get(25, None)
-
-    col_idf1, col_idf2, col_idf3 = st.columns(3)
-    if tr25_1h:
-        col_idf1.metric("Intensidade Tr=25 (1h)", f"{tr25_1h:.1f} mm/h")
-        vol_poco_tr25_1h = tr25_1h * factor_mm_cm
-        col_idf2.metric("Entrada equivalente no poço (1h)", f"{vol_poco_tr25_1h:.1f} cm/h")
-        col_idf3.metric(
-            "Excede saturação da bomba?",
-            "SIM ⚠️" if tr25_1h > intensidade_sat_mmh else "NÃO ✅",
-            delta=f"{tr25_1h - intensidade_sat_mmh:+.1f} mm/h",
-            delta_color="inverse",
-        )
-
-    # ── Simulação da pior chuva (Tr=25, 1h) no poço ──
-    if tr25_1h:
-        st.markdown("#### Simulação do Impacto no Poço – Chuva Tr=25 anos (1 hora)")
-        sim_dur_h_idf = st.selectbox(
-            "Duração da chuva de projeto",
-            options=[f"{d}h" for d in duracoes_h],
-            index=0,
-            key="idf_dur_select",
-        )
-        dur_sel = int(sim_dur_h_idf.replace("h", ""))
-        intens_sel = idf_results.get(dur_sel, {}).get(25, tr25_1h)
-        taxa_entrada_idf = intens_sel * factor_mm_cm  # cm/h de entrada no poço
-
-        # Simulação dinâmica (passos de 5min)
-        dt_h_idf = 5.0 / 60.0
-        total_h_idf = max(dur_sel * 1.5, 6.0)
-        n_steps_idf = int(total_h_idf / dt_h_idf)
-        t_idf = np.linspace(0, total_h_idf, n_steps_idf)
-
-        lvls_idf = []
-        curr_idf = d_off
-        p1_idf = False
-        p2_idf = False
-        ovf_idf = False
-        ovf_idf_t = None
-
-        for ti in t_idf:
-            r_in_idf = (r_gnd_param + taxa_entrada_idf) if ti <= dur_sel else r_gnd_param
-
-            if not p1_idf and curr_idf <= d_on:
-                p1_idf = True
-            elif p1_idf and curr_idf >= d_off:
-                p1_idf = False
-
-            if tem_bomba2:
-                if not p2_idf and curr_idf <= d_on2:
-                    p2_idf = True
-                elif p2_idf and curr_idf >= d_off2:
-                    p2_idf = False
-            else:
-                p2_idf = False
-
-            r_act_idf = (int(p1_idf) + int(p2_idf)) * r_pump_param
-            curr_idf += (r_act_idf - r_in_idf) * dt_h_idf
-
-            lvls_idf.append(curr_idf)
-            if not ovf_idf and curr_idf <= d_overflow:
-                ovf_idf = True
-                ovf_idf_t = ti
-
-        fig_idf_sim = go.Figure()
-        # Fundo: duração da chuva
-        fig_idf_sim.add_vrect(
-            x0=0, x1=dur_sel,
-            fillcolor="rgba(30, 144, 255, 0.08)", line_width=0,
-            annotation_text="Duração da chuva", annotation_position="top left",
-        )
-        fig_idf_sim.add_trace(go.Scatter(
-            x=t_idf, y=lvls_idf,
-            mode="lines",
-            name=f"Nível poço (Tr=25a, {dur_sel}h)",
-            line=dict(color="#e74c3c", width=2.5),
+        st.plotly_chart(fig_anual, width="stretch")
+    
+        # ── Gráfico 2 – Histograma de intensidades horárias + limiar de saturação ──
+        st.subheader("📊 Distribuição de Intensidades Horárias")
+        precip_positivo = hist5_df["precipitation"][hist5_df["precipitation"] > 0]
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(
+            x=precip_positivo,
+            nbinsx=60,
+            name="Horas com chuva",
+            marker_color="rgba(30, 100, 220, 0.6)",
+            xbins=dict(start=0, end=max(precip_positivo.max(), intensidade_sat_mmh * 1.5), size=2),
         ))
-        fig_idf_sim.add_hline(y=d_on, line_dash="dash", line_color="red",
-                              annotation_text="Bóia 1 LIGA", annotation_position="top right")
-        fig_idf_sim.add_hline(y=d_off, line_dash="dash", line_color="green",
-                              annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
-        if tem_bomba2:
-            fig_idf_sim.add_hline(y=d_on2, line_dash="dash", line_color="orange",
-                                  annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
-            fig_idf_sim.add_hline(y=d_off2, line_dash="dash", line_color="teal",
-                                  annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
-        fig_idf_sim.add_hline(y=d_overflow, line_dash="dot", line_color="black",
-                              annotation_text="Nível Crítico", annotation_position="top right")
-        fig_idf_sim.add_hrect(
-            y0=0, y1=d_overflow, fillcolor="rgba(231,76,60,0.08)", line_width=0,
+        fig_hist.add_vline(
+            x=intensidade_sat_mmh,
+            line_dash="dash", line_color="red",
         )
-        fig_idf_sim.update_layout(
-            title=f"Chuva Tr=25 anos | {dur_sel}h | {intens_sel:.1f} mm/h | Partida: d_off={d_off:.0f} cm",
-            xaxis_title="Tempo (horas)",
-            yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
-            height=420, margin=dict(l=20, r=20, t=50, b=30),
+        fig_hist.add_annotation(
+            x=intensidade_sat_mmh, y=1, yref="paper",
+            text=f"Saturação bomba<br>{intensidade_sat_mmh:.1f} mm/h",
+            showarrow=True, arrowhead=2, arrowcolor="red",
+            font=dict(color="red", size=11), xanchor="left",
         )
-        st.plotly_chart(fig_idf_sim, width="stretch")
-
-        if ovf_idf and ovf_idf_t is not None:
-            st.error(
-                f"🚨 **TRANSBORDO ESPERADO** para chuva Tr=25 anos ({dur_sel}h, {intens_sel:.1f} mm/h): "
-                f"o poço atingiria o nível crítico em **{ovf_idf_t*60:.0f} minutos** "
-                f"({ovf_idf_t:.2f} horas) após o início da chuva!"
+        fig_hist.update_layout(
+            xaxis_title="Intensidade (mm/h)",
+            yaxis_title="Número de horas",
+            height=320, margin=dict(l=20, r=20, t=20, b=30),
+        )
+        st.plotly_chart(fig_hist, width="stretch")
+    
+        n_eventos_sat_5anos = int((hist5_df["precipitation"] >= intensidade_sat_mmh).sum())
+        if n_eventos_sat_5anos > 0:
+            st.warning(
+                f"⚠️ Em **{n_anos} anos** ocorreram **{n_eventos_sat_5anos} horas** com intensidade ≥ {intensidade_sat_mmh:.1f} mm/h "
+                f"(limite de saturação da bomba) – média de **{freq_sat_ano:.1f} evento(s)/ano**. "
+                "Nesses momentos o poço enche mais rápido do que a bomba consegue esvaziar."
             )
         else:
             st.success(
-                f"✅ O sistema suporta a chuva de projeto Tr=25 anos ({dur_sel}h, {intens_sel:.1f} mm/h) "
-                "sem transbordo nas condições simuladas."
+                f"✅ Nenhuma hora com intensidade ≥ {intensidade_sat_mmh:.1f} mm/h nos últimos {n_anos} anos. "
+                "O sistema não foi saturado no período analisado."
             )
-
-    # ── Máximas anuais (expander) ──
-    with st.expander("📊 Ver máximas anuais por duração (entrada do ajuste Gumbel)"):
-        max_table_data = {}
-        for dur in duracoes_h:
-            if dur in gumbel_params:
-                alpha, u, annual_max = gumbel_params[dur]
-                max_table_data[f"{dur}h (mm/h)"] = np.round(annual_max, 2)
-        if max_table_data:
-            n_rows = max(len(v) for v in max_table_data.values())
-            idx = [str(y) for y in anos_disponiveis[:n_rows]]
-            max_df = pd.DataFrame(max_table_data, index=idx[:n_rows])
-            max_df.index.name = "Ano"
-            st.dataframe(max_df, width="stretch")
-            st.caption(
-                "⚠️ Gumbel ajustado com apenas 5 pontos (1 por ano). "
-                "Para aplicações de engenharia crítica, recomenda-se série histórica ≥ 30 anos."
-            )
-
-    # ── Seção de Calibração: Ponte Adolfo Konder vs ERA5 ──
-    st.markdown("---")
-    st.subheader("🎯 Calibração Pluviométrica: Estação Ponte Adolfo Konder vs. ERA5 Bruto (2021–2025)")
-    st.caption(
-        "Comparação ano a ano dos picos máximos anuais medidos pelo pluviômetro local da Ponte Adolfo Konder (Blumenau) "
-        "com a série horária de precipitação do modelo ERA5 (Open-Meteo). Permite validar se o fator de escala ×2.60 reflete a realidade local."
-    )
-    konder_calib_ds = load_adolfo_konder_dataset()
-    if not konder_calib_ds.empty and 'hist5_raw_df' in locals() and not hist5_raw_df.empty:
-        konder_h_series = konder_calib_ds["precip_15min"].resample("h").sum()
-        era_raw_series = hist5_raw_df["precipitation"]
-
-        calib_rows = []
-        ratios_list = []
-        for y_cal in [2021, 2022, 2023, 2024, 2025]:
-            k_val = konder_h_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(konder_h_series.index).year.astype(str) else np.nan
-            e_val = era_raw_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(era_raw_series.index).year.astype(str) else np.nan
-            if pd.notna(k_val) and pd.notna(e_val) and e_val > 0:
-                r_cal = k_val / e_val
-                ratios_list.append(r_cal)
-                calib_rows.append({
-                    "Ano": str(y_cal),
-                    "Ponte Adolfo Konder (Medição Real mm/h)": round(k_val, 1),
-                    "ERA5 Bruto (Satélite mm/h)": round(e_val, 1),
-                    "Fator de Correção Requerido": f"×{r_cal:.2f}",
-                })
-        if calib_rows:
-            st.dataframe(pd.DataFrame(calib_rows).set_index("Ano"), width="stretch")
-            med_ratio = np.mean(ratios_list) if ratios_list else 2.07
-            max_ratio = np.max(ratios_list) if ratios_list else 2.90
-            st.info(
-                f"💡 **Conclusão da Calibração Local (Ponte Adolfo Konder):**\n"
-                f"- A média dos fatores anuais é de **×{med_ratio:.2f}**.\n"
-                f"- Para tempestades e picos de eventos graves (ex: 2022 e 2025 com 58.0 mm/h), a subestimação do ERA5 atinge **×{max_ratio:.2f}**.\n"
-                f"- Recomenda-se utilizar o **Fator de Correção em ×2.60** no menu lateral para garantir margem de segurança no dimensionamento hidráulico NBR 10844."
-            )
-
-    # ── Seção de Validação: Open-Meteo vs. Defesa Civil ──
-    st.markdown("---")
-    st.subheader("🔬 Validação: Open-Meteo Archive vs. Defesa Civil de Blumenau")
-    st.caption(
-        "O Open-Meteo usa reanálise ERA5 (~9 km de resolução espacial e 1 hora temporal). "
-        "A Defesa Civil usa pluviômetros locais que capturam picos pontuais. "
-        "Esta seção compara os dois e estima o fator de subestimação do ERA5."
-    )
-
-    with st.spinner("Buscando dados da Defesa Civil para validação…"):
-        dc_val = fetch_defesa_civil_rankings()
-
-    if not dc_val or hist5_df.empty:
-        st.warning("Não foi possível realizar a validação (dados indisponíveis).")
-    else:
-        dur_val_map = {"15min": 1, "30min": 1, "01h": 1, "24h": 24, "96h": 96}
-        dur_val_h   = {"15min": 0.25, "30min": 0.5, "01h": 1.0, "24h": 24.0, "96h": 96.0}
-
-        # ── 1. Tabela de máximos globais por duração ──
-        st.markdown("#### 1️⃣ Máximos Globais por Duração — DC (histórico completo) vs. Open-Meteo (5 anos)")
-        rows_cmp = []
-        for dur, df_dc in dc_val.items():
-            dh = dur_val_h.get(dur, 1.0)
-            win = dur_val_map.get(dur, 1)           # janela em horas para rolling
-            dc_max_mm  = df_dc["Acumulado_mm"].max()
-            dc_max_mmh = dc_max_mm / dh
-
-            # Open-Meteo: rolling sum de `win` horas → máximo da série
-            om_rolled = hist5_df["precipitation"].rolling(window=win, min_periods=win).sum()
-            om_max_mm  = om_rolled.max()
-            om_max_mmh = om_max_mm / dh
-
-            ratio = om_max_mmh / dc_max_mmh if dc_max_mmh > 0 else None
-            rows_cmp.append({
-                "Duração": dur,
-                "DC – Máx. (mm)": round(dc_max_mm, 1),
-                "OM – Máx. 5a (mm)": round(om_max_mm, 1),
-                "DC – Intensidade (mm/h)": round(dc_max_mmh, 1),
-                "OM – Intensidade (mm/h)": round(om_max_mmh, 1),
-                "OM / DC (%)": round(ratio * 100, 1) if ratio else None,
-            })
-
-        df_cmp = pd.DataFrame(rows_cmp).set_index("Duração")
-
-        def color_ratio(val):
-            if val is None:
-                return ""
-            if val >= 80:
-                return "background-color: rgba(52,168,83,0.2)"
-            if val >= 60:
-                return "background-color: rgba(251,188,4,0.25)"
-            return "background-color: rgba(234,67,53,0.2)"
-
-        st.dataframe(
-            df_cmp.style.map(color_ratio, subset=["OM / DC (%)"]),
-            width="stretch",
-        )
+    
+        st.markdown("---")
+    
+        # ── Gráfico 3 – Curva IDF ──
+        st.subheader("📈 Curva IDF – Intensidade–Duração–Frequência")
         st.caption(
-            "🟢 ≥ 80%: boa concordância | 🟡 60–80%: subestimação moderada | 🔴 < 60%: subestimação significativa"
+            "Distribuição de Gumbel ajustada às máximas anuais horárias. "
+            "Cada curva representa um período de retorno (Tr)."
         )
-
-        # ── 2. Lookup de eventos recentes (DC na janela de 5 anos) ──
-        st.markdown("#### 2️⃣ Eventos Recentes da DC dentro da Janela Open-Meteo (5 anos)")
+    
+        if idf_results:
+            palette = [
+                "#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"
+            ]
+            fig_idf = go.Figure()
+            for i, tr in enumerate(trs):
+                y_idf = [idf_results.get(d, {}).get(tr, None) for d in duracoes_h]
+                fig_idf.add_trace(go.Scatter(
+                    x=duracoes_h,
+                    y=y_idf,
+                    mode="lines+markers",
+                    name=f"Tr = {tr} anos",
+                    line=dict(color=palette[i % len(palette)], width=2.5 if tr == 25 else 1.5,
+                              dash="solid" if tr == 25 else "dot" if tr >= 50 else "solid"),
+                    marker=dict(size=7),
+                ))
+            # Linha de saturação da bomba (capacidade 1h)
+            fig_idf.add_hline(
+                y=intensidade_sat_mmh,
+                line_dash="dash", line_color="red",
+                annotation_text=f"Saturação bomba ({intensidade_sat_mmh:.1f} mm/h)",
+                annotation_position="top right",
+            )
+            fig_idf.update_layout(
+                xaxis=dict(title="Duração (horas)", tickvals=duracoes_h,
+                           ticktext=[f"{d}h" for d in duracoes_h]),
+                yaxis_title="Intensidade média (mm/h)",
+                legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+                height=420, margin=dict(l=20, r=20, t=20, b=60),
+            )
+            st.plotly_chart(fig_idf, width="stretch")
+    
+        # ── Tabela IDF completa ──
+        st.subheader("📋 Tabela IDF – Intensidades por Duração e Período de Retorno (mm/h)")
+        if idf_results:
+            idf_table = pd.DataFrame(
+                {f"Tr={tr}a": [idf_results.get(d, {}).get(tr, None) for d in duracoes_h] for tr in trs},
+                index=[f"{d}h" for d in duracoes_h],
+            ).round(1)
+            idf_table.index.name = "Duração"
+    
+            def highlight_tr25(col):
+                return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
+    
+            st.dataframe(idf_table.style.apply(highlight_tr25), width="stretch")
+    
+        st.markdown("---")
+    
+        # ── Destaque: Chuva de projeto Tr=25 anos ──
+        st.subheader("🚨 Chuva de Projeto – Tr = 25 anos")
+        tr25_1h = idf_results.get(1, {}).get(25, None)
+        tr25_24h = idf_results.get(24, {}).get(25, None)
+    
+        col_idf1, col_idf2, col_idf3 = st.columns(3)
+        if tr25_1h:
+            col_idf1.metric("Intensidade Tr=25 (1h)", f"{tr25_1h:.1f} mm/h")
+            vol_poco_tr25_1h = tr25_1h * factor_mm_cm
+            col_idf2.metric("Entrada equivalente no poço (1h)", f"{vol_poco_tr25_1h:.1f} cm/h")
+            col_idf3.metric(
+                "Excede saturação da bomba?",
+                "SIM ⚠️" if tr25_1h > intensidade_sat_mmh else "NÃO ✅",
+                delta=f"{tr25_1h - intensidade_sat_mmh:+.1f} mm/h",
+                delta_color="inverse",
+            )
+    
+        # ── Simulação da pior chuva (Tr=25, 1h) no poço ──
+        if tr25_1h:
+            st.markdown("#### Simulação do Impacto no Poço – Chuva Tr=25 anos (1 hora)")
+            sim_dur_h_idf = st.selectbox(
+                "Duração da chuva de projeto",
+                options=[f"{d}h" for d in duracoes_h],
+                index=0,
+                key="idf_dur_select",
+            )
+            dur_sel = int(sim_dur_h_idf.replace("h", ""))
+            intens_sel = idf_results.get(dur_sel, {}).get(25, tr25_1h)
+            taxa_entrada_idf = intens_sel * factor_mm_cm  # cm/h de entrada no poço
+    
+            # Simulação dinâmica (passos de 5min)
+            dt_h_idf = 5.0 / 60.0
+            total_h_idf = max(dur_sel * 1.5, 6.0)
+            n_steps_idf = int(total_h_idf / dt_h_idf)
+            t_idf = np.linspace(0, total_h_idf, n_steps_idf)
+    
+            lvls_idf = []
+            curr_idf = d_off
+            p1_idf = False
+            p2_idf = False
+            ovf_idf = False
+            ovf_idf_t = None
+    
+            for ti in t_idf:
+                r_in_idf = (r_gnd_param + taxa_entrada_idf) if ti <= dur_sel else r_gnd_param
+    
+                if not p1_idf and curr_idf <= d_on:
+                    p1_idf = True
+                elif p1_idf and curr_idf >= d_off:
+                    p1_idf = False
+    
+                if tem_bomba2:
+                    if not p2_idf and curr_idf <= d_on2:
+                        p2_idf = True
+                    elif p2_idf and curr_idf >= d_off2:
+                        p2_idf = False
+                else:
+                    p2_idf = False
+    
+                r_act_idf = (int(p1_idf) + int(p2_idf)) * r_pump_param
+                curr_idf += (r_act_idf - r_in_idf) * dt_h_idf
+    
+                lvls_idf.append(curr_idf)
+                if not ovf_idf and curr_idf <= d_overflow:
+                    ovf_idf = True
+                    ovf_idf_t = ti
+    
+            fig_idf_sim = go.Figure()
+            # Fundo: duração da chuva
+            fig_idf_sim.add_vrect(
+                x0=0, x1=dur_sel,
+                fillcolor="rgba(30, 144, 255, 0.08)", line_width=0,
+                annotation_text="Duração da chuva", annotation_position="top left",
+            )
+            fig_idf_sim.add_trace(go.Scatter(
+                x=t_idf, y=lvls_idf,
+                mode="lines",
+                name=f"Nível poço (Tr=25a, {dur_sel}h)",
+                line=dict(color="#e74c3c", width=2.5),
+            ))
+            fig_idf_sim.add_hline(y=d_on, line_dash="dash", line_color="red",
+                                  annotation_text="Bóia 1 LIGA", annotation_position="top right")
+            fig_idf_sim.add_hline(y=d_off, line_dash="dash", line_color="green",
+                                  annotation_text="Bóia 1 DESLIGA", annotation_position="top right")
+            if tem_bomba2:
+                fig_idf_sim.add_hline(y=d_on2, line_dash="dash", line_color="orange",
+                                      annotation_text="Bóia 2 LIGA (Emergência)", annotation_position="top right")
+                fig_idf_sim.add_hline(y=d_off2, line_dash="dash", line_color="teal",
+                                      annotation_text="Bóia 2 DESLIGA", annotation_position="top right")
+            fig_idf_sim.add_hline(y=d_overflow, line_dash="dot", line_color="black",
+                                  annotation_text="Nível Crítico", annotation_position="top right")
+            fig_idf_sim.add_hrect(
+                y0=0, y1=d_overflow, fillcolor="rgba(231,76,60,0.08)", line_width=0,
+            )
+            fig_idf_sim.update_layout(
+                title=f"Chuva Tr=25 anos | {dur_sel}h | {intens_sel:.1f} mm/h | Partida: d_off={d_off:.0f} cm",
+                xaxis_title="Tempo (horas)",
+                yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
+                height=420, margin=dict(l=20, r=20, t=50, b=30),
+            )
+            st.plotly_chart(fig_idf_sim, width="stretch")
+    
+            if ovf_idf and ovf_idf_t is not None:
+                st.error(
+                    f"🚨 **TRANSBORDO ESPERADO** para chuva Tr=25 anos ({dur_sel}h, {intens_sel:.1f} mm/h): "
+                    f"o poço atingiria o nível crítico em **{ovf_idf_t*60:.0f} minutos** "
+                    f"({ovf_idf_t:.2f} horas) após o início da chuva!"
+                )
+            else:
+                st.success(
+                    f"✅ O sistema suporta a chuva de projeto Tr=25 anos ({dur_sel}h, {intens_sel:.1f} mm/h) "
+                    "sem transbordo nas condições simuladas."
+                )
+    
+        # ── Máximas anuais (expander) ──
+        with st.expander("Ver máximas anuais por duração (entrada do ajuste Gumbel)", icon=":material/bar_chart:"):
+            max_table_data = {}
+            for dur in duracoes_h:
+                if dur in gumbel_params:
+                    alpha, u, annual_max = gumbel_params[dur]
+                    max_table_data[f"{dur}h (mm/h)"] = np.round(annual_max, 2)
+            if max_table_data:
+                n_rows = max(len(v) for v in max_table_data.values())
+                idx = [str(y) for y in anos_disponiveis[:n_rows]]
+                max_df = pd.DataFrame(max_table_data, index=idx[:n_rows])
+                max_df.index.name = "Ano"
+                st.dataframe(max_df, width="stretch")
+                st.caption(
+                    "⚠️ Gumbel ajustado com apenas 5 pontos (1 por ano). "
+                    "Para aplicações de engenharia crítica, recomenda-se série histórica ≥ 30 anos."
+                )
+    
+        # ── Seção de Calibração: Ponte Adolfo Konder vs ERA5 ──
+        st.markdown("---")
+        st.subheader("🎯 Calibração Pluviométrica: Estação Ponte Adolfo Konder vs. ERA5 Bruto (2021–2025)")
         st.caption(
-            "Para eventos registrados pela DC dentro dos últimos 5 anos, buscamos o valor "
-            "que o Open-Meteo registrou na mesma janela temporal e comparamos diretamente."
+            "Comparação ano a ano dos picos máximos anuais medidos pelo pluviômetro local da Ponte Adolfo Konder (Blumenau) "
+            "com a série horária de precipitação do modelo ERA5 (Open-Meteo). Permite validar se o fator de escala ×2.60 reflete a realidade local."
         )
-
-        om_start = hist5_df.index.min()
-        om_end   = hist5_df.index.max()
-        event_rows = []
-
-        for dur, df_dc in dc_val.items():
-            dh  = dur_val_h.get(dur, 1.0)
-            win = dur_val_map.get(dur, 1)
-            for _, row in df_dc.iterrows():
-                raw_dt = row["Data/Hora"]
-                try:
-                    dt = pd.to_datetime(raw_dt, dayfirst=True).tz_localize("America/Sao_Paulo")
-                except Exception:
-                    continue
-                if dt < om_start or dt > om_end:
-                    continue
-
-                # Janela de busca: [dt - win horas, dt + 1h]
-                t0 = dt - pd.Timedelta(hours=win + 1)
-                t1 = dt + pd.Timedelta(hours=2)
-                slice_om = hist5_df.loc[t0:t1, "precipitation"]
-                if slice_om.empty or len(slice_om) < win:
-                    continue
-                om_event_mm = slice_om.rolling(window=win, min_periods=win).sum().max()
-                if pd.isna(om_event_mm):
-                    continue
-
-                dc_mm = row["Acumulado_mm"]
-                ratio_ev = (om_event_mm / dc_mm * 100) if dc_mm else None
-                event_rows.append({
+        konder_calib_ds = load_adolfo_konder_dataset()
+        if not konder_calib_ds.empty and 'hist5_raw_df' in locals() and not hist5_raw_df.empty:
+            konder_h_series = konder_calib_ds["precip_15min"].resample("h").sum()
+            era_raw_series = hist5_raw_df["precipitation"]
+    
+            calib_rows = []
+            ratios_list = []
+            for y_cal in [2021, 2022, 2023, 2024, 2025]:
+                k_val = konder_h_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(konder_h_series.index).year.astype(str) else np.nan
+                e_val = era_raw_series[str(y_cal)].max() if str(y_cal) in pd.DatetimeIndex(era_raw_series.index).year.astype(str) else np.nan
+                if pd.notna(k_val) and pd.notna(e_val) and e_val > 0:
+                    r_cal = k_val / e_val
+                    ratios_list.append(r_cal)
+                    calib_rows.append({
+                        "Ano": str(y_cal),
+                        "Ponte Adolfo Konder (Medição Real mm/h)": round(k_val, 1),
+                        "ERA5 Bruto (Satélite mm/h)": round(e_val, 1),
+                        "Fator de Correção Requerido": f"×{r_cal:.2f}",
+                    })
+            if calib_rows:
+                st.dataframe(pd.DataFrame(calib_rows).set_index("Ano"), width="stretch")
+                med_ratio = np.mean(ratios_list) if ratios_list else 2.07
+                max_ratio = np.max(ratios_list) if ratios_list else 2.90
+                st.info(
+                    f"💡 **Conclusão da Calibração Local (Ponte Adolfo Konder):**\n"
+                    f"- A média dos fatores anuais é de **×{med_ratio:.2f}**.\n"
+                    f"- Para tempestades e picos de eventos graves (ex: 2022 e 2025 com 58.0 mm/h), a subestimação do ERA5 atinge **×{max_ratio:.2f}**.\n"
+                    f"- Recomenda-se utilizar o **Fator de Correção em ×2.60** no menu lateral para garantir margem de segurança no dimensionamento hidráulico NBR 10844."
+                )
+    
+        # ── Seção de Validação: Open-Meteo vs. Defesa Civil ──
+        st.markdown("---")
+        st.subheader("🔬 Validação: Open-Meteo Archive vs. Defesa Civil de Blumenau")
+        st.caption(
+            "O Open-Meteo usa reanálise ERA5 (~9 km de resolução espacial e 1 hora temporal). "
+            "A Defesa Civil usa pluviômetros locais que capturam picos pontuais. "
+            "Esta seção compara os dois e estima o fator de subestimação do ERA5."
+        )
+    
+        with st.spinner("Buscando dados da Defesa Civil para validação…"):
+            dc_val = fetch_defesa_civil_rankings()
+    
+        if not dc_val or hist5_df.empty:
+            st.warning("Não foi possível realizar a validação (dados indisponíveis).")
+        else:
+            dur_val_map = {"15min": 1, "30min": 1, "01h": 1, "24h": 24, "96h": 96}
+            dur_val_h   = {"15min": 0.25, "30min": 0.5, "01h": 1.0, "24h": 24.0, "96h": 96.0}
+    
+            # ── 1. Tabela de máximos globais por duração ──
+            st.markdown("#### 1️⃣ Máximos Globais por Duração — DC (histórico completo) vs. Open-Meteo (5 anos)")
+            rows_cmp = []
+            for dur, df_dc in dc_val.items():
+                dh = dur_val_h.get(dur, 1.0)
+                win = dur_val_map.get(dur, 1)           # janela em horas para rolling
+                dc_max_mm  = df_dc["Acumulado_mm"].max()
+                dc_max_mmh = dc_max_mm / dh
+    
+                # Open-Meteo: rolling sum de `win` horas → máximo da série
+                om_rolled = hist5_df["precipitation"].rolling(window=win, min_periods=win).sum()
+                om_max_mm  = om_rolled.max()
+                om_max_mmh = om_max_mm / dh
+    
+                ratio = om_max_mmh / dc_max_mmh if dc_max_mmh > 0 else None
+                rows_cmp.append({
                     "Duração": dur,
-                    "Estação DC": row["Estação"],
-                    "Região": row["Região"],
-                    "Data/Hora DC": raw_dt,
-                    "DC (mm)": round(dc_mm, 1),
-                    "Open-Meteo (mm)": round(om_event_mm, 1),
-                    "OM / DC (%)": round(ratio_ev, 1) if ratio_ev else None,
+                    "DC – Máx. (mm)": round(dc_max_mm, 1),
+                    "OM – Máx. 5a (mm)": round(om_max_mm, 1),
+                    "DC – Intensidade (mm/h)": round(dc_max_mmh, 1),
+                    "OM – Intensidade (mm/h)": round(om_max_mmh, 1),
+                    "OM / DC (%)": round(ratio * 100, 1) if ratio else None,
                 })
-
-        if event_rows:
-            df_ev = pd.DataFrame(event_rows).sort_values("OM / DC (%)")
-            df_ev.index = pd.RangeIndex(1, len(df_ev) + 1)
-            df_ev.index.name = "#"
-
-            def color_ev(val):
+    
+            df_cmp = pd.DataFrame(rows_cmp).set_index("Duração")
+    
+            def color_ratio(val):
                 if val is None:
                     return ""
                 if val >= 80:
                     return "background-color: rgba(52,168,83,0.2)"
-                if val >= 50:
+                if val >= 60:
                     return "background-color: rgba(251,188,4,0.25)"
                 return "background-color: rgba(234,67,53,0.2)"
-
+    
             st.dataframe(
-                df_ev.style.map(color_ev, subset=["OM / DC (%)"]),
+                df_cmp.style.map(color_ratio, subset=["OM / DC (%)"]),
                 width="stretch",
             )
-
-            # ── 3. Scatter OM vs DC ──
-            st.markdown("#### 3️⃣ Dispersão: Open-Meteo vs. Defesa Civil (eventos recentes)")
-            fig_scatter = go.Figure()
-            # Linha de referência 1:1
-            max_val = max(df_ev["DC (mm)"].max(), df_ev["Open-Meteo (mm)"].max()) * 1.1
-            fig_scatter.add_trace(go.Scatter(
-                x=[0, max_val], y=[0, max_val],
-                mode="lines", name="Referência 1:1",
-                line=dict(dash="dash", color="gray", width=1.5),
-            ))
-            for dur_label in df_ev["Duração"].unique():
-                sub = df_ev[df_ev["Duração"] == dur_label]
-                fig_scatter.add_trace(go.Scatter(
-                    x=sub["DC (mm)"], y=sub["Open-Meteo (mm)"],
-                    mode="markers+text",
-                    name=dur_label,
-                    text=sub["Estação DC"],
-                    textposition="top center",
-                    textfont=dict(size=8),
-                    marker=dict(size=10),
-                    hovertemplate=(
-                        "<b>%{text}</b><br>"
-                        "DC: %{x:.1f} mm<br>"
-                        "OM: %{y:.1f} mm<br>"
-                        "<extra>" + dur_label + "</extra>"
-                    ),
-                ))
-            fig_scatter.update_layout(
-                xaxis_title="Acumulado Defesa Civil (mm)",
-                yaxis_title="Acumulado Open-Meteo ERA5 (mm)",
-                height=420,
-                margin=dict(l=20, r=20, t=20, b=30),
-                legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-            )
-            st.plotly_chart(fig_scatter, width="stretch")
             st.caption(
-                "Pontos **abaixo** da linha 1:1 → Open-Meteo subestima o dado local. "
-                "Pontos **acima** → Open-Meteo superestima (raro para chuvas intensas pontuais)."
+                "🟢 ≥ 80%: boa concordância | 🟡 60–80%: subestimação moderada | 🔴 < 60%: subestimação significativa"
             )
-
-            # ── 4. Conclusão automática ──
-            ratios_validos = df_ev["OM / DC (%)"].dropna()
-            if len(ratios_validos) > 0:
-                media_ratio = ratios_validos.mean()
-                fator_correcao = 100 / media_ratio if media_ratio > 0 else None
-                st.markdown("#### 4️⃣ Conclusão — Fator de Correção Estimado")
-                col_c1, col_c2, col_c3 = st.columns(3)
-                col_c1.metric("Média OM/DC", f"{media_ratio:.1f}%",
-                              help="Percentual médio que o Open-Meteo captura dos recordes DC para eventos recentes")
-                col_c2.metric("Fator de correção estimado", f"×{fator_correcao:.2f}" if fator_correcao else "N/D",
-                              help="Multiplique os valores Open-Meteo por este fator para estimar os picos locais equivalentes")
-                col_c3.metric("Eventos comparados", f"{len(ratios_validos)}",
-                              help="Número de registros DC com data dentro da janela Open-Meteo (5 anos)")
-
-                if media_ratio < 50:
-                    st.error(
-                        f"🔴 **Subestimação significativa**: o Open-Meteo captura em média apenas **{media_ratio:.0f}%** "
-                        "dos valores registrados pela Defesa Civil. "
-                        "Isso é esperado para dados de reanálise de grade grossa em regiões com topografia complexa. "
-                        f"Para fins de projeto, considere multiplicar os valores IDF por **{fator_correcao:.1f}×**."
+    
+            # ── 2. Lookup de eventos recentes (DC na janela de 5 anos) ──
+            st.markdown("#### 2️⃣ Eventos Recentes da DC dentro da Janela Open-Meteo (5 anos)")
+            st.caption(
+                "Para eventos registrados pela DC dentro dos últimos 5 anos, buscamos o valor "
+                "que o Open-Meteo registrou na mesma janela temporal e comparamos diretamente."
+            )
+    
+            om_start = hist5_df.index.min()
+            om_end   = hist5_df.index.max()
+            event_rows = []
+    
+            for dur, df_dc in dc_val.items():
+                dh  = dur_val_h.get(dur, 1.0)
+                win = dur_val_map.get(dur, 1)
+                for _, row in df_dc.iterrows():
+                    raw_dt = row["Data/Hora"]
+                    try:
+                        dt = pd.to_datetime(raw_dt, dayfirst=True).tz_localize("America/Sao_Paulo")
+                    except Exception:
+                        continue
+                    if dt < om_start or dt > om_end:
+                        continue
+    
+                    # Janela de busca: [dt - win horas, dt + 1h]
+                    t0 = dt - pd.Timedelta(hours=win + 1)
+                    t1 = dt + pd.Timedelta(hours=2)
+                    slice_om = hist5_df.loc[t0:t1, "precipitation"]
+                    if slice_om.empty or len(slice_om) < win:
+                        continue
+                    om_event_mm = slice_om.rolling(window=win, min_periods=win).sum().max()
+                    if pd.isna(om_event_mm):
+                        continue
+    
+                    dc_mm = row["Acumulado_mm"]
+                    ratio_ev = (om_event_mm / dc_mm * 100) if dc_mm else None
+                    event_rows.append({
+                        "Duração": dur,
+                        "Estação DC": row["Estação"],
+                        "Região": row["Região"],
+                        "Data/Hora DC": raw_dt,
+                        "DC (mm)": round(dc_mm, 1),
+                        "Open-Meteo (mm)": round(om_event_mm, 1),
+                        "OM / DC (%)": round(ratio_ev, 1) if ratio_ev else None,
+                    })
+    
+            if event_rows:
+                df_ev = pd.DataFrame(event_rows).sort_values("OM / DC (%)")
+                df_ev.index = pd.RangeIndex(1, len(df_ev) + 1)
+                df_ev.index.name = "#"
+    
+                def color_ev(val):
+                    if val is None:
+                        return ""
+                    if val >= 80:
+                        return "background-color: rgba(52,168,83,0.2)"
+                    if val >= 50:
+                        return "background-color: rgba(251,188,4,0.25)"
+                    return "background-color: rgba(234,67,53,0.2)"
+    
+                st.dataframe(
+                    df_ev.style.map(color_ev, subset=["OM / DC (%)"]),
+                    width="stretch",
+                )
+    
+                # ── 3. Scatter OM vs DC ──
+                st.markdown("#### 3️⃣ Dispersão: Open-Meteo vs. Defesa Civil (eventos recentes)")
+                fig_scatter = go.Figure()
+                # Linha de referência 1:1
+                max_val = max(df_ev["DC (mm)"].max(), df_ev["Open-Meteo (mm)"].max()) * 1.1
+                fig_scatter.add_trace(go.Scatter(
+                    x=[0, max_val], y=[0, max_val],
+                    mode="lines", name="Referência 1:1",
+                    line=dict(dash="dash", color="gray", width=1.5),
+                ))
+                for dur_label in df_ev["Duração"].unique():
+                    sub = df_ev[df_ev["Duração"] == dur_label]
+                    fig_scatter.add_trace(go.Scatter(
+                        x=sub["DC (mm)"], y=sub["Open-Meteo (mm)"],
+                        mode="markers+text",
+                        name=dur_label,
+                        text=sub["Estação DC"],
+                        textposition="top center",
+                        textfont=dict(size=8),
+                        marker=dict(size=10),
+                        hovertemplate=(
+                            "<b>%{text}</b><br>"
+                            "DC: %{x:.1f} mm<br>"
+                            "OM: %{y:.1f} mm<br>"
+                            "<extra>" + dur_label + "</extra>"
+                        ),
+                    ))
+                fig_scatter.update_layout(
+                    xaxis_title="Acumulado Defesa Civil (mm)",
+                    yaxis_title="Acumulado Open-Meteo ERA5 (mm)",
+                    height=420,
+                    margin=dict(l=20, r=20, t=20, b=30),
+                    legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+                )
+                st.plotly_chart(fig_scatter, width="stretch")
+                st.caption(
+                    "Pontos **abaixo** da linha 1:1 → Open-Meteo subestima o dado local. "
+                    "Pontos **acima** → Open-Meteo superestima (raro para chuvas intensas pontuais)."
+                )
+    
+                # ── 4. Conclusão automática ──
+                ratios_validos = df_ev["OM / DC (%)"].dropna()
+                if len(ratios_validos) > 0:
+                    media_ratio = ratios_validos.mean()
+                    fator_correcao = 100 / media_ratio if media_ratio > 0 else None
+                    st.markdown("#### 4️⃣ Conclusão — Fator de Correção Estimado")
+                    col_c1, col_c2, col_c3 = st.columns(3)
+                    col_c1.metric("Média OM/DC", f"{media_ratio:.1f}%",
+                                  help="Percentual médio que o Open-Meteo captura dos recordes DC para eventos recentes")
+                    col_c2.metric("Fator de correção estimado", f"×{fator_correcao:.2f}" if fator_correcao else "N/D",
+                                  help="Multiplique os valores Open-Meteo por este fator para estimar os picos locais equivalentes")
+                    col_c3.metric("Eventos comparados", f"{len(ratios_validos)}",
+                                  help="Número de registros DC com data dentro da janela Open-Meteo (5 anos)")
+    
+                    if media_ratio < 50:
+                        st.error(
+                            f"🔴 **Subestimação significativa**: o Open-Meteo captura em média apenas **{media_ratio:.0f}%** "
+                            "dos valores registrados pela Defesa Civil. "
+                            "Isso é esperado para dados de reanálise de grade grossa em regiões com topografia complexa. "
+                            f"Para fins de projeto, considere multiplicar os valores IDF por **{fator_correcao:.1f}×**."
+                        )
+                    elif media_ratio < 75:
+                        st.warning(
+                            f"🟡 **Subestimação moderada**: Open-Meteo captura ~**{media_ratio:.0f}%** dos picos DC. "
+                            f"Fator de correção sugerido: **{fator_correcao:.2f}×**."
+                        )
+                    else:
+                        st.success(
+                            f"🟢 **Boa concordância**: Open-Meteo captura ~**{media_ratio:.0f}%** dos picos DC. "
+                            "Os dados de reanálise são razoavelmente representativos para este local."
+                        )
+            else:
+                st.info(
+                    "ℹ️ Nenhum evento recente da Defesa Civil (últimos 5 anos) foi encontrado na janela "
+                    "do Open-Meteo Archive para comparação direta. "
+                    "A comparação de máximos globais na tabela acima ainda é válida."
+                )
+    
+            st.markdown("---")
+            st.caption(
+                "**Por que os dados diferem?** O Open-Meteo Archive usa ERA5 (ECMWF), "
+                "uma reanálise global com células de grade de ~9 km. "
+                "Eventos de chuva intensa muito localizados (convectivos) são suavizados espacialmente, "
+                "resultando em intensidades menores do que as medidas por pluviômetros pontuais. "
+                "Já a Defesa Civil usa estações físicas que capturam o pico local real. "
+                "Para dimensionamento de sistemas como este poço, os dados da Defesa Civil são mais conservadores e confiáveis."
+            )
+    
+    # ──────────────────────────────────────────────────────────────────────────────────
+with tab7:
+    if tab7.open:
+        st.subheader("🛑 Maiores Chuvas Históricas – Defesa Civil de Blumenau")
+        st.caption(
+            "Dados oficiais do AlertaBlu – Últimos Rankings por duração (15min, 30min, 1h, 24h, 96h). "
+            "Fonte: [defesacivil.blumenau.sc.gov.br](https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas)"
+        )
+    
+        intensidade_sat_dc = r_pump_param / factor_mm_cm  # mm/h de saturação da bomba
+    
+        with st.spinner("⏳ Buscando dados do site da Defesa Civil de Blumenau..."):
+            dc_rankings = fetch_defesa_civil_rankings()
+    
+        if not dc_rankings:
+            st.error(
+                "Não foi possível buscar os dados da Defesa Civil de Blumenau. "
+                "Verifique a conexão com a internet ou se o site está acessível."
+            )
+        else:
+            # ── Mapa de conversão de duração para horas (para calcular intensidade em mm/h)
+            dur_para_horas = {
+                "15min": 0.25,
+                "30min": 0.5,
+                "01h": 1.0,
+                "1h": 1.0,
+                "24h": 24.0,
+                "96h": 96.0,
+            }
+    
+            # ── Filtro de Região / Bairro ──
+            # Coletar todas as regiões presentes nos dados
+            todas_regioes = sorted(set(
+                regiao
+                for df_dur in dc_rankings.values()
+                for regiao in df_dur["Região"].dropna().unique()
+            ))
+            OPCAO_TODAS = "★ Todas as regiões (máximo global)"
+            opcoes_regiao = [OPCAO_TODAS] + todas_regioes
+    
+            col_dur, col_reg = st.columns(2)
+            with col_dur:
+                dur_selecionada = st.selectbox(
+                    "Duração:",
+                    options=list(dc_rankings.keys()),
+                    key="dc_dur_select",
+                )
+            with col_reg:
+                regiao_selecionada = st.selectbox(
+                    "Região / Bairro:",
+                    options=opcoes_regiao,
+                    key="dc_regiao_select",
+                    help="Filtra o ranking pelas estações de uma região específica, ou exibe o máximo global.",
+                )
+    
+            # ── Visão geral: maiores registros de cada duração (rank 1), respeitando o filtro de região ──
+            st.subheader("🏆 Recordes Absolutos por Duração")
+            resumo_cols = st.columns(len(dc_rankings))
+            for i, (dur, df_dur) in enumerate(dc_rankings.items()):
+                if regiao_selecionada == OPCAO_TODAS:
+                    df_top = df_dur
+                else:
+                    df_top = df_dur[df_dur["Região"] == regiao_selecionada]
+                if df_top.empty:
+                    resumo_cols[i].metric(label=f"Máx. em {dur}", value="—", help=f"Nenhum registro para {regiao_selecionada}")
+                    continue
+                top = df_top.sort_values("Acumulado_mm", ascending=False).iloc[0]
+                dur_h = dur_para_horas.get(dur, 1.0)
+                intensidade_top = top["Acumulado_mm"] / dur_h if dur_h > 0 else 0
+                resumo_cols[i].metric(
+                    label=f"Máx. em {dur}",
+                    value=f"{top['Acumulado_mm']:.1f} mm",
+                    help=f"{top['Estação']} ({top['Região']}) | {top['Data/Hora']} | {intensidade_top:.1f} mm/h",
+                )
+    
+            st.markdown("---")
+    
+            # Aplicar filtro de região
+            df_sel = dc_rankings[dur_selecionada].copy()
+            regiao_sem_dados = False
+            if regiao_selecionada != OPCAO_TODAS:
+                df_sel_filtrado = df_sel[df_sel["Região"] == regiao_selecionada].copy()
+                if df_sel_filtrado.empty:
+                    # Descobrir quais durações têm dados para esta região
+                    durs_com_dados = [
+                        dur for dur, df_dur in dc_rankings.items()
+                        if not df_dur[df_dur["Região"] == regiao_selecionada].empty
+                    ]
+                    msg_durs = ", ".join(f"**{d}**" for d in durs_com_dados) if durs_com_dados else "nenhuma"
+                    st.info(
+                        f"ℹ️ A região **{regiao_selecionada}** não aparece no ranking de **{dur_selecionada}** "
+                        f"(o top-10 dessa duração é dominado por outras regiões). "
+                        f"Durações com registros para {regiao_selecionada}: {msg_durs}. "
+                        "Exibindo ranking global para referência."
                     )
-                elif media_ratio < 75:
-                    st.warning(
-                        f"🟡 **Subestimação moderada**: Open-Meteo captura ~**{media_ratio:.0f}%** dos picos DC. "
-                        f"Fator de correção sugerido: **{fator_correcao:.2f}×**."
+                    regiao_sem_dados = True
+                    # Mantém df_sel com o ranking global para exibição de fallback
+                else:
+                    df_sel = df_sel_filtrado
+            dur_h_sel = dur_para_horas.get(dur_selecionada, 1.0) if dur_selecionada else 1.0
+            df_sel["Intensidade_mmh"] = df_sel["Acumulado_mm"] / dur_h_sel
+            ultima_atualiz = df_sel["ultima_atualizacao"].iloc[0] if not df_sel.empty else ""
+    
+            st.caption(f"Tabela: Maiores Chuvas em **{dur_selecionada}** | Última atualização: {ultima_atualiz}")
+    
+            # Gráfico de barras horizontal com destaque das que saturam a bomba
+            cores = [
+                "rgba(231,76,60,0.85)" if row["Intensidade_mmh"] >= intensidade_sat_dc else "rgba(30,100,220,0.75)"
+                for _, row in df_sel.iterrows()
+            ]
+            fig_dc = go.Figure()
+            fig_dc.add_trace(go.Bar(
+                x=df_sel["Acumulado_mm"],
+                y=[f"{row['Estação']} ({row['Data/Hora']})" for _, row in df_sel.iterrows()],
+                orientation="h",
+                marker_color=cores,
+                text=[f"{v:.1f} mm" for v in df_sel["Acumulado_mm"]],
+                textposition="outside",
+                customdata=df_sel[["Estação", "Região", "Intensidade_mmh"]].values,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
+                    "Acumulado: %{x:.1f} mm<br>"
+                    f"Intensidade média: %{{customdata[2]:.1f}} mm/h<br>"
+                    "<extra></extra>"
+                ),
+            ))
+            # Linha de saturação convertida para acumulado na duração selecionada
+            acum_sat = intensidade_sat_dc * dur_h_sel
+            fig_dc.add_vline(
+                x=acum_sat,
+                line_dash="dash", line_color="red",
+            )
+            fig_dc.add_annotation(
+                x=acum_sat, y=1, yref="paper",
+                text=f"Saturação bomba<br>({acum_sat:.1f} mm em {dur_selecionada})",
+                showarrow=True, arrowhead=2, arrowcolor="red",
+                font=dict(color="red", size=10), xanchor="left",
+            )
+            fig_dc.update_layout(
+                xaxis_title=f"Acumulado em {dur_selecionada} (mm)",
+                yaxis=dict(autorange="reversed"),
+                height=max(300, 50 + 40 * len(df_sel)),
+                margin=dict(l=10, r=120, t=20, b=30),
+            )
+            st.plotly_chart(fig_dc, width="stretch")
+    
+            # Quantos registros no ranking superam a saturação da bomba?
+            n_acima_sat = (df_sel["Intensidade_mmh"] >= intensidade_sat_dc).sum()
+            if n_acima_sat > 0:
+                st.warning(
+                    f"⚠️ **{n_acima_sat} de {len(df_sel)} registros** neste ranking têm intensidade ≥ **{intensidade_sat_dc:.1f} mm/h** "
+                    f"(limite de saturação da bomba). Em eventos como esses, o poço encheria mais rápido do que a bomba conseguiria esvaziar."
+                )
+            else:
+                st.success(
+                    f"✅ Nenhum registro deste ranking supera o limite de saturação da bomba ({intensidade_sat_dc:.1f} mm/h)."
+                )
+    
+            # ── Tabela detalhada ──
+            st.subheader("📋 Tabela Completa")
+            df_display = df_sel[["Estação", "Região", "Data/Hora", "Acumulado_mm", "Intensidade_mmh"]].copy()
+            df_display.columns = ["Estação", "Região", "Data/Hora", f"Acumulado em {dur_selecionada} (mm)", "Intensidade média (mm/h)"]
+            df_display[f"Acumulado em {dur_selecionada} (mm)"] = df_display[f"Acumulado em {dur_selecionada} (mm)"].round(1)
+            df_display["Intensidade média (mm/h)"] = df_display["Intensidade média (mm/h)"].round(1)
+            df_display.index = pd.RangeIndex(1, len(df_display) + 1)
+            df_display.index.name = "#"
+            st.dataframe(df_display, width="stretch")
+    
+            st.markdown("---")
+    
+            # ── Contexto IDF: comparar maiores chuvas do DC com a IDF Gumbel (se disponível) ──
+            st.subheader("📈 Contexto IDF: Maiores Chuvas Históricas vs. Curva Gumbel (Open-Meteo)")
+            st.caption(
+                "Pontos vermelhos = recordes da Defesa Civil de Blumenau | "
+                "Linhas = curvas IDF estimadas da tab Histórico & IDF (5 anos)"
+            )
+    
+            # Garantir acesso aos resultados IDF calculados (recalcula via cache se necessário)
+            idf_res_found = globals().get("idf_results", None) or locals().get("idf_results", None)
+            if not idf_res_found:
+                idf_res_found, _ = compute_gumbel_idf_results(latitude, longitude, era5_correction)
+            idf_results = idf_res_found
+            idf_ok = True if idf_results else False
+    
+            # Construir pontos dos recordes da Defesa Civil (respeitando o filtro de região)
+            dc_points_x = []  # duração em horas
+            dc_points_y = []  # intensidade mm/h
+            dc_points_label = []
+            for dur, df_dur in dc_rankings.items():
+                dh = dur_para_horas.get(dur, None)
+                if dh is None:
+                    continue
+                df_pts = df_dur if regiao_selecionada == OPCAO_TODAS else df_dur[df_dur["Região"] == regiao_selecionada]
+                if df_pts.empty:
+                    continue
+                top = df_pts.sort_values("Acumulado_mm", ascending=False).iloc[0]
+                dc_points_x.append(dh)
+                dc_points_y.append(top["Acumulado_mm"] / dh)
+                dc_points_label.append(f"{top['Estação']} ({dur}: {top['Acumulado_mm']:.0f}mm)")
+    
+            fig_ctx = go.Figure()
+    
+            if idf_ok:
+                duracoes_h_ctx = [1, 2, 3, 6, 12, 24]
+                palette_ctx = ["#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"]
+                trs_ctx = [2, 5, 10, 25, 50, 100]
+                for i_tr, tr in enumerate(trs_ctx):
+                    y_ctx = [idf_results.get(d, {}).get(tr, None) for d in duracoes_h_ctx]
+                    fig_ctx.add_trace(go.Scatter(
+                        x=duracoes_h_ctx, y=y_ctx,
+                        mode="lines",
+                        name=f"Tr={tr}a (Gumbel)",
+                        line=dict(color=palette_ctx[i_tr % len(palette_ctx)],
+                                  width=2.5 if tr == 25 else 1.2,
+                                  dash="solid" if tr in [25, 100] else "dot"),
+                        opacity=0.7,
+                    ))
+    
+            # Pontos dos recordes da Defesa Civil
+            if dc_points_x:
+                fig_ctx.add_trace(go.Scatter(
+                    x=dc_points_x, y=dc_points_y,
+                    mode="markers+text",
+                    name="Recorde Defesa Civil BNU",
+                    marker=dict(size=12, color="red", symbol="star"),
+                    text=dc_points_label,
+                    textposition="top center",
+                    textfont=dict(size=9),
+                ))
+    
+            # Linha de saturação horizontal
+            fig_ctx.add_hline(
+                y=intensidade_sat_dc,
+                line_dash="dash", line_color="darkred",
+                annotation_text=f"Saturação bomba ({intensidade_sat_dc:.1f} mm/h)",
+                annotation_position="top right",
+            )
+            fig_ctx.update_layout(
+                xaxis=dict(
+                    title="Duração (horas)",
+                    tickvals=[0.25, 0.5, 1, 2, 3, 6, 12, 24, 96],
+                    ticktext=["15min", "30min", "1h", "2h", "3h", "6h", "12h", "24h", "96h"],
+                ),
+                yaxis_title="Intensidade média (mm/h)",
+                legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center"),
+                height=480,
+                margin=dict(l=20, r=20, t=20, b=80),
+            )
+            st.plotly_chart(fig_ctx, width="stretch")
+    
+            if not idf_ok:
+                st.info(
+                    "ℹ️ Para ver as curvas IDF junto com os recordes, acesse primeiro a aba "
+                    "**📊 Histórico & IDF (5 anos)** para que os dados sejam calculados."
+                )
+    
+            st.markdown("---")
+            st.info(
+                "🔗 Dados originais: [Defesa Civil de Blumenau – Maiores Chuvas]("
+                "https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas). "
+                "Os dados são atualizados pelo AlertaBlu conforme novos eventos ocorrem."
+            )
+    
+    
+    
+        # ── SEÇÃO EXCLUSIVA: ESTAÇÃO PONTE ADOLFO KONDER (GUMBEL & EXTREMOS LOCALIZADOS) ──
+        st.markdown("---")
+        st.subheader("🌊 Estação Pluviométrica Ponte Adolfo Konder — Análise de Gumbel & Recordes (2021–2025)")
+        st.caption(
+            "Seção exclusiva dedicada à Estação Pluviométrica física instalada na Ponte Adolfo Konder (Centro de Blumenau). "
+            "Contém a análise de frequência de extremos por Ajuste da Distribuição de Gumbel e os maiores picos gravados no poço de monitoramento."
+        )
+    
+        konder_sec_df = load_adolfo_konder_dataset()
+        if not konder_sec_df.empty:
+            pico_15m_rec = konder_sec_df["precip_15min"].max()
+            pico_15m_dt = konder_sec_df["precip_15min"].idxmax()
+            pico_1h_rec = konder_sec_df["precipitation"].max()
+            pico_1h_dt = konder_sec_df["precipitation"].idxmax()
+            tot_leituras_k = len(konder_sec_df)
+    
+            mk1, mk2, mk3, mk4 = st.columns(4)
+            mk1.metric("Recorde 15min (Pulso)", f"{pico_15m_rec:.1f} mm", help=f"Data: {pd.to_datetime(pico_15m_dt).strftime('%d/%m/%Y %H:%M')} | Taxa inst.: {pico_15m_rec*4:.1f} mm/h")
+            mk2.metric("Recorde Horário (1h)", f"{pico_1h_rec:.1f} mm/h", help=f"Data: {pd.to_datetime(pico_1h_dt).strftime('%d/%m/%Y %H:%M')}")
+            mk3.metric("Período Coberto", "2021–2025", help=f"{konder_sec_df.index.min().strftime('%d/%m/%Y')} a {konder_sec_df.index.max().strftime('%d/%m/%Y')}")
+            mk4.metric("Total de Leituras", f"{tot_leituras_k:,}", help="Intervalos contínuos de 15 minutos")
+    
+            st.markdown("#### 📈 Curvas IDF de Gumbel — Estação Ponte Adolfo Konder")
+            st.caption("Intensidades máximas calculadas por Gumbel (método dos momentos) sobre as séries reais de 15min a 24h.")
+    
+            dur_map_k = {
+                "15min": (0.25, konder_sec_df["precip_mmh"]),
+                "30min": (0.5, konder_sec_df["precip_15min"].rolling(2, min_periods=1).sum() * 2.0),
+                "1h": (1.0, konder_sec_df["precip_15min"].rolling(4, min_periods=1).sum()),
+                "2h": (2.0, konder_sec_df["precip_15min"].rolling(8, min_periods=1).sum() / 2.0),
+                "6h": (6.0, konder_sec_df["precip_15min"].rolling(24, min_periods=1).sum() / 6.0),
+                "24h": (24.0, konder_sec_df["precip_15min"].rolling(96, min_periods=1).sum() / 24.0),
+            }
+            trs_k = [2, 5, 10, 25, 50, 100]
+            idf_k_dict = {}
+    
+            for d_lbl, (dh_k, s_k) in dur_map_k.items():
+                ann_max_k = np.asarray(s_k.groupby(pd.to_datetime(s_k.index).year).max().dropna().values, dtype=np.float64)
+                if len(ann_max_k) >= 2:
+                    alpha_k, u_k = fit_gumbel(ann_max_k)
+                    idf_k_dict[d_lbl] = {tr: round(max(gumbel_quantile(alpha_k, u_k, tr), 0.0), 1) for tr in trs_k}
+    
+            if idf_k_dict:
+                idf_k_df = pd.DataFrame(idf_k_dict).T
+                idf_k_df.columns = [f"Tr={tr}a" for tr in trs_k]
+                idf_k_df.index.name = "Duração"
+    
+                palette_k = ["#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"]
+                fig_idf_k = go.Figure()
+                durs_x = list(idf_k_dict.keys())
+                for idx_tr, tr_val in enumerate(trs_k):
+                    y_vals_k = [idf_k_dict[d_lbl][tr_val] for d_lbl in durs_x]
+                    fig_idf_k.add_trace(go.Scatter(
+                        x=durs_x, y=y_vals_k, mode="lines+markers",
+                        name=f"Tr = {tr_val} anos",
+                        line=dict(color=palette_k[idx_tr % len(palette_k)], width=2.5 if tr_val == 25 else 1.5),
+                        marker=dict(size=7),
+                    ))
+                fig_idf_k.update_layout(
+                    title="Curvas IDF Gumbel — Estação Ponte Adolfo Konder (2021–2025)",
+                    xaxis_title="Duração", yaxis_title="Intensidade Média (mm/h)",
+                    legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
+                    height=420, margin=dict(l=20, r=20, t=40, b=50),
+                )
+                st.plotly_chart(fig_idf_k, width="stretch")
+    
+                st.markdown("##### 📋 Tabela IDF Gumbel (Ponte Adolfo Konder — mm/h)")
+                def highlight_tr25_k(col):
+                    return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
+                st.dataframe(idf_k_df.style.apply(highlight_tr25_k), width="stretch")
+    
+            st.markdown("#### 🏆 Maiores Picos Registrados na Ponte Adolfo Konder")
+            tab_p1, tab_p2 = st.tabs([":material/bolt: Top 10 Pulsos de 15 Minutos", ":material/rainy: Top 10 Eventos Horários (1h)"], on_change="rerun")
+    
+            with tab_p1:
+                if tab_p1.open:
+                    top_15m = konder_sec_df.sort_values("precip_15min", ascending=False).head(10).copy()
+                    top_15m_display = []
+                    for dt_k, r_k in top_15m.iterrows():
+                        val_15 = r_k["precip_15min"]
+                        rate_h = val_15 * 4.0
+                        sat_status = "🚨 Excede Bomba 1" if rate_h > intensidade_sat_dc else "✅ Suportado"
+                        top_15m_display.append({
+                            "Data / Hora": dt_k.strftime("%d/%m/%Y %H:%M") if hasattr(dt_k, "strftime") else str(dt_k),
+                            "Precipitação (mm / 15min)": f"{val_15:.1f} mm",
+                            "Taxa Horária Eq. (mm/h)": f"{rate_h:.1f} mm/h",
+                            "Entrada no Poço (cm/h)": f"{rate_h * factor_mm_cm:.1f} cm/h",
+                            "Status": sat_status,
+                        })
+                    st.dataframe(pd.DataFrame(top_15m_display), width="stretch")
+        
+            with tab_p2:
+                if tab_p2.open:
+                    top_1h = konder_sec_df["precipitation"].resample("1h").sum().sort_values(ascending=False).head(10).copy()
+                    top_1h_display = []
+                    for dt_k, val_1h in top_1h.items():
+                        sat_status = "🚨 Excede Bomba 1" if val_1h > intensidade_sat_dc else "✅ Suportado"
+                        top_1h_display.append({
+                            "Data / Hora": dt_k.strftime("%d/%m/%Y %H:00") if hasattr(dt_k, "strftime") else str(dt_k),
+                            "Chuva Acumulada 1h (mm)": f"{val_1h:.1f} mm/h",
+                            "Entrada no Poço (cm/h)": f"{val_1h * factor_mm_cm:.1f} cm/h",
+                            "Status": sat_status,
+                        })
+                    st.dataframe(pd.DataFrame(top_1h_display), width="stretch")
+        
+        # ──────────────────────────────────────────────────────────────────────────────────
+with tab8:
+    if tab8.open:
+        st.subheader("🗂️ Diagrama do Poço de Drenagem")
+        st.caption("Diagrama esquemático em escala real a partir do Topo do Poço (0 cm). Atualiza automaticamente ao alterar qualquer parâmetro.")
+    
+        # ── Posições Y em cm a partir do Topo do Poço (0.0 cm = Topo do Poço) ──
+        y_topo = 0.0
+        y_sensor = abs(dist_borda_cm)            # Ex: +70.0 cm (pendurado dentro do poço)
+        y_risco = y_sensor + 20.0                # Ex: +90.0 cm (20 cm da água ao sensor)
+        y_don = d_on                             # Ex: +160.0 cm abaixo do topo
+        y_doff = d_off                           # Ex: +183.0 cm abaixo do topo
+        y_don2 = d_on2
+        y_doff2 = d_off2
+        y_fundo = FUNDODOPOCO                    # Ex: +210.0 cm abaixo do topo
+    
+        # Nível atual da água (distância a partir do topo do poço)
+        if latest_distance is not None:
+            y_agua = latest_distance
+        else:
+            y_agua = y_don  # fallback
+    
+        dist_sensor_agua = max(y_agua - y_sensor, 0.0)
+    
+        y_top = -20.0                # Margem acima do topo do poço
+        y_bottom = y_fundo + 20.0    # Margem abaixo do fundo
+    
+        w = 1.0       # Largura do poço
+        wwall = 0.08  # Espessura da parede
+    
+        fig_diag = go.Figure()
+    
+        # 1. Fundo do poço
+        fig_diag.add_shape(type="rect",
+            x0=-w/2, x1=w/2, y0=y_fundo, y1=y_fundo + 10,
+            fillcolor="#795548", line_color="#4e342e", line_width=2)
+    
+        # 2. Paredes do poço (do topo até o fundo)
+        for xi0, xi1 in [(-w/2 - wwall, -w/2), (w/2, w/2 + wwall)]:
+            fig_diag.add_shape(type="rect",
+                x0=xi0, x1=xi1, y0=y_topo, y1=y_fundo + 10,
+                fillcolor="#9e9e9e", line_color="#616161", line_width=1.5)
+    
+        # 3. Suporte e caixa do Sensor (pendurado dentro do poço)
+        fig_diag.add_shape(type="rect",
+            x0=-w/4, x1=w/4, y0=y_sensor - 5, y1=y_sensor,
+            fillcolor="#ff9800", line_color="#e67e22", line_width=2)
+    
+        # Cabo/haste de sustentação do sensor vindo do topo (0 cm) até o sensor (+70 cm)
+        fig_diag.add_shape(type="line",
+            x0=0, x1=0, y0=y_topo, y1=y_sensor - 5,
+            line=dict(color="#333333", width=2.5, dash="solid"))
+    
+        # 4. Faixa de Risco do Sensor (até 20 cm abaixo do sensor)
+        fig_diag.add_shape(type="rect",
+            x0=-w/2, x1=w/2, y0=y_sensor, y1=y_risco,
+            fillcolor="rgba(231,76,60,0.15)", line_width=0)
+        fig_diag.add_shape(type="line",
+            x0=-w/2, x1=w/2, y0=y_risco, y1=y_risco,
+            line=dict(color="#e74c3c", width=1.5, dash="dot"))
+    
+        # 5. Zona de atuação da Bomba 1 (entre Liga e Desliga)
+        fig_diag.add_shape(type="rect",
+            x0=-w/2, x1=w/2, y0=min(y_don, y_doff), y1=max(y_don, y_doff),
+            fillcolor="rgba(52,152,219,0.15)", line_width=0)
+    
+        # 6. Água atual no poço (do nível atual da água até o fundo)
+        if y_agua <= y_fundo:
+            fig_diag.add_shape(type="rect",
+                x0=-w/2 + 0.01, x1=w/2 - 0.01,
+                y0=max(y_agua, y_top), y1=y_fundo,
+                fillcolor="rgba(30,144,255,0.40)",
+                line_color="rgba(30,144,255,0.7)", line_width=1.5)
+    
+        # 7. Linha do Topo do Poço (0 cm)
+        fig_diag.add_shape(type="line",
+            x0=-w/2 - wwall, x1=w/2 + wwall, y0=0, y1=0,
+            line=dict(color="black", width=3.5))
+    
+        # 8. Linhas de liga/desliga bomba
+        diag_lines = [(y_don, f"Bomba 1 LIGA ({y_don:.1f} cm)", "#e74c3c"), (y_doff, f"Bomba 1 DESLIGA ({y_doff:.1f} cm)", "#27ae60")]
+        if tem_bomba2:
+            diag_lines.extend([(y_don2, f"Bomba 2 LIGA ({y_don2:.1f} cm)", "#d35400"), (y_doff2, f"Bomba 2 DESLIGA ({y_doff2:.1f} cm)", "#16a085")])
+    
+        for y_lv, lbl, clr in diag_lines:
+            fig_diag.add_shape(type="line",
+                x0=-w/2, x1=w/2, y0=y_lv, y1=y_lv,
+                line=dict(color=clr, width=2, dash="dash"))
+    
+        # 9. Linha do nível atual da água
+        fig_diag.add_shape(type="line",
+            x0=-w/2 + 0.01, x1=w/2 - 0.01, y0=y_agua, y1=y_agua,
+            line=dict(color="#0056b3", width=3))
+    
+        # 10. Anotações laterais
+        ann_x = w/2 + wwall + 0.08
+        annotations = [
+            dict(x=ann_x, y=0, text="<b>Topo do Poço</b> (0 cm)",
+                 xanchor="left", showarrow=True, ax=30, ay=0,
+                 font=dict(color="black", size=12),
+                 arrowcolor="black", arrowwidth=2),
+            dict(x=ann_x, y=y_sensor, text=f"<b>Sensor Físico</b><br>+{y_sensor:.0f} cm pendurado no poço",
+                 xanchor="left", showarrow=True, ax=30, ay=0,
+                 font=dict(color="#e67e22", size=11),
+                 arrowcolor="#e67e22", arrowwidth=1.5),
+            dict(x=ann_x, y=y_risco, text=f"<b>Risco Submersão</b><br>+{y_risco:.0f} cm (20 cm do sensor)",
+                 xanchor="left", showarrow=True, ax=30, ay=0,
+                 font=dict(color="#e74c3c", size=10),
+                 arrowcolor="#e74c3c", arrowwidth=1.2),
+            dict(x=ann_x, y=y_agua,
+                 text=f"<b>Nível Atual da Água</b><br>+{y_agua:.1f} cm do topo (sensor lê: {dist_sensor_agua:.1f} cm)",
+                 xanchor="left", showarrow=True, ax=30, ay=0,
+                 font=dict(color="#0056b3", size=11),
+                 arrowcolor="#0056b3", arrowwidth=1.8),
+            dict(x=-ann_x, y=y_don,
+                 text=f"Bomba 1 LIGA<br>+{y_don:.1f} cm do topo",
+                 xanchor="right", showarrow=True, ax=-30, ay=0,
+                 font=dict(color="#e74c3c", size=10),
+                 arrowcolor="#e74c3c", arrowwidth=1.2),
+            dict(x=-ann_x, y=y_doff,
+                 text=f"Bomba 1 DESLIGA<br>+{y_doff:.1f} cm do topo",
+                 xanchor="right", showarrow=True, ax=-30, ay=0,
+                 font=dict(color="#27ae60", size=10),
+                 arrowcolor="#27ae60", arrowwidth=1.2),
+            dict(x=-ann_x, y=y_fundo,
+                 text=f"Fundo do poço<br>+{y_fundo:.0f} cm do topo",
+                 xanchor="right", showarrow=True, ax=-30, ay=0,
+                 font=dict(color="#795548", size=10),
+                 arrowcolor="#795548", arrowwidth=1.2),
+        ]
+    
+        fig_diag.update_layout(
+            title=f"📐 Corte Esquemático do Poço em Escala Real (Topo do Poço = 0 cm | Nível Atual = {y_agua:.1f} cm)",
+            xaxis=dict(range=[-w*1.6, w*1.6], showgrid=False, zeroline=False, showticklabels=False),
+            yaxis=dict(autorange="reversed", range=[y_bottom, y_top], title="Profundidade a partir do Topo do Poço (cm)"),
+            annotations=annotations,
+            height=650,
+            margin=dict(l=20, r=20, t=50, b=20),
+            plot_bgcolor="#f8f9fa",
+            paper_bgcolor="white",
+        )
+    
+        st.plotly_chart(fig_diag, width="stretch")
+    
+        col_l1, col_l2, col_l3 = st.columns(3)
+        col_l1.metric("Profundidade Total do Poço", f"{y_fundo:.0f} cm",
+                      help="Fundo do poço a partir do topo superior")
+        if latest_distance is not None:
+            altura_agua_cm = max(y_fundo - y_agua, 0.0)
+            col_l2.metric("Lâmina d'Água no Fundo", f"{altura_agua_cm:.0f} cm")
+            col_l3.metric("Distância da Água ao Sensor", f"{dist_sensor_agua:.0f} cm",
+                          delta=f"Sensor pendurado a {y_sensor:.0f} cm do topo")
+        else:
+            col_l2.metric("Lâmina d'Água", "Sem leitura")
+            col_l3.metric("Distância ao Sensor", "Sem leitura")
+        col_l1.metric("Capacidade total do poço", f"{capacidade_total_cm:.0f} cm",
+                      help="Fundo do poço até a borda superior")
+        if latest_distance is not None:
+            dist_ao_transbordo = latest_distance + dist_borda_cm
+            altura_agua_cm = max(FUNDODOPOCO - latest_distance, 0.0)
+            col_l2.metric("Nível da água (acima do fundo)", f"{altura_agua_cm:.0f} cm")
+            col_l3.metric("📦 Folga até a borda", f"{dist_ao_transbordo:.0f} cm",
+                          delta=f"{dist_ao_transbordo / capacidade_total_cm * 100:.0f}% da capacidade")
+        else:
+            col_l2.metric("Nível da água", "Sem leitura")
+            col_l3.metric("📦 Folga até a borda", "Sem leitura")
+    
+        st.markdown("""
+        **Legenda:**
+        - 🟥 Zona vermelha: região acima do sensor (borda do poço) \u2014 água aqui = transbordamento
+        - 🟦 Zona azul: faixa de operação da bomba (liga a {y_don:.0f} cm, desliga a {y_doff:.0f} cm)
+        - 🟦 Água atual: nível medido pelo sensor
+        - 🟠 Sensor: ponto de referência zero (distância = 0)
+        """.format(y_don=y_don, y_doff=y_doff))
+    
+    # ────────────────────────────────────────────────────────────────────────────────
+    # TAB 9 – RELATÓRIO DE ADEQUAÇÃO DA BOMBA
+    # ────────────────────────────────────────────────────────────────────────────────
+with tab9:
+    if tab9.open:
+        import datetime as _dt
+        try:
+            from zoneinfo import ZoneInfo
+            _tz_br = ZoneInfo("America/Sao_Paulo")
+        except Exception:
+            _tz_br = _dt.timezone(_dt.timedelta(hours=-3))
+        _now_br = _dt.datetime.now(_tz_br)
+    
+        st.subheader("📋 Relatório de Adequação da Bomba de Drenagem")
+        st.caption(
+            "Relatório técnico automático baseado nos parâmetros do sistema, Curvas IDF de Gumbel da "
+            "Estação Pluviométrica Ponte Adolfo Konder (Blumenau) e normas ABNT NBR 10844. Atualizado a cada re-execução."
+        )
+    
+        # ── Parâmetros derivados ────────────────────────────────────────────────────
+        area_poco_m2 = round(100.0 / fator_m3h_para_cmh, 2)
+        area_drenagem_m2 = round(factor_mm_cm * area_poco_m2 / 0.1, 1)
+        volume_buffer_L = round(dist_borda_cm * 0.01 * area_poco_m2 * 1000, 0)
+    
+        # ── Buscar dados históricos (cache compartilhado) ───────────────────────────
+        _dc_rep = fetch_defesa_civil_rankings()
+        _oldest_rep = "2015-01-08"
+        if _dc_rep:
+            _all_d = []
+            for _dfr in _dc_rep.values():
+                for _rr in _dfr["Data/Hora"]:
+                    try:
+                        _all_d.append(pd.to_datetime(_rr, dayfirst=True))
+                    except Exception:
+                        pass
+            if _all_d:
+                _oldest_rep = min(_all_d).strftime("%Y-%m-%d")
+    
+        with st.spinner("Carregando dados históricos para o relatório…"):
+            rep_hist_df, _rep_err = fetch_historical_5years_precip(
+                latitude, longitude, start_date_str=_oldest_rep
+            )
+    
+        if not rep_hist_df.empty and era5_correction != 1.0:
+            rep_hist_df = rep_hist_df.copy()
+            rep_hist_df["precipitation"] = rep_hist_df["precipitation"] * era5_correction
+    
+        # ── Obter dados IDF da Estação Ponte Adolfo Konder (Medições Locais Reais) ──
+        _konder_rep_df = load_adolfo_konder_dataset()
+        _fonte_idf_rep = "Estação Pluviométrica Ponte Adolfo Konder (Medições Locais Reais - Blumenau 2021–2025)"
+        _usou_konder_rep = False
+    
+        _DURACOES = {"1h": 1, "2h": 2, "3h": 3, "6h": 6, "12h": 12, "24h": 24}
+        _DURACOES_K = {"1h": 4, "2h": 8, "3h": 12, "6h": 24, "12h": 48, "24h": 96}
+        _TRS = [2, 5, 10, 25, 50, 100]
+        _TR_NORMA = 25
+    
+        idf_rep = {}    # {label: {tr: intensity_mmh}}
+    
+        if not _konder_rep_df.empty:
+            _usou_konder_rep = True
+            for _lbl, _n15 in _DURACOES_K.items():
+                _roll = _konder_rep_df["precip_15min"].rolling(_n15, min_periods=1).sum()
+                _nh = _n15 / 4.0
+                _intens = _roll / _nh
+                _ann = _intens.groupby(pd.DatetimeIndex(_intens.index).year).max().dropna()
+                if len(_ann) >= 2:
+                    _a, _u = fit_gumbel(np.asarray(_ann.values, dtype=np.float64))
+                    idf_rep[_lbl] = {tr: round(gumbel_quantile(_a, _u, tr), 1) for tr in _TRS}
+    
+        if not idf_rep:
+            _fonte_idf_rep = f"Modelo ERA5 (Open-Meteo ×{era5_correction:.2f})"
+            if not rep_hist_df.empty:
+                for _lbl, _nh in {"1h": 1, "2h": 2, "3h": 3, "6h": 6, "12h": 12, "24h": 24}.items():
+                    _roll = rep_hist_df["precipitation"].rolling(_nh).sum()
+                    _intens = _roll / _nh
+                    _ann = _intens.groupby(_intens.index.year).max().dropna()
+                    if len(_ann) >= 3:
+                        _a, _u = fit_gumbel(_ann.values)
+                        idf_rep[_lbl] = {tr: round(gumbel_quantile(_a, _u, tr), 1) for tr in _TRS}
+    
+        # ── Análise de adequação (referência: 1h) ──────────────────────────────────
+        _dur_ref = "1h"
+        adequacy_rep = {}
+        if _dur_ref in idf_rep:
+            for tr in _TRS:
+                q_mmh = idf_rep[_dur_ref][tr]
+                q_cmh = round(q_mmh * factor_mm_cm, 1)
+                margem = round((r_pump_total_param - q_cmh) / q_cmh * 100, 1)
+                adequacy_rep[tr] = {
+                    "q_mmh": q_mmh, "q_cmh": q_cmh,
+                    "pump_cmh": round(r_pump_total_param, 1),
+                    "adequate": bool(r_pump_total_param >= q_cmh),
+                    "margem_pct": margem,
+                }
+    
+        vered = adequacy_rep.get(_TR_NORMA, {})
+        _adeq_val = vered.get("adequate", None)
+        bomba_ok = bool(_adeq_val) if _adeq_val is not None else None
+    
+        # ── CABEÇALHO ───────────────────────────────────────────────────────────────
+        st.markdown("---")
+        col_tit, col_badge = st.columns([3, 1])
+        with col_tit:
+            st.markdown("## Relatório de Adequação Hidráulica")
+            st.markdown(
+                f"**Local:** lat {latitude:.4f}, lon {longitude:.4f} &nbsp;|&nbsp; "
+                f"**Emitido:** {_now_br.strftime('%d/%m/%Y %H:%M')} (Horário de Brasília)"
+            )
+        with col_badge:
+            if bomba_ok is True:
+                st.success("BOMBA ADEQUADA\n\nTr 25a – NBR 10844")
+            elif bomba_ok is False:
+                st.error("BOMBA INSUFICIENTE\n\nTr 25a – NBR 10844")
+            else:
+                st.warning("DADOS INSUFICIENTES")
+    
+        # ── Diagnóstico automático quando dados insuficientes ───────────────────────
+        if bomba_ok is None:
+            with st.expander("Diagnóstico — por que os dados são insuficientes?", icon=":material/find_in_page:", expanded=True):
+                st.markdown("**Verificando cada etapa do pipeline de dados:**")
+    
+                # 1. Fetch histórico
+                if rep_hist_df.empty:
+                    st.error(f"❌ **Dados históricos ERA5 não carregados.**  \nErro retornado: `{_rep_err}`")
+                    st.markdown(
+                        "**Possíveis causas:**\n"
+                        "- Sem conexão com a internet\n"
+                        "- API Open-Meteo Archive temporariamente indisponível\n"
+                        "- Coordenadas inválidas (lat/lon fora do range aceito pela API)\n\n"
+                        f"**Parâmetros enviados:** lat={latitude}, lon={longitude}, start={_oldest_rep}"
                     )
                 else:
+                    _anos_diag = sorted(rep_hist_df.index.year.unique())
+                    _n_rows = len(rep_hist_df)
                     st.success(
-                        f"🟢 **Boa concordância**: Open-Meteo captura ~**{media_ratio:.0f}%** dos picos DC. "
-                        "Os dados de reanálise são razoavelmente representativos para este local."
+                        f"✅ **Dados ERA5 carregados:** {_n_rows:,} horas | "
+                        f"Período: {_anos_diag[0]}–{_anos_diag[-1]} | "
+                        f"Anos disponíveis: {len(_anos_diag)}"
                     )
-        else:
-            st.info(
-                "ℹ️ Nenhum evento recente da Defesa Civil (últimos 5 anos) foi encontrado na janela "
-                "do Open-Meteo Archive para comparação direta. "
-                "A comparação de máximos globais na tabela acima ainda é válida."
-            )
-
-        st.markdown("---")
-        st.caption(
-            "**Por que os dados diferem?** O Open-Meteo Archive usa ERA5 (ECMWF), "
-            "uma reanálise global com células de grade de ~9 km. "
-            "Eventos de chuva intensa muito localizados (convectivos) são suavizados espacialmente, "
-            "resultando em intensidades menores do que as medidas por pluviômetros pontuais. "
-            "Já a Defesa Civil usa estações físicas que capturam o pico local real. "
-            "Para dimensionamento de sistemas como este poço, os dados da Defesa Civil são mais conservadores e confiáveis."
-        )
-
-# ──────────────────────────────────────────────────────────────────────────────────
-with tab7:
-    st.subheader("🛑 Maiores Chuvas Históricas – Defesa Civil de Blumenau")
-    st.caption(
-        "Dados oficiais do AlertaBlu – Últimos Rankings por duração (15min, 30min, 1h, 24h, 96h). "
-        "Fonte: [defesacivil.blumenau.sc.gov.br](https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas)"
-    )
-
-    intensidade_sat_dc = r_pump_param / factor_mm_cm  # mm/h de saturação da bomba
-
-    with st.spinner("⏳ Buscando dados do site da Defesa Civil de Blumenau..."):
-        dc_rankings = fetch_defesa_civil_rankings()
-
-    if not dc_rankings:
-        st.error(
-            "Não foi possível buscar os dados da Defesa Civil de Blumenau. "
-            "Verifique a conexão com a internet ou se o site está acessível."
-        )
-    else:
-        # ── Mapa de conversão de duração para horas (para calcular intensidade em mm/h)
-        dur_para_horas = {
-            "15min": 0.25,
-            "30min": 0.5,
-            "01h": 1.0,
-            "1h": 1.0,
-            "24h": 24.0,
-            "96h": 96.0,
-        }
-
-        # ── Filtro de Região / Bairro ──
-        # Coletar todas as regiões presentes nos dados
-        todas_regioes = sorted(set(
-            regiao
-            for df_dur in dc_rankings.values()
-            for regiao in df_dur["Região"].dropna().unique()
-        ))
-        OPCAO_TODAS = "★ Todas as regiões (máximo global)"
-        opcoes_regiao = [OPCAO_TODAS] + todas_regioes
-
-        col_dur, col_reg = st.columns(2)
-        with col_dur:
-            dur_selecionada = st.selectbox(
-                "Duração:",
-                options=list(dc_rankings.keys()),
-                key="dc_dur_select",
-            )
-        with col_reg:
-            regiao_selecionada = st.selectbox(
-                "Região / Bairro:",
-                options=opcoes_regiao,
-                key="dc_regiao_select",
-                help="Filtra o ranking pelas estações de uma região específica, ou exibe o máximo global.",
-            )
-
-        # ── Visão geral: maiores registros de cada duração (rank 1), respeitando o filtro de região ──
-        st.subheader("🏆 Recordes Absolutos por Duração")
-        resumo_cols = st.columns(len(dc_rankings))
-        for i, (dur, df_dur) in enumerate(dc_rankings.items()):
-            if regiao_selecionada == OPCAO_TODAS:
-                df_top = df_dur
-            else:
-                df_top = df_dur[df_dur["Região"] == regiao_selecionada]
-            if df_top.empty:
-                resumo_cols[i].metric(label=f"Máx. em {dur}", value="—", help=f"Nenhum registro para {regiao_selecionada}")
-                continue
-            top = df_top.sort_values("Acumulado_mm", ascending=False).iloc[0]
-            dur_h = dur_para_horas.get(dur, 1.0)
-            intensidade_top = top["Acumulado_mm"] / dur_h if dur_h > 0 else 0
-            resumo_cols[i].metric(
-                label=f"Máx. em {dur}",
-                value=f"{top['Acumulado_mm']:.1f} mm",
-                help=f"{top['Estação']} ({top['Região']}) | {top['Data/Hora']} | {intensidade_top:.1f} mm/h",
-            )
-
-        st.markdown("---")
-
-        # Aplicar filtro de região
-        df_sel = dc_rankings[dur_selecionada].copy()
-        regiao_sem_dados = False
-        if regiao_selecionada != OPCAO_TODAS:
-            df_sel_filtrado = df_sel[df_sel["Região"] == regiao_selecionada].copy()
-            if df_sel_filtrado.empty:
-                # Descobrir quais durações têm dados para esta região
-                durs_com_dados = [
-                    dur for dur, df_dur in dc_rankings.items()
-                    if not df_dur[df_dur["Região"] == regiao_selecionada].empty
-                ]
-                msg_durs = ", ".join(f"**{d}**" for d in durs_com_dados) if durs_com_dados else "nenhuma"
-                st.info(
-                    f"ℹ️ A região **{regiao_selecionada}** não aparece no ranking de **{dur_selecionada}** "
-                    f"(o top-10 dessa duração é dominado por outras regiões). "
-                    f"Durações com registros para {regiao_selecionada}: {msg_durs}. "
-                    "Exibindo ranking global para referência."
+    
+                # 2. Data de início (Defesa Civil)
+                if _dc_rep:
+                    st.success(f"✅ **Defesa Civil:** dados carregados. Data mais antiga encontrada: `{_oldest_rep}`")
+                else:
+                    st.warning(
+                        f"⚠️ **Defesa Civil:** sem dados (scraping falhou ou cache ausente). "
+                        f"Usando data de início padrão: `{_oldest_rep}`"
+                    )
+    
+                # 3. IDF por duração
+                _anos_diag = list(pd.DatetimeIndex(rep_hist_df.index).year.unique()) if not rep_hist_df.empty else []
+                st.markdown("**Status da curva IDF por duração:**")
+                _idf_diag_rows = []
+                if not rep_hist_df.empty:
+                    for _lbl2, _nh2 in _DURACOES.items():
+                        _roll2 = rep_hist_df["precipitation"].rolling(_nh2).sum()
+                        _intens2 = _roll2 / _nh2
+                        _ann2 = _intens2.groupby(pd.DatetimeIndex(_intens2.index).year).max().dropna()
+                        _ok = len(_ann2) >= 3
+                        _idf_diag_rows.append({
+                            "Duração": _lbl2,
+                            "Anos com máxima anual": len(_ann2),
+                            "Mín. necessário": 3,
+                            "IDF calculada": "✅ Sim" if _ok else "❌ Não (anos insuficientes)",
+                            "Máx. observada (mm/h)": f"{_ann2.max():.1f}" if not _ann2.empty else "—",
+                        })
+                else:
+                    for _lbl2 in _DURACOES:
+                        _idf_diag_rows.append({
+                            "Duração": _lbl2,
+                            "Anos com máxima anual": 0,
+                            "Mín. necessário": 3,
+                            "IDF calculada": "❌ Sem dados ERA5",
+                            "Máx. observada (mm/h)": "—",
+                        })
+                st.dataframe(
+                    pd.DataFrame(_idf_diag_rows).set_index("Duração"),
+                    width="stretch",
                 )
-                regiao_sem_dados = True
-                # Mantém df_sel com o ranking global para exibição de fallback
-            else:
-                df_sel = df_sel_filtrado
-        dur_h_sel = dur_para_horas.get(dur_selecionada, 1.0) if dur_selecionada else 1.0
-        df_sel["Intensidade_mmh"] = df_sel["Acumulado_mm"] / dur_h_sel
-        ultima_atualiz = df_sel["ultima_atualizacao"].iloc[0] if not df_sel.empty else ""
-
-        st.caption(f"Tabela: Maiores Chuvas em **{dur_selecionada}** | Última atualização: {ultima_atualiz}")
-
-        # Gráfico de barras horizontal com destaque das que saturam a bomba
-        cores = [
-            "rgba(231,76,60,0.85)" if row["Intensidade_mmh"] >= intensidade_sat_dc else "rgba(30,100,220,0.75)"
-            for _, row in df_sel.iterrows()
-        ]
-        fig_dc = go.Figure()
-        fig_dc.add_trace(go.Bar(
-            x=df_sel["Acumulado_mm"],
-            y=[f"{row['Estação']} ({row['Data/Hora']})" for _, row in df_sel.iterrows()],
-            orientation="h",
-            marker_color=cores,
-            text=[f"{v:.1f} mm" for v in df_sel["Acumulado_mm"]],
-            textposition="outside",
-            customdata=df_sel[["Estação", "Região", "Intensidade_mmh"]].values,
-            hovertemplate=(
-                "<b>%{customdata[0]}</b> (%{customdata[1]})<br>"
-                "Acumulado: %{x:.1f} mm<br>"
-                f"Intensidade média: %{{customdata[2]:.1f}} mm/h<br>"
-                "<extra></extra>"
-            ),
-        ))
-        # Linha de saturação convertida para acumulado na duração selecionada
-        acum_sat = intensidade_sat_dc * dur_h_sel
-        fig_dc.add_vline(
-            x=acum_sat,
-            line_dash="dash", line_color="red",
-        )
-        fig_dc.add_annotation(
-            x=acum_sat, y=1, yref="paper",
-            text=f"Saturação bomba<br>({acum_sat:.1f} mm em {dur_selecionada})",
-            showarrow=True, arrowhead=2, arrowcolor="red",
-            font=dict(color="red", size=10), xanchor="left",
-        )
-        fig_dc.update_layout(
-            xaxis_title=f"Acumulado em {dur_selecionada} (mm)",
-            yaxis=dict(autorange="reversed"),
-            height=max(300, 50 + 40 * len(df_sel)),
-            margin=dict(l=10, r=120, t=20, b=30),
-        )
-        st.plotly_chart(fig_dc, width="stretch")
-
-        # Quantos registros no ranking superam a saturação da bomba?
-        n_acima_sat = (df_sel["Intensidade_mmh"] >= intensidade_sat_dc).sum()
-        if n_acima_sat > 0:
-            st.warning(
-                f"⚠️ **{n_acima_sat} de {len(df_sel)} registros** neste ranking têm intensidade ≥ **{intensidade_sat_dc:.1f} mm/h** "
-                f"(limite de saturação da bomba). Em eventos como esses, o poço encheria mais rápido do que a bomba conseguiria esvaziar."
-            )
-        else:
-            st.success(
-                f"✅ Nenhum registro deste ranking supera o limite de saturação da bomba ({intensidade_sat_dc:.1f} mm/h)."
-            )
-
-        # ── Tabela detalhada ──
-        st.subheader("📋 Tabela Completa")
-        df_display = df_sel[["Estação", "Região", "Data/Hora", "Acumulado_mm", "Intensidade_mmh"]].copy()
-        df_display.columns = ["Estação", "Região", "Data/Hora", f"Acumulado em {dur_selecionada} (mm)", "Intensidade média (mm/h)"]
-        df_display[f"Acumulado em {dur_selecionada} (mm)"] = df_display[f"Acumulado em {dur_selecionada} (mm)"].round(1)
-        df_display["Intensidade média (mm/h)"] = df_display["Intensidade média (mm/h)"].round(1)
-        df_display.index = pd.RangeIndex(1, len(df_display) + 1)
-        df_display.index.name = "#"
-        st.dataframe(df_display, width="stretch")
-
+    
+                # 4. Adequação
+                if _dur_ref in idf_rep:
+                    st.success(f"✅ **IDF para duração de referência ({_dur_ref})** calculada. Análise de adequação disponível.")
+                else:
+                    st.error(
+                        f"❌ **IDF para duração de referência ({_dur_ref}) não disponível.** "
+                        f"A análise de adequação requer pelo menos 3 anos de dados históricos "
+                        f"com a janela de {_dur_ref}. Durações calculadas: `{list(idf_rep.keys()) or 'nenhuma'}`"
+                    )
+    
+                # 5. Resumo e sugestões de ação
+                st.markdown("**Sugestões para resolver:**")
+                if rep_hist_df.empty:
+                    st.markdown(
+                        "1. Verifique a conexão com internet e recarregue a página\n"
+                        "2. Confirme que as coordenadas estão corretas no sidebar\n"
+                        "3. Tente ajustar a data de início da análise (aba Histórico & IDF)"
+                    )
+                elif len(_anos_diag) < 3:
+                    st.markdown(
+                        f"1. Apenas {len(_anos_diag)} ano(s) de dados disponíveis — "
+                        f"são necessários pelo menos 3\n"
+                        "2. Aumente o período de análise na aba **Histórico & IDF**\n"
+                        "3. Se a API retornar dados muito recentes, aguarde alguns dias para "
+                        "o período se completar"
+                    )
+                else:
+                    st.markdown(
+                        "Os dados foram carregados mas a análise de adequação falhou. "
+                        "Verifique se `fit_gumbel` recebeu valores válidos (sem NaN)."
+                    )
+    
         st.markdown("---")
-
-        # ── Contexto IDF: comparar maiores chuvas do DC com a IDF Gumbel (se disponível) ──
-        st.subheader("📈 Contexto IDF: Maiores Chuvas Históricas vs. Curva Gumbel (Open-Meteo)")
-        st.caption(
-            "Pontos vermelhos = recordes da Defesa Civil de Blumenau | "
-            "Linhas = curvas IDF estimadas da tab Histórico & IDF (5 anos)"
-        )
-
-        # Checar se idf_results já foi calculado (está no escopo de tab6, mas Python é single-scope)
-        idf_available = "idf_results" in dir() or "idf_results" in globals() or "idf_results" in locals()
-        # Como o código de tab6 só roda quando a aba está ativa no Streamlit,
-        # vamos recalcular de forma simples se necessário
-        try:
-            _ = idf_results  # checa se já existe no escopo global
-            idf_ok = True
-        except NameError:
-            idf_ok = False
-
-        # Construir pontos dos recordes da Defesa Civil (respeitando o filtro de região)
-        dc_points_x = []  # duração em horas
-        dc_points_y = []  # intensidade mm/h
-        dc_points_label = []
-        for dur, df_dur in dc_rankings.items():
-            dh = dur_para_horas.get(dur, None)
-            if dh is None:
-                continue
-            df_pts = df_dur if regiao_selecionada == OPCAO_TODAS else df_dur[df_dur["Região"] == regiao_selecionada]
-            if df_pts.empty:
-                continue
-            top = df_pts.sort_values("Acumulado_mm", ascending=False).iloc[0]
-            dc_points_x.append(dh)
-            dc_points_y.append(top["Acumulado_mm"] / dh)
-            dc_points_label.append(f"{top['Estação']} ({dur}: {top['Acumulado_mm']:.0f}mm)")
-
-        fig_ctx = go.Figure()
-
-        if idf_ok:
-            duracoes_h_ctx = [1, 2, 3, 6, 12, 24]
-            palette_ctx = ["#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"]
-            trs_ctx = [2, 5, 10, 25, 50, 100]
-            for i_tr, tr in enumerate(trs_ctx):
-                y_ctx = [idf_results.get(d, {}).get(tr, None) for d in duracoes_h_ctx]
-                fig_ctx.add_trace(go.Scatter(
-                    x=duracoes_h_ctx, y=y_ctx,
-                    mode="lines",
-                    name=f"Tr={tr}a (Gumbel)",
-                    line=dict(color=palette_ctx[i_tr % len(palette_ctx)],
-                              width=2.5 if tr == 25 else 1.2,
-                              dash="solid" if tr in [25, 100] else "dot"),
-                    opacity=0.7,
-                ))
-
-        # Pontos dos recordes da Defesa Civil
-        if dc_points_x:
-            fig_ctx.add_trace(go.Scatter(
-                x=dc_points_x, y=dc_points_y,
-                mode="markers+text",
-                name="Recorde Defesa Civil BNU",
-                marker=dict(size=12, color="red", symbol="star"),
-                text=dc_points_label,
-                textposition="top center",
-                textfont=dict(size=9),
-            ))
-
-        # Linha de saturação horizontal
-        fig_ctx.add_hline(
-            y=intensidade_sat_dc,
-            line_dash="dash", line_color="darkred",
-            annotation_text=f"Saturação bomba ({intensidade_sat_dc:.1f} mm/h)",
-            annotation_position="top right",
-        )
-        fig_ctx.update_layout(
-            xaxis=dict(
-                title="Duração (horas)",
-                tickvals=[0.25, 0.5, 1, 2, 3, 6, 12, 24, 96],
-                ticktext=["15min", "30min", "1h", "2h", "3h", "6h", "12h", "24h", "96h"],
-            ),
-            yaxis_title="Intensidade média (mm/h)",
-            legend=dict(orientation="h", y=-0.3, x=0.5, xanchor="center"),
-            height=480,
-            margin=dict(l=20, r=20, t=20, b=80),
-        )
-        st.plotly_chart(fig_ctx, width="stretch")
-
-        if not idf_ok:
-            st.info(
-                "ℹ️ Para ver as curvas IDF junto com os recordes, acesse primeiro a aba "
-                "**📊 Histórico & IDF (5 anos)** para que os dados sejam calculados."
-            )
-
-        st.markdown("---")
-        st.info(
-            "🔗 Dados originais: [Defesa Civil de Blumenau – Maiores Chuvas]("
-            "https://defesacivil.blumenau.sc.gov.br/d/maiores-chuvas). "
-            "Os dados são atualizados pelo AlertaBlu conforme novos eventos ocorrem."
-        )
-
-
-
-    # ── SEÇÃO EXCLUSIVA: ESTAÇÃO PONTE ADOLFO KONDER (GUMBEL & EXTREMOS LOCALIZADOS) ──
-    st.markdown("---")
-    st.subheader("🌊 Estação Pluviométrica Ponte Adolfo Konder — Análise de Gumbel & Recordes (2021–2025)")
-    st.caption(
-        "Seção exclusiva dedicada à Estação Pluviométrica física instalada na Ponte Adolfo Konder (Centro de Blumenau). "
-        "Contém a análise de frequência de extremos por Ajuste da Distribuição de Gumbel e os maiores picos gravados no poço de monitoramento."
-    )
-
-    konder_sec_df = load_adolfo_konder_dataset()
-    if not konder_sec_df.empty:
-        pico_15m_rec = konder_sec_df["precip_15min"].max()
-        pico_15m_dt = konder_sec_df["precip_15min"].idxmax()
-        pico_1h_rec = konder_sec_df["precipitation"].max()
-        pico_1h_dt = konder_sec_df["precipitation"].idxmax()
-        tot_leituras_k = len(konder_sec_df)
-
-        mk1, mk2, mk3, mk4 = st.columns(4)
-        mk1.metric("Recorde 15min (Pulso)", f"{pico_15m_rec:.1f} mm", help=f"Data: {pd.to_datetime(pico_15m_dt).strftime('%d/%m/%Y %H:%M')} | Taxa inst.: {pico_15m_rec*4:.1f} mm/h")
-        mk2.metric("Recorde Horário (1h)", f"{pico_1h_rec:.1f} mm/h", help=f"Data: {pd.to_datetime(pico_1h_dt).strftime('%d/%m/%Y %H:%M')}")
-        mk3.metric("Período Coberto", "2021–2025", help=f"{konder_sec_df.index.min().strftime('%d/%m/%Y')} a {konder_sec_df.index.max().strftime('%d/%m/%Y')}")
-        mk4.metric("Total de Leituras", f"{tot_leituras_k:,}", help="Intervalos contínuos de 15 minutos")
-
-        st.markdown("#### 📈 Curvas IDF de Gumbel — Estação Ponte Adolfo Konder")
-        st.caption("Intensidades máximas calculadas por Gumbel (método dos momentos) sobre as séries reais de 15min a 24h.")
-
-        dur_map_k = {
-            "15min": (0.25, konder_sec_df["precip_mmh"]),
-            "30min": (0.5, konder_sec_df["precip_15min"].rolling(2, min_periods=1).sum() * 2.0),
-            "1h": (1.0, konder_sec_df["precip_15min"].rolling(4, min_periods=1).sum()),
-            "2h": (2.0, konder_sec_df["precip_15min"].rolling(8, min_periods=1).sum() / 2.0),
-            "6h": (6.0, konder_sec_df["precip_15min"].rolling(24, min_periods=1).sum() / 6.0),
-            "24h": (24.0, konder_sec_df["precip_15min"].rolling(96, min_periods=1).sum() / 24.0),
-        }
-        trs_k = [2, 5, 10, 25, 50, 100]
-        idf_k_dict = {}
-
-        for d_lbl, (dh_k, s_k) in dur_map_k.items():
-            ann_max_k = np.asarray(s_k.groupby(pd.to_datetime(s_k.index).year).max().dropna().values, dtype=np.float64)
-            if len(ann_max_k) >= 2:
-                alpha_k, u_k = fit_gumbel(ann_max_k)
-                idf_k_dict[d_lbl] = {tr: round(max(gumbel_quantile(alpha_k, u_k, tr), 0.0), 1) for tr in trs_k}
-
-        if idf_k_dict:
-            idf_k_df = pd.DataFrame(idf_k_dict).T
-            idf_k_df.columns = [f"Tr={tr}a" for tr in trs_k]
-            idf_k_df.index.name = "Duração"
-
-            palette_k = ["#1a73e8", "#34a853", "#fbbc04", "#ea4335", "#9c27b0", "#00bcd4"]
-            fig_idf_k = go.Figure()
-            durs_x = list(idf_k_dict.keys())
-            for idx_tr, tr_val in enumerate(trs_k):
-                y_vals_k = [idf_k_dict[d_lbl][tr_val] for d_lbl in durs_x]
-                fig_idf_k.add_trace(go.Scatter(
-                    x=durs_x, y=y_vals_k, mode="lines+markers",
-                    name=f"Tr = {tr_val} anos",
-                    line=dict(color=palette_k[idx_tr % len(palette_k)], width=2.5 if tr_val == 25 else 1.5),
-                    marker=dict(size=7),
-                ))
-            fig_idf_k.update_layout(
-                title="Curvas IDF Gumbel — Estação Ponte Adolfo Konder (2021–2025)",
-                xaxis_title="Duração", yaxis_title="Intensidade Média (mm/h)",
-                legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center"),
-                height=420, margin=dict(l=20, r=20, t=40, b=50),
-            )
-            st.plotly_chart(fig_idf_k, width="stretch")
-
-            st.markdown("##### 📋 Tabela IDF Gumbel (Ponte Adolfo Konder — mm/h)")
-            def highlight_tr25_k(col):
-                return ["background-color: rgba(234,67,53,0.15); font-weight:bold" if col.name == "Tr=25a" else "" for _ in col]
-            st.dataframe(idf_k_df.style.apply(highlight_tr25_k), width="stretch")
-
-        st.markdown("#### 🏆 Maiores Picos Registrados na Ponte Adolfo Konder")
-        tab_p1, tab_p2 = st.tabs(["⚡ Top 10 Pulsos de 15 Minutos", "🌧️ Top 10 Eventos Horários (1h)"])
-
-        with tab_p1:
-            top_15m = konder_sec_df.sort_values("precip_15min", ascending=False).head(10).copy()
-            top_15m_display = []
-            for dt_k, r_k in top_15m.iterrows():
-                val_15 = r_k["precip_15min"]
-                rate_h = val_15 * 4.0
-                sat_status = "🚨 Excede Bomba 1" if rate_h > intensidade_sat_dc else "✅ Suportado"
-                top_15m_display.append({
-                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:%M") if hasattr(dt_k, "strftime") else str(dt_k),
-                    "Precipitação (mm / 15min)": f"{val_15:.1f} mm",
-                    "Taxa Horária Eq. (mm/h)": f"{rate_h:.1f} mm/h",
-                    "Entrada no Poço (cm/h)": f"{rate_h * factor_mm_cm:.1f} cm/h",
-                    "Status": sat_status,
-                })
-            st.dataframe(pd.DataFrame(top_15m_display), width="stretch")
-
-        with tab_p2:
-            top_1h = konder_sec_df["precipitation"].resample("1h").sum().sort_values(ascending=False).head(10).copy()
-            top_1h_display = []
-            for dt_k, val_1h in top_1h.items():
-                sat_status = "🚨 Excede Bomba 1" if val_1h > intensidade_sat_dc else "✅ Suportado"
-                top_1h_display.append({
-                    "Data / Hora": dt_k.strftime("%d/%m/%Y %H:00") if hasattr(dt_k, "strftime") else str(dt_k),
-                    "Chuva Acumulada 1h (mm)": f"{val_1h:.1f} mm/h",
-                    "Entrada no Poço (cm/h)": f"{val_1h * factor_mm_cm:.1f} cm/h",
-                    "Status": sat_status,
-                })
-            st.dataframe(pd.DataFrame(top_1h_display), width="stretch")
-
-# ──────────────────────────────────────────────────────────────────────────────────
-with tab8:
-    st.subheader("🗂️ Diagrama do Poço de Drenagem")
-    st.caption("Diagrama esquemático em escala real a partir do Topo do Poço (0 cm). Atualiza automaticamente ao alterar qualquer parâmetro.")
-
-    # ── Posições Y em cm a partir do Topo do Poço (0.0 cm = Topo do Poço) ──
-    y_topo = 0.0
-    y_sensor = abs(dist_borda_cm)            # Ex: +70.0 cm (pendurado dentro do poço)
-    y_risco = y_sensor + 20.0                # Ex: +90.0 cm (20 cm da água ao sensor)
-    y_don = d_on                             # Ex: +160.0 cm abaixo do topo
-    y_doff = d_off                           # Ex: +183.0 cm abaixo do topo
-    y_don2 = d_on2
-    y_doff2 = d_off2
-    y_fundo = FUNDODOPOCO                    # Ex: +210.0 cm abaixo do topo
-
-    # Nível atual da água (distância a partir do topo do poço)
-    if latest_distance is not None:
-        y_agua = latest_distance
-    else:
-        y_agua = y_don  # fallback
-
-    dist_sensor_agua = max(y_agua - y_sensor, 0.0)
-
-    y_top = -20.0                # Margem acima do topo do poço
-    y_bottom = y_fundo + 20.0    # Margem abaixo do fundo
-
-    w = 1.0       # Largura do poço
-    wwall = 0.08  # Espessura da parede
-
-    fig_diag = go.Figure()
-
-    # 1. Fundo do poço
-    fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=y_fundo, y1=y_fundo + 10,
-        fillcolor="#795548", line_color="#4e342e", line_width=2)
-
-    # 2. Paredes do poço (do topo até o fundo)
-    for xi0, xi1 in [(-w/2 - wwall, -w/2), (w/2, w/2 + wwall)]:
-        fig_diag.add_shape(type="rect",
-            x0=xi0, x1=xi1, y0=y_topo, y1=y_fundo + 10,
-            fillcolor="#9e9e9e", line_color="#616161", line_width=1.5)
-
-    # 3. Suporte e caixa do Sensor (pendurado dentro do poço)
-    fig_diag.add_shape(type="rect",
-        x0=-w/4, x1=w/4, y0=y_sensor - 5, y1=y_sensor,
-        fillcolor="#ff9800", line_color="#e67e22", line_width=2)
-
-    # Cabo/haste de sustentação do sensor vindo do topo (0 cm) até o sensor (+70 cm)
-    fig_diag.add_shape(type="line",
-        x0=0, x1=0, y0=y_topo, y1=y_sensor - 5,
-        line=dict(color="#333333", width=2.5, dash="solid"))
-
-    # 4. Faixa de Risco do Sensor (até 20 cm abaixo do sensor)
-    fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=y_sensor, y1=y_risco,
-        fillcolor="rgba(231,76,60,0.15)", line_width=0)
-    fig_diag.add_shape(type="line",
-        x0=-w/2, x1=w/2, y0=y_risco, y1=y_risco,
-        line=dict(color="#e74c3c", width=1.5, dash="dot"))
-
-    # 5. Zona de atuação da Bomba 1 (entre Liga e Desliga)
-    fig_diag.add_shape(type="rect",
-        x0=-w/2, x1=w/2, y0=min(y_don, y_doff), y1=max(y_don, y_doff),
-        fillcolor="rgba(52,152,219,0.15)", line_width=0)
-
-    # 6. Água atual no poço (do nível atual da água até o fundo)
-    if y_agua <= y_fundo:
-        fig_diag.add_shape(type="rect",
-            x0=-w/2 + 0.01, x1=w/2 - 0.01,
-            y0=max(y_agua, y_top), y1=y_fundo,
-            fillcolor="rgba(30,144,255,0.40)",
-            line_color="rgba(30,144,255,0.7)", line_width=1.5)
-
-    # 7. Linha do Topo do Poço (0 cm)
-    fig_diag.add_shape(type="line",
-        x0=-w/2 - wwall, x1=w/2 + wwall, y0=0, y1=0,
-        line=dict(color="black", width=3.5))
-
-    # 8. Linhas de liga/desliga bomba
-    diag_lines = [(y_don, f"Bomba 1 LIGA ({y_don:.1f} cm)", "#e74c3c"), (y_doff, f"Bomba 1 DESLIGA ({y_doff:.1f} cm)", "#27ae60")]
-    if tem_bomba2:
-        diag_lines.extend([(y_don2, f"Bomba 2 LIGA ({y_don2:.1f} cm)", "#d35400"), (y_doff2, f"Bomba 2 DESLIGA ({y_doff2:.1f} cm)", "#16a085")])
-
-    for y_lv, lbl, clr in diag_lines:
-        fig_diag.add_shape(type="line",
-            x0=-w/2, x1=w/2, y0=y_lv, y1=y_lv,
-            line=dict(color=clr, width=2, dash="dash"))
-
-    # 9. Linha do nível atual da água
-    fig_diag.add_shape(type="line",
-        x0=-w/2 + 0.01, x1=w/2 - 0.01, y0=y_agua, y1=y_agua,
-        line=dict(color="#0056b3", width=3))
-
-    # 10. Anotações laterais
-    ann_x = w/2 + wwall + 0.08
-    annotations = [
-        dict(x=ann_x, y=0, text="<b>Topo do Poço</b> (0 cm)",
-             xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="black", size=12),
-             arrowcolor="black", arrowwidth=2),
-        dict(x=ann_x, y=y_sensor, text=f"<b>Sensor Físico</b><br>+{y_sensor:.0f} cm pendurado no poço",
-             xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="#e67e22", size=11),
-             arrowcolor="#e67e22", arrowwidth=1.5),
-        dict(x=ann_x, y=y_risco, text=f"<b>Risco Submersão</b><br>+{y_risco:.0f} cm (20 cm do sensor)",
-             xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="#e74c3c", size=10),
-             arrowcolor="#e74c3c", arrowwidth=1.2),
-        dict(x=ann_x, y=y_agua,
-             text=f"<b>Nível Atual da Água</b><br>+{y_agua:.1f} cm do topo (sensor lê: {dist_sensor_agua:.1f} cm)",
-             xanchor="left", showarrow=True, ax=30, ay=0,
-             font=dict(color="#0056b3", size=11),
-             arrowcolor="#0056b3", arrowwidth=1.8),
-        dict(x=-ann_x, y=y_don,
-             text=f"Bomba 1 LIGA<br>+{y_don:.1f} cm do topo",
-             xanchor="right", showarrow=True, ax=-30, ay=0,
-             font=dict(color="#e74c3c", size=10),
-             arrowcolor="#e74c3c", arrowwidth=1.2),
-        dict(x=-ann_x, y=y_doff,
-             text=f"Bomba 1 DESLIGA<br>+{y_doff:.1f} cm do topo",
-             xanchor="right", showarrow=True, ax=-30, ay=0,
-             font=dict(color="#27ae60", size=10),
-             arrowcolor="#27ae60", arrowwidth=1.2),
-        dict(x=-ann_x, y=y_fundo,
-             text=f"Fundo do poço<br>+{y_fundo:.0f} cm do topo",
-             xanchor="right", showarrow=True, ax=-30, ay=0,
-             font=dict(color="#795548", size=10),
-             arrowcolor="#795548", arrowwidth=1.2),
-    ]
-
-    fig_diag.update_layout(
-        title=f"📐 Corte Esquemático do Poço em Escala Real (Topo do Poço = 0 cm | Nível Atual = {y_agua:.1f} cm)",
-        xaxis=dict(range=[-w*1.6, w*1.6], showgrid=False, zeroline=False, showticklabels=False),
-        yaxis=dict(autorange="reversed", range=[y_bottom, y_top], title="Profundidade a partir do Topo do Poço (cm)"),
-        annotations=annotations,
-        height=650,
-        margin=dict(l=20, r=20, t=50, b=20),
-        plot_bgcolor="#f8f9fa",
-        paper_bgcolor="white",
-    )
-
-    st.plotly_chart(fig_diag, width="stretch")
-
-    col_l1, col_l2, col_l3 = st.columns(3)
-    col_l1.metric("Profundidade Total do Poço", f"{y_fundo:.0f} cm",
-                  help="Fundo do poço a partir do topo superior")
-    if latest_distance is not None:
-        altura_agua_cm = max(y_fundo - y_agua, 0.0)
-        col_l2.metric("Lâmina d'Água no Fundo", f"{altura_agua_cm:.0f} cm")
-        col_l3.metric("Distância da Água ao Sensor", f"{dist_sensor_agua:.0f} cm",
-                      delta=f"Sensor pendurado a {y_sensor:.0f} cm do topo")
-    else:
-        col_l2.metric("Lâmina d'Água", "Sem leitura")
-        col_l3.metric("Distância ao Sensor", "Sem leitura")
-    col_l1.metric("Capacidade total do poço", f"{capacidade_total_cm:.0f} cm",
-                  help="Fundo do poço até a borda superior")
-    if latest_distance is not None:
-        dist_ao_transbordo = latest_distance + dist_borda_cm
-        altura_agua_cm = max(FUNDODOPOCO - latest_distance, 0.0)
-        col_l2.metric("Nível da água (acima do fundo)", f"{altura_agua_cm:.0f} cm")
-        col_l3.metric("📦 Folga até a borda", f"{dist_ao_transbordo:.0f} cm",
-                      delta=f"{dist_ao_transbordo / capacidade_total_cm * 100:.0f}% da capacidade")
-    else:
-        col_l2.metric("Nível da água", "Sem leitura")
-        col_l3.metric("📦 Folga até a borda", "Sem leitura")
-
-    st.markdown("""
-    **Legenda:**
-    - 🟥 Zona vermelha: região acima do sensor (borda do poço) \u2014 água aqui = transbordamento
-    - 🟦 Zona azul: faixa de operação da bomba (liga a {y_don:.0f} cm, desliga a {y_doff:.0f} cm)
-    - 🟦 Água atual: nível medido pelo sensor
-    - 🟠 Sensor: ponto de referência zero (distância = 0)
-    """.format(y_don=y_don, y_doff=y_doff))
-
-# ────────────────────────────────────────────────────────────────────────────────
-# TAB 9 – RELATÓRIO DE ADEQUAÇÃO DA BOMBA
-# ────────────────────────────────────────────────────────────────────────────────
-with tab9:
-    import datetime as _dt
-    try:
-        from zoneinfo import ZoneInfo
-        _tz_br = ZoneInfo("America/Sao_Paulo")
-    except Exception:
-        _tz_br = _dt.timezone(_dt.timedelta(hours=-3))
-    _now_br = _dt.datetime.now(_tz_br)
-
-    st.subheader("📋 Relatório de Adequação da Bomba de Drenagem")
-    st.caption(
-        "Relatório técnico automático baseado nos parâmetros do sistema, Curvas IDF de Gumbel da "
-        "Estação Pluviométrica Ponte Adolfo Konder (Blumenau) e normas ABNT NBR 10844. Atualizado a cada re-execução."
-    )
-
-    # ── Parâmetros derivados ────────────────────────────────────────────────────
-    area_poco_m2 = round(100.0 / fator_m3h_para_cmh, 2)
-    area_drenagem_m2 = round(factor_mm_cm * area_poco_m2 / 0.1, 1)
-    volume_buffer_L = round(dist_borda_cm * 0.01 * area_poco_m2 * 1000, 0)
-
-    # ── Buscar dados históricos (cache compartilhado) ───────────────────────────
-    _dc_rep = fetch_defesa_civil_rankings()
-    _oldest_rep = "2015-01-08"
-    if _dc_rep:
-        _all_d = []
-        for _dfr in _dc_rep.values():
-            for _rr in _dfr["Data/Hora"]:
-                try:
-                    _all_d.append(pd.to_datetime(_rr, dayfirst=True))
-                except Exception:
-                    pass
-        if _all_d:
-            _oldest_rep = min(_all_d).strftime("%Y-%m-%d")
-
-    with st.spinner("Carregando dados históricos para o relatório…"):
-        rep_hist_df, _rep_err = fetch_historical_5years_precip(
-            latitude, longitude, start_date_str=_oldest_rep
-        )
-
-    if not rep_hist_df.empty and era5_correction != 1.0:
-        rep_hist_df = rep_hist_df.copy()
-        rep_hist_df["precipitation"] = rep_hist_df["precipitation"] * era5_correction
-
-    # ── Obter dados IDF da Estação Ponte Adolfo Konder (Medições Locais Reais) ──
-    _konder_rep_df = load_adolfo_konder_dataset()
-    _fonte_idf_rep = "Estação Pluviométrica Ponte Adolfo Konder (Medições Locais Reais - Blumenau 2021–2025)"
-    _usou_konder_rep = False
-
-    _DURACOES = {"1h": 1, "2h": 2, "3h": 3, "6h": 6, "12h": 12, "24h": 24}
-    _DURACOES_K = {"1h": 4, "2h": 8, "3h": 12, "6h": 24, "12h": 48, "24h": 96}
-    _TRS = [2, 5, 10, 25, 50, 100]
-    _TR_NORMA = 25
-
-    idf_rep = {}    # {label: {tr: intensity_mmh}}
-
-    if not _konder_rep_df.empty:
-        _usou_konder_rep = True
-        for _lbl, _n15 in _DURACOES_K.items():
-            _roll = _konder_rep_df["precip_15min"].rolling(_n15, min_periods=1).sum()
-            _nh = _n15 / 4.0
-            _intens = _roll / _nh
-            _ann = _intens.groupby(pd.DatetimeIndex(_intens.index).year).max().dropna()
-            if len(_ann) >= 2:
-                _a, _u = fit_gumbel(np.asarray(_ann.values, dtype=np.float64))
-                idf_rep[_lbl] = {tr: round(gumbel_quantile(_a, _u, tr), 1) for tr in _TRS}
-
-    if not idf_rep:
-        _fonte_idf_rep = f"Modelo ERA5 (Open-Meteo ×{era5_correction:.2f})"
-        if not rep_hist_df.empty:
-            for _lbl, _nh in {"1h": 1, "2h": 2, "3h": 3, "6h": 6, "12h": 12, "24h": 24}.items():
-                _roll = rep_hist_df["precipitation"].rolling(_nh).sum()
-                _intens = _roll / _nh
-                _ann = _intens.groupby(_intens.index.year).max().dropna()
-                if len(_ann) >= 3:
-                    _a, _u = fit_gumbel(_ann.values)
-                    idf_rep[_lbl] = {tr: round(gumbel_quantile(_a, _u, tr), 1) for tr in _TRS}
-
-    # ── Análise de adequação (referência: 1h) ──────────────────────────────────
-    _dur_ref = "1h"
-    adequacy_rep = {}
-    if _dur_ref in idf_rep:
-        for tr in _TRS:
-            q_mmh = idf_rep[_dur_ref][tr]
-            q_cmh = round(q_mmh * factor_mm_cm, 1)
-            margem = round((r_pump_total_param - q_cmh) / q_cmh * 100, 1)
-            adequacy_rep[tr] = {
-                "q_mmh": q_mmh, "q_cmh": q_cmh,
-                "pump_cmh": round(r_pump_total_param, 1),
-                "adequate": bool(r_pump_total_param >= q_cmh),
-                "margem_pct": margem,
-            }
-
-    vered = adequacy_rep.get(_TR_NORMA, {})
-    _adeq_val = vered.get("adequate", None)
-    bomba_ok = bool(_adeq_val) if _adeq_val is not None else None
-
-    # ── CABEÇALHO ───────────────────────────────────────────────────────────────
-    st.markdown("---")
-    col_tit, col_badge = st.columns([3, 1])
-    with col_tit:
-        st.markdown("## Relatório de Adequação Hidráulica")
+    
+        # -- SEÇÃO 1: PARÂMETROS ----------------------------------------------------------------
+        st.markdown("### 1. Parâmetros do Sistema Instalado")
         st.markdown(
-            f"**Local:** lat {latitude:.4f}, lon {longitude:.4f} &nbsp;|&nbsp; "
-            f"**Emitido:** {_now_br.strftime('%d/%m/%Y %H:%M')} (Horário de Brasília)"
+            """
+            Esta seção descreve o que foi instalado no local e é a base de comparação com
+            o que as normas exigem. Antes de qualquer cálculo, precisamos saber exatamente
+            com o que estamos trabalhando: qual é a capacidade real da bomba, qual é o tamanho
+            físico do poço e quanta área de telhado/terra contribui com chuva para esse poço.
+            """
         )
-    with col_badge:
-        if bomba_ok is True:
-            st.success("BOMBA ADEQUADA\n\nTr 25a – NBR 10844")
-        elif bomba_ok is False:
-            st.error("BOMBA INSUFICIENTE\n\nTr 25a – NBR 10844")
-        else:
-            st.warning("DADOS INSUFICIENTES")
-
-    # ── Diagnóstico automático quando dados insuficientes ───────────────────────
-    if bomba_ok is None:
-        with st.expander("🔍 Diagnóstico — por que os dados são insuficientes?", expanded=True):
-            st.markdown("**Verificando cada etapa do pipeline de dados:**")
-
-            # 1. Fetch histórico
-            if rep_hist_df.empty:
-                st.error(f"❌ **Dados históricos ERA5 não carregados.**  \nErro retornado: `{_rep_err}`")
-                st.markdown(
-                    "**Possíveis causas:**\n"
-                    "- Sem conexão com a internet\n"
-                    "- API Open-Meteo Archive temporariamente indisponível\n"
-                    "- Coordenadas inválidas (lat/lon fora do range aceito pela API)\n\n"
-                    f"**Parâmetros enviados:** lat={latitude}, lon={longitude}, start={_oldest_rep}"
-                )
-            else:
-                _anos_diag = sorted(rep_hist_df.index.year.unique())
-                _n_rows = len(rep_hist_df)
-                st.success(
-                    f"✅ **Dados ERA5 carregados:** {_n_rows:,} horas | "
-                    f"Período: {_anos_diag[0]}–{_anos_diag[-1]} | "
-                    f"Anos disponíveis: {len(_anos_diag)}"
-                )
-
-            # 2. Data de início (Defesa Civil)
-            if _dc_rep:
-                st.success(f"✅ **Defesa Civil:** dados carregados. Data mais antiga encontrada: `{_oldest_rep}`")
-            else:
-                st.warning(
-                    f"⚠️ **Defesa Civil:** sem dados (scraping falhou ou cache ausente). "
-                    f"Usando data de início padrão: `{_oldest_rep}`"
-                )
-
-            # 3. IDF por duração
-            _anos_diag = list(pd.DatetimeIndex(rep_hist_df.index).year.unique()) if not rep_hist_df.empty else []
-            st.markdown("**Status da curva IDF por duração:**")
-            _idf_diag_rows = []
-            if not rep_hist_df.empty:
-                for _lbl2, _nh2 in _DURACOES.items():
-                    _roll2 = rep_hist_df["precipitation"].rolling(_nh2).sum()
-                    _intens2 = _roll2 / _nh2
-                    _ann2 = _intens2.groupby(pd.DatetimeIndex(_intens2.index).year).max().dropna()
-                    _ok = len(_ann2) >= 3
-                    _idf_diag_rows.append({
-                        "Duração": _lbl2,
-                        "Anos com máxima anual": len(_ann2),
-                        "Mín. necessário": 3,
-                        "IDF calculada": "✅ Sim" if _ok else "❌ Não (anos insuficientes)",
-                        "Máx. observada (mm/h)": f"{_ann2.max():.1f}" if not _ann2.empty else "—",
-                    })
-            else:
-                for _lbl2 in _DURACOES:
-                    _idf_diag_rows.append({
-                        "Duração": _lbl2,
-                        "Anos com máxima anual": 0,
-                        "Mín. necessário": 3,
-                        "IDF calculada": "❌ Sem dados ERA5",
-                        "Máx. observada (mm/h)": "—",
-                    })
-            st.dataframe(
-                pd.DataFrame(_idf_diag_rows).set_index("Duração"),
-                width="stretch",
-            )
-
-            # 4. Adequação
-            if _dur_ref in idf_rep:
-                st.success(f"✅ **IDF para duração de referência ({_dur_ref})** calculada. Análise de adequação disponível.")
-            else:
-                st.error(
-                    f"❌ **IDF para duração de referência ({_dur_ref}) não disponível.** "
-                    f"A análise de adequação requer pelo menos 3 anos de dados históricos "
-                    f"com a janela de {_dur_ref}. Durações calculadas: `{list(idf_rep.keys()) or 'nenhuma'}`"
-                )
-
-            # 5. Resumo e sugestões de ação
-            st.markdown("**Sugestões para resolver:**")
-            if rep_hist_df.empty:
-                st.markdown(
-                    "1. Verifique a conexão com internet e recarregue a página\n"
-                    "2. Confirme que as coordenadas estão corretas no sidebar\n"
-                    "3. Tente ajustar a data de início da análise (aba Histórico & IDF)"
-                )
-            elif len(_anos_diag) < 3:
-                st.markdown(
-                    f"1. Apenas {len(_anos_diag)} ano(s) de dados disponíveis — "
-                    f"são necessários pelo menos 3\n"
-                    "2. Aumente o período de análise na aba **Histórico & IDF**\n"
-                    "3. Se a API retornar dados muito recentes, aguarde alguns dias para "
-                    "o período se completar"
-                )
-            else:
-                st.markdown(
-                    "Os dados foram carregados mas a análise de adequação falhou. "
-                    "Verifique se `fit_gumbel` recebeu valores válidos (sem NaN)."
-                )
-
-    st.markdown("---")
-
-    # -- SEÇÃO 1: PARÂMETROS ----------------------------------------------------------------
-    st.markdown("### 1. Parâmetros do Sistema Instalado")
-    st.markdown(
-        """
-        Esta seção descreve o que foi instalado no local e é a base de comparação com
-        o que as normas exigem. Antes de qualquer cálculo, precisamos saber exatamente
-        com o que estamos trabalhando: qual é a capacidade real da bomba, qual é o tamanho
-        físico do poço e quanta área de telhado/terra contribui com chuva para esse poço.
-        """
-    )
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(
-        "Capacidade Instalada",
-        f"{vazao_total_m3h:.1f} m³/h",
-        help=f"1ª Bomba: {vazao_bomba_m3h:.1f} m³/h" + (f" + 2ª Bomba: {vazao_bomba_m3h:.1f} m³/h (2x em paralelo)" if tem_bomba2 else " (1 bomba isolada)")
-    )
-    c2.metric("Velocidade de Rebaixamento", f"{r_pump_total_param:.1f} cm/h",
-              help="Taxa máxima de rebaixamento do nível do poço com todas as bombas operando.")
-    c3.metric("Seção Transversal do Poço", f"{area_poco_m2:.2f} m²",
-              help="Área da abertura interna do poço. Poços maiores sobem mais devagar sob chuva igual.")
-    c4.metric("Área de Drenagem Estimada", f"{area_drenagem_m2:.0f} m²",
-              help=(
-                  "Estimação da área total (telhados, pisos, jardins) cujas águas pluviais "
-                  "são direcionadas para este poço. Calculado pelo fator de amplificação calibrado."
-              ))
-
-    _t_esvaziar = round(FUNDODOPOCO / r_pump_total_param, 1)
-    _vol_1mm = round(area_drenagem_m2 * 0.001 * 1000, 0)
-    _bomba2_rows = (
-        f"| Bóia 2 LIGA quando distância | **≤ {d_on2:.0f} cm** | Emergência: aciona 2ª bomba em paralelo (+30 cm) |\n"
-        f"| Bóia 2 DESLIGA quando distância | **≥ {d_off2:.0f} cm** | Desliga a 2ª bomba quando o nível baixa |\n"
-    ) if tem_bomba2 else ""
-
-    st.markdown(
-        f"""
-**O que esses números significam na prática?**
-
-- A capacidade total instalada de bombeamento é de **{r_pump_total_param:.1f} cm/h** ({vazao_total_m3h:.1f} m³/h).
-  Isso significa: se a chuva parar agora, o sistema leva cerca de **{_t_esvaziar} horas**
-  para esvaziar completamente o poço a partir do nível máximo.
-- A área de drenagem de **{area_drenagem_m2:.0f} m²** significa que cada 1 mm de chuva coloca
-  aproximadamente **{_vol_1mm:.0f} litros** de água dentro do poço.
-- O poço tem capacidade total de **{capacidade_total_cm:.0f} cm** de coluna d'água:
-  {FUNDODOPOCO} cm do sensor até o fundo + {dist_borda_cm:.0f} cm do sensor até a borda superior.
-
-💡 **Nota Técnica — Por que a área/volume equivalente é maior que a seção do cilindro de concreto?**
-> Embora a camisa cilíndrica de concreto do poço tenha um diâmetro físico de **1,20 m** (seção transversal de **1,13 m²**), o poço não opera de forma isolada. As galerias e tubulações de drenagem que deságuam nele estão instaladas em diferentes cotas com inclinação suave (semi-horizontais).
->
-> Quando o nível de água sobe no poço, ocorre o **efeito de remanso (backwater effect)**: a água retrocede e invade a rede de tubulações a montante. Para subir cada 1 cm no sensor do poço, a chuva precisa preencher não apenas o tubo vertical do poço, mas também metros de galerias conectadas (*Pipe Storage*). Esse volume em rede funciona como um **reservatório de amortecimento físico**, fazendo com que a seção acumuladora equivalente de água se comporte como uma área significativamente maior do que a camisa cilíndrica de 1,20 m.
-
-| Parâmetro | Valor | Interpretação |
-|---|---|---|
-| Profundidade sensor → fundo | **{FUNDODOPOCO} cm** | Reservatório principal de água |
-| Sensor → borda superior | **{dist_borda_cm:.0f} cm** | Margem de segurança extra antes do transbordamento |
-| Capacidade total do poço | **{capacidade_total_cm:.0f} cm** | Volume total que o poço suporta |
-| Volume de segurança acima do sensor | **{volume_buffer_L:.0f} L** | Reserva que ganha tempo antes do transbordo |
-| Bóia 1 LIGA quando distância | **≤ {d_on:.0f} cm** | Quando a água sobe e aciona a 1ª bomba |
-| Bóia 1 DESLIGA quando distância | **≥ {d_off:.0f} cm** | Quando o poço esvazia até desligar a 1ª bomba |
-{_bomba2_rows}| Fator correção ERA5 aplicado | **×{era5_correction:.2f}** | Ajuste dos dados climáticos (ver Seção 2) |
-        """
-    )
-
-
-    # -- SEÇÃO 2: BASE DE DADOS -----------------------------------------------------------------
-    st.markdown("### 2. Base de Dados Pluviométrica Utilizada")
-    st.markdown(
-        f"""
-Para saber se a bomba é adequada, precisamos saber com qual chuva ela precisa lidar.
-Usamos dados históricos reais de precipitação ao longo de vários anos. Essas informações
-vêm de duas fontes complementares:
-
-- **Estação Pluviométrica Ponte Adolfo Konder (Medições Locais Reais 2021–2025):** pluviômetro físico
-  instalado no centro de Blumenau que registra chuvas continuamente em intervalos de 15 minutos. É a nossa
-  **fonte primária para o cálculo da Curva IDF e Chuva de Projeto**, por capturar com máxima fidelidade os picos
-  reais de tempestades locais.
-
-- **Open-Meteo ERA5 (reanálise do ECMWF):** modelo climático global utilizado como base secundária e para histórico
-  estendido de longo prazo.
-
-O **fator de correção ×{era5_correction:.2f}** aplicado ao ERA5 significa que os picos reais observados
-pela Defesa Civil são em média {(era5_correction-1)*100:.0f}% maiores do que o ERA5 registra.
-Sem essa correção, estaremos projetando para uma chuva menor do que a real — o que
-levaria a uma avaliação otimista demais sobre a adequação da bomba.
-        """
-    )
-    if not rep_hist_df.empty:
-        _anos = sorted(rep_hist_df.index.year.unique())
-        _prec_med = rep_hist_df["precipitation"].sum() / len(_anos)
-        _max_h = rep_hist_df["precipitation"].max()
-        ca, cb, cc, cd = st.columns(4)
-        ca.metric("Período analisado", f"{_anos[0]}–{_anos[-1]}")
-        cb.metric("Anos de dados", str(len(_anos)))
-        cc.metric("Precipitação média anual", f"{_prec_med:.0f} mm",
-                  help="Média de chuva por ano no período analisado. Blumenau é uma das cidades mais chuvosas do Brasil.")
-        cd.metric("Máx. horária ERA5 (corrigida)", f"{_max_h:.1f} mm/h",
-                  help="A hora mais chuvosa registrada no período completo após correção.")
-        st.caption(f"Fonte: Open-Meteo Archive API (ERA5) com fator ×{era5_correction:.2f} | Dados desde: {_oldest_rep}")
-        if _dc_rep and "01h" in _dc_rep and "1h" in idf_rep:
-            _dc_max = _dc_rep["01h"]["Acumulado_mm"].max()
-            _era_tr100 = idf_rep["1h"].get(100, None)
-            if _era_tr100:
-                _ratio = _dc_max / _era_tr100 * 100
-                st.info(
-                    f"Validação cruzada: o maior evento de 1h registrado pela Defesa Civil foi de "
-                    f"**{_dc_max:.1f} mm/h**. A curva IDF do ERA5 (corrigida) estima que chuvas assim "
-                    f"correspondem a Tr ≈ 100 anos ({_era_tr100:.1f} mm/h no ERA5). "
-                    f"Relação DC/ERA5-Tr100 = **{_ratio:.0f}%** — "
-                    + (
-                        "valores próximos de 100% indicam boa consistência entre as fontes."
-                        if 80 <= _ratio <= 120
-                        else f"diferença relevante — o fator de correção ×{era5_correction:.2f} tenta compensar isso."
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric(
+            "Capacidade Instalada",
+            f"{vazao_total_m3h:.1f} m³/h",
+            help=f"1ª Bomba: {vazao_bomba_m3h:.1f} m³/h" + (f" + 2ª Bomba: {vazao_bomba_m3h:.1f} m³/h (2x em paralelo)" if tem_bomba2 else " (1 bomba isolada)")
+        )
+        c2.metric("Velocidade de Rebaixamento", f"{r_pump_total_param:.1f} cm/h",
+                  help="Taxa máxima de rebaixamento do nível do poço com todas as bombas operando.")
+        c3.metric("Seção Transversal do Poço", f"{area_poco_m2:.2f} m²",
+                  help="Área da abertura interna do poço. Poços maiores sobem mais devagar sob chuva igual.")
+        c4.metric("Área de Drenagem Estimada", f"{area_drenagem_m2:.0f} m²",
+                  help=(
+                      "Estimação da área total (telhados, pisos, jardins) cujas águas pluviais "
+                      "são direcionadas para este poço. Calculado pelo fator de amplificação calibrado."
+                  ))
+    
+        _t_esvaziar = round(FUNDODOPOCO / r_pump_total_param, 1)
+        _vol_1mm = round(area_drenagem_m2 * 0.001 * 1000, 0)
+        _bomba2_rows = (
+            f"| Bóia 2 LIGA quando distância | **≤ {d_on2:.0f} cm** | Emergência: aciona 2ª bomba em paralelo (+30 cm) |\n"
+            f"| Bóia 2 DESLIGA quando distância | **≥ {d_off2:.0f} cm** | Desliga a 2ª bomba quando o nível baixa |\n"
+        ) if tem_bomba2 else ""
+    
+        st.markdown(
+            f"""
+    **O que esses números significam na prática?**
+    
+    - A capacidade total instalada de bombeamento é de **{r_pump_total_param:.1f} cm/h** ({vazao_total_m3h:.1f} m³/h).
+      Isso significa: se a chuva parar agora, o sistema leva cerca de **{_t_esvaziar} horas**
+      para esvaziar completamente o poço a partir do nível máximo.
+    - A área de drenagem de **{area_drenagem_m2:.0f} m²** significa que cada 1 mm de chuva coloca
+      aproximadamente **{_vol_1mm:.0f} litros** de água dentro do poço.
+    - O poço tem capacidade total de **{capacidade_total_cm:.0f} cm** de coluna d'água:
+      {FUNDODOPOCO} cm do sensor até o fundo + {dist_borda_cm:.0f} cm do sensor até a borda superior.
+    
+    💡 **Nota Técnica — Por que a área/volume equivalente é maior que a seção do cilindro de concreto?**
+    > Embora a camisa cilíndrica de concreto do poço tenha um diâmetro físico de **1,20 m** (seção transversal de **1,13 m²**), o poço não opera de forma isolada. As galerias e tubulações de drenagem que deságuam nele estão instaladas em diferentes cotas com inclinação suave (semi-horizontais).
+    >
+    > Quando o nível de água sobe no poço, ocorre o **efeito de remanso (backwater effect)**: a água retrocede e invade a rede de tubulações a montante. Para subir cada 1 cm no sensor do poço, a chuva precisa preencher não apenas o tubo vertical do poço, mas também metros de galerias conectadas (*Pipe Storage*). Esse volume em rede funciona como um **reservatório de amortecimento físico**, fazendo com que a seção acumuladora equivalente de água se comporte como uma área significativamente maior do que a camisa cilíndrica de 1,20 m.
+    
+    | Parâmetro | Valor | Interpretação |
+    |---|---|---|
+    | Profundidade sensor → fundo | **{FUNDODOPOCO} cm** | Reservatório principal de água |
+    | Sensor → borda superior | **{dist_borda_cm:.0f} cm** | Margem de segurança extra antes do transbordamento |
+    | Capacidade total do poço | **{capacidade_total_cm:.0f} cm** | Volume total que o poço suporta |
+    | Volume de segurança acima do sensor | **{volume_buffer_L:.0f} L** | Reserva que ganha tempo antes do transbordo |
+    | Bóia 1 LIGA quando distância | **≤ {d_on:.0f} cm** | Quando a água sobe e aciona a 1ª bomba |
+    | Bóia 1 DESLIGA quando distância | **≥ {d_off:.0f} cm** | Quando o poço esvazia até desligar a 1ª bomba |
+    {_bomba2_rows}| Fator correção ERA5 aplicado | **×{era5_correction:.2f}** | Ajuste dos dados climáticos (ver Seção 2) |
+            """
+        )
+    
+    
+        # -- SEÇÃO 2: BASE DE DADOS -----------------------------------------------------------------
+        st.markdown("### 2. Base de Dados Pluviométrica Utilizada")
+        st.markdown(
+            f"""
+    Para saber se a bomba é adequada, precisamos saber com qual chuva ela precisa lidar.
+    Usamos dados históricos reais de precipitação ao longo de vários anos. Essas informações
+    vêm de duas fontes complementares:
+    
+    - **Estação Pluviométrica Ponte Adolfo Konder (Medições Locais Reais 2021–2025):** pluviômetro físico
+      instalado no centro de Blumenau que registra chuvas continuamente em intervalos de 15 minutos. É a nossa
+      **fonte primária para o cálculo da Curva IDF e Chuva de Projeto**, por capturar com máxima fidelidade os picos
+      reais de tempestades locais.
+    
+    - **Open-Meteo ERA5 (reanálise do ECMWF):** modelo climático global utilizado como base secundária e para histórico
+      estendido de longo prazo.
+    
+    O **fator de correção ×{era5_correction:.2f}** aplicado ao ERA5 significa que os picos reais observados
+    pela Defesa Civil são em média {(era5_correction-1)*100:.0f}% maiores do que o ERA5 registra.
+    Sem essa correção, estaremos projetando para uma chuva menor do que a real — o que
+    levaria a uma avaliação otimista demais sobre a adequação da bomba.
+            """
+        )
+        if not rep_hist_df.empty:
+            _anos = sorted(rep_hist_df.index.year.unique())
+            _prec_med = rep_hist_df["precipitation"].sum() / len(_anos)
+            _max_h = rep_hist_df["precipitation"].max()
+            ca, cb, cc, cd = st.columns(4)
+            ca.metric("Período analisado", f"{_anos[0]}–{_anos[-1]}")
+            cb.metric("Anos de dados", str(len(_anos)))
+            cc.metric("Precipitação média anual", f"{_prec_med:.0f} mm",
+                      help="Média de chuva por ano no período analisado. Blumenau é uma das cidades mais chuvosas do Brasil.")
+            cd.metric("Máx. horária ERA5 (corrigida)", f"{_max_h:.1f} mm/h",
+                      help="A hora mais chuvosa registrada no período completo após correção.")
+            st.caption(f"Fonte: Open-Meteo Archive API (ERA5) com fator ×{era5_correction:.2f} | Dados desde: {_oldest_rep}")
+            if _dc_rep and "01h" in _dc_rep and "1h" in idf_rep:
+                _dc_max = _dc_rep["01h"]["Acumulado_mm"].max()
+                _era_tr100 = idf_rep["1h"].get(100, None)
+                if _era_tr100:
+                    _ratio = _dc_max / _era_tr100 * 100
+                    st.info(
+                        f"Validação cruzada: o maior evento de 1h registrado pela Defesa Civil foi de "
+                        f"**{_dc_max:.1f} mm/h**. A curva IDF do ERA5 (corrigida) estima que chuvas assim "
+                        f"correspondem a Tr ≈ 100 anos ({_era_tr100:.1f} mm/h no ERA5). "
+                        f"Relação DC/ERA5-Tr100 = **{_ratio:.0f}%** — "
+                        + (
+                            "valores próximos de 100% indicam boa consistência entre as fontes."
+                            if 80 <= _ratio <= 120
+                            else f"diferença relevante — o fator de correção ×{era5_correction:.2f} tenta compensar isso."
+                        )
                     )
-                )
-    else:
-        st.warning(f"Dados históricos não disponíveis. Erro: {_rep_err}")
-
-    # -- SEÇÃO 3: CURVA IDF -----------------------------------------------------------------------
-    st.markdown("### 3. Intensidades de Projeto – Curva IDF")
-    st.markdown(
-        """
-**O que é a curva IDF?**
-
-IDF significa **Intensidade – Duração – Frequência**. É a ferramenta fundamental do projeto
-hidrológico: ela responde à pergunta *"com que intensidade pode chover, por quanto tempo,
-e com que frequência isso ocorre?"*
-
-**O que é período de retorno (Tr)?**
-
-Tr = 25 anos significa que aquele evento de chuva tem **probabilidade de 4% de ocorrer
-em qualquer ano**. Não significa que vai chover exatamente assim a cada 25 anos exatos
-— pode ocorrer dois anos seguidos, ou não ocorrer por 40 anos. É uma forma estatística
-de descrever a *raridade* do evento. Quanto maior o Tr, mais rara é a chuva.
-
-**Como foram calculados os valores?**
-
-Para cada duração de chuva (1h, 2h, etc.), identificamos o maior evento registrado
-em cada ano do histórico. Com esses valores extremos anuais, ajustamos uma
-*distribuição de Gumbel* — modelo estatístico especificamente desenvolvido para análise
-de máximos. Ele extrapola para períodos de retorno mais longos do que o período de dados
-disponível, com incerteza crescente para Tr muito maiores que o histórico.
-
-**Como usar a tabela abaixo:**
-
-Cada célula mostra a *intensidade média* (mm/h) da chuva de projeto para aquela
-combinação de duração e Tr. Por exemplo, "Tr 25a / 1h" é a intensidade de uma chuva
-que dura 1 hora e tem Tr = 25 anos — o cenário que a norma NBR 10844 exige que o
-sistema suporte.
-
-A linha tracejada vermelha no gráfico indica a intensidade a partir da qual a bomba
-instalada não consegue mais acompanhar o enchimento do poço (ponto de saturação).
-        """
-    )
-    if idf_rep:
-        _idf_rows = []
-        for _lbl in _DURACOES:
-            if _lbl not in idf_rep:
-                continue
-            row = {"Duração": _lbl}
-            row.update({f"Tr {tr}a": f"{idf_rep[_lbl][tr]:.1f} mm/h" for tr in _TRS})
-            _idf_rows.append(row)
-        st.dataframe(pd.DataFrame(_idf_rows).set_index("Duração"), width="stretch")
-
-        # Gráfico IDF
-        fig_idf_r = go.Figure()
-        _colors = px.colors.qualitative.Set2
-        for _i, tr in enumerate(_TRS):
-            _xv = [_DURACOES[l] for l in _DURACOES if l in idf_rep]
-            _yv = [idf_rep[l][tr] for l in _DURACOES if l in idf_rep]
-            fig_idf_r.add_trace(go.Scatter(
-                x=_xv, y=_yv, mode="lines+markers", name=f"Tr {tr}a",
-                line=dict(color=_colors[_i % len(_colors)],
-                          width=3 if tr == _TR_NORMA else 1.5,
-                          dash="solid" if tr == _TR_NORMA else "dot"),
-                marker=dict(size=8 if tr == _TR_NORMA else 5),
-            ))
-        # Linha de saturação da bomba
-        _sat_mmh = r_pump_param / factor_mm_cm
-        fig_idf_r.add_hline(
-            y=_sat_mmh, line_dash="dash", line_color="#e74c3c",
-            annotation_text=f"Saturação bomba: {_sat_mmh:.1f} mm/h",
-            annotation_position="top right",
-            annotation_font_color="#e74c3c",
-        )
-        fig_idf_r.update_layout(
-            title="Curva IDF – linha tracejada vermelha = limite de saturação da bomba instalada",
-            xaxis_title="Duração (horas)", yaxis_title="Intensidade média (mm/h)",
-            height=400,
-            legend=dict(orientation="h", y=-0.28, x=0.5, xanchor="center"),
-        )
-        st.plotly_chart(fig_idf_r, width="stretch")
-    else:
-        st.warning("IDF não calculada — dados insuficientes.")
-
-    # -- SEÇÃO 4: ADEQUAÇÃO -----------------------------------------------------------------------
-    st.markdown("### 4. Comparação: Chuva de Projeto vs Capacidade da Bomba")
-    st.markdown(
-        f"""
-**Como a bomba é comparada com a chuva de projeto?**
-
-A lógica é simples: a chuva entra no poço a uma certa taxa (cm/h), e a bomba precisa
-remover água a uma taxa igual ou maior para que o nível não suba continuamente.
-
-Para converter chuva (mm/h) em taxa de enchimento do poço (cm/h), usamos o
-**Fator de Amplificação** de {factor_mm_cm:.2f} calibrado em eventos reais:
-cada 1 mm/h de chuva sobre a área de drenagem eleva o nível do poço em **{factor_mm_cm:.2f} cm/h**.
-
-A *duração de referência de 1 hora* é a mais crítica para bombas de recalque:
-é o tempo suficiente para saturar o poço, e é o padrão que a maioria das normas usa
-para dimensionar sistemas de bombeamento de águas pluviais.
-
-**Como ler a tabela e o gráfico:**
-- Cada linha mostra: qual chuva (mm/h) ocorre naquele Tr, como isso se traduz em
-  taxa de enchimento (cm/h), e se a bomba instalada consegue ou não acompanhar.
-- As barras coloridas no gráfico mostram o quanto a bomba precisa trabalhar.
-- A linha verde é a capacidade real da bomba instalada.
-- Barras **acima** da linha verde = a bomba **não consegue acompanhar** essa chuva.
-- Barras **abaixo** da linha = a bomba **dá conta** e o nível não sobe indefinidamente.
-        """
-    )
-    if adequacy_rep:
-        _adq_rows = []
-        for tr in _TRS:
-            a = adequacy_rep[tr]
-            _adq_rows.append({
-                "Tr (anos)": tr,
-                "Intensidade 1h (mm/h)": a["q_mmh"],
-                "Taxa de enchimento (cm/h)": a["q_cmh"],
-                "Capacidade da Bomba (cm/h)": a["pump_cmh"],
-                "Margem (%)": f"{a['margem_pct']:+.1f}%",
-                "Resultado": "✅ Bomba dá conta" if a["adequate"] else "❌ Bomba insuficiente",
-            })
-        st.dataframe(pd.DataFrame(_adq_rows).set_index("Tr (anos)"), width="stretch")
-        st.caption(
-            f"Margem positiva = bomba tem folga. Margem negativa = falta capacidade. "
-            f"A norma NBR 10844 exige que a bomba seja adequada para Tr = {_TR_NORMA} anos."
-        )
-
-        fig_adq_r = go.Figure()
-        fig_adq_r.add_trace(go.Bar(
-            x=[str(tr) for tr in _TRS],
-            y=[adequacy_rep[tr]["q_cmh"] for tr in _TRS],
-            name="Taxa de enchimento do poço (chuva de projeto)",
-            marker_color=["#e74c3c" if not adequacy_rep[tr]["adequate"] else "#f39c12" for tr in _TRS],
-        ))
-        fig_adq_r.add_hline(
-            y=r_pump_total_param, line_dash="dash", line_color="#27ae60",
-            annotation_text=f"Bomba(s) instalada(s): {r_pump_total_param:.1f} cm/h ({vazao_total_m3h:.1f} m³/h)",
-            annotation_position="top left", annotation_font_color="#27ae60",
-        )
-        fig_adq_r.update_layout(
-            title="Barras vermelhas = bomba insuficiente | Amarelas = bomba adequada | Linha verde = capacidade instalada",
-            xaxis_title="Período de Retorno (anos)",
-            yaxis_title="Taxa de enchimento necessária (cm/h)",
-            height=350,
-        )
-        st.plotly_chart(fig_adq_r, width="stretch")
-
-    # -- SEÇÃO 5: BUFFER --------------------------------------------------------------------------
-    st.markdown("### 5. Tempo de Amortecimento do Poço (Margem de Segurança Física)")
-    st.markdown(
-        f"""
-**O poço como reservatório de segurança**
-
-Mesmo que a bomba instalada não consiga remover água tão rápido quanto ela entra
-durante uma chuva forte, o poço ainda tem uma margem física antes de transbordar:
-são **{dist_borda_cm:.0f} cm** entre o sensor e a borda superior. Esses {dist_borda_cm:.0f} cm
-funcionam como um reservatório de emergência.
-
-O **tempo de amortecimento** é quanto tempo leva para o poço se encher completamente
-com o excesso de água que a bomba não consegue remover. Isso importa porque a maioria
-das chuvas intensas não sustenta sua intensidade máxima por mais de 30 a 60 minutos.
-Se o poço aguentar esse pico sem transbordar, a bomba consegue esvaziar o restante
-depois que a chuva diminuir.
-
-**Como ler a tabela:**
-- "Excesso não removido" = taxa de enchimento menos capacidade da bomba.
-  Se for zero, a bomba dá conta e o poço nunca enche completamente naquele Tr.
-- "Tempo até transbordo" = quanto tempo o poço aguenta com chuva contínua na
-  intensidade máxima de projeto. Na prática, o sistema normalmente resiste mais tempo
-  porque a intensidade varia ao longo do evento de chuva.
-        """
-    )
-    if adequacy_rep:
-        _buf_rows = []
-        for tr in _TRS:
-            a = adequacy_rep[tr]
-            excesso = max(a["q_cmh"] - r_pump_total_param, 0.0)
-            if excesso > 0:
-                t_min = round(dist_borda_cm / excesso * 60, 0)
-                nota = f"{t_min:.0f} min até transbordo"
-            else:
-                nota = "Sem risco — bomba suficiente para esse Tr"
-            _buf_rows.append({
-                "Tr (anos)": tr,
-                "Excesso não removido (cm/h)": round(excesso, 1),
-                "Buffer disponível (cm)": dist_borda_cm,
-                "Tempo até transbordo": nota,
-            })
-        st.dataframe(pd.DataFrame(_buf_rows).set_index("Tr (anos)"), width="stretch")
-        st.caption(
-            "Nota: o tempo até transbordo assume chuva contínua na intensidade máxima de projeto. "
-            "Cenário conservador — na prática, a intensidade varia e o sistema geralmente aguenta mais."
-        )
-
-    # -- SEÇÃO 6: NORMAS --------------------------------------------------------------------------
-    st.markdown("### 6. Normas e Critérios de Projeto Aplicados")
-    st.markdown(
-        f"""
-As normas de engenharia estabelecem o **nível mínimo de proteção** que uma instalação
-deve ter, equilibrando custo e risco. Elas foram desenvolvidas por especialistas com base
-em dados históricos e experiência acumulada ao longo de décadas:
-
-- **ABNT NBR 10844:1989** — *Instalações prediais de águas pluviais*: a principal norma
-  brasileira para dimensionamento de calhas, condutores e bombas de águas pluviais em
-  edificações. Para uso coletivo (condomínios, comércio), exige que o sistema suporte
-  chuvas com **Tr ≥ 25 anos**. Isso significa que há no máximo 4% de chance
-  por ano de a chuva superar o que o sistema foi projetado para suportar.
-
-- **ABNT NBR 5626:2020** — Norma geral para dimensionamento de sistemas prediais hidráulicos.
-
-- **Manual de Drenagem DAEE/SP** — utilizado amplamente no Brasil para drenagem urbana;
-  recomenda Tr entre 10 e 100 anos dependendo do risco (área residencial, via pública,
-  área crítica, etc.).
-
-**Por que Tr = 25 anos foi escolhido como critério principal?**
-
-Um critério mais conservador (ex: Tr = 100 anos) seria mais seguro, mas exigiria uma bomba
-muito maior e mais cara. Um critério muito brando (Tr = 2 anos) significaria transbordamento
-frequente. Tr = 25 anos é o balanço estabelecido pela NBR 10844 para edificações coletivas —
-um transbordamento esperado *no pior caso* a cada 25 anos de operação.
-
-| Norma | Aplicação | Tr recomendado |
-|---|---|---|
-| **ABNT NBR 10844:1989** | Instalações prediais de águas pluviais | **Tr ≥ 25 anos** (uso coletivo) |
-| **ABNT NBR 5626:2020** | Sistemas de água fria e quente | Dimensionamento geral |
-| **Manual DAEE/SP** | Drenagem urbana | Tr 10–100 anos conforme risco |
-| **ERA5 + DC Blumenau** | Dados históricos locais | Corrigido por ×{era5_correction:.2f} |
-        """
-    )
-
-    # -- SEÇÃO 7: PARECER TÉCNICO FINAL -----------------------------------------------------------
-    st.markdown("### 7. Parecer Técnico Final")
-    if not adequacy_rep:
-        st.warning("Dados insuficientes para emitir parecer.")
-    else:
-        _tr_max_ok = max((tr for tr in _TRS if adequacy_rep[tr]["adequate"]), default=None)
-        if bomba_ok is True:
-            _mg = vered.get("margem_pct", 0)
-            _conf = "alta" if _mg >= 50 else ("moderada" if _mg >= 20 else "baixa — margem estreita")
-            _txt_sistema = f"de 2 bombas em paralelo ({vazao_total_m3h:.1f} m³/h = {r_pump_total_param:.1f} cm/h)" if tem_bomba2 else f"da bomba instalada ({vazao_bomba_m3h:.1f} m³/h = {r_pump_param:.1f} cm/h)"
-            st.success(
-                f"✅ APROVADO — O sistema está dimensionado conforme a norma NBR 10844.\n\n"
-                f"A capacidade do sistema {_txt_sistema} "
-                f"consegue remover água mais rápido do que ela entra durante uma chuva de "
-                f"período de retorno de **{_TR_NORMA} anos** (probabilidade de 4% ao ano). "
-                f"A margem de segurança é de **{_mg:+.1f}%** — confiabilidade **{_conf}**."
-            )
-            if _mg < 20:
-                st.warning(
-                    f"Atenção: apesar de aprovada, a margem de {_mg:.1f}% é estreita. "
-                    f"Qualquer redução de vazão por desgaste da bomba, entupimento das grades "
-                    f"ou aumento da área de drenagem pode tornar o sistema insuficiente. "
-                    f"Recomenda-se monitoramento periódico e medição da vazão real da bomba."
-                )
         else:
-            _def = abs(vered.get("margem_pct", 0))
-            _q_needed = vered.get("q_cmh", r_pump_total_param * 1.3) / fator_m3h_para_cmh
-            _q_norma_cmh = vered.get("q_cmh", r_pump_total_param * 1.3)
-            _txt_sistema = f"de 2 bombas em paralelo ({vazao_total_m3h:.1f} m³/h = {r_pump_total_param:.1f} cm/h)" if tem_bomba2 else f"da bomba instalada ({vazao_bomba_m3h:.1f} m³/h = {r_pump_param:.1f} cm/h)"
-            st.error(
-                f"❌ REPROVADO — O sistema está subdimensionado para a norma NBR 10844.\n\n"
-                f"A capacidade do sistema {_txt_sistema} "
-                f"NÃO CONSEGUE remover água na mesma velocidade que ela entra durante "
-                f"uma chuva de Tr = {_TR_NORMA} anos. O sistema está com **{_def:.1f}%** menos "
-                f"capacidade do que o necessário segundo a norma. "
-                + (
-                    f"O sistema atual só é suficiente para chuvas de até Tr = **{_tr_max_ok} anos** "
-                    f"(probabilidade de {100//_tr_max_ok}% ao ano). "
-                    if _tr_max_ok else ""
-                )
-                + f"Para cumprir a norma, seria necessária uma capacidade total de pelo menos **{_q_needed:.1f} m³/h**."
+            st.warning(f"Dados históricos não disponíveis. Erro: {_rep_err}")
+    
+        # -- SEÇÃO 3: CURVA IDF -----------------------------------------------------------------------
+        st.markdown("### 3. Intensidades de Projeto – Curva IDF")
+        st.markdown(
+            """
+    **O que é a curva IDF?**
+    
+    IDF significa **Intensidade – Duração – Frequência**. É a ferramenta fundamental do projeto
+    hidrológico: ela responde à pergunta *"com que intensidade pode chover, por quanto tempo,
+    e com que frequência isso ocorre?"*
+    
+    **O que é período de retorno (Tr)?**
+    
+    Tr = 25 anos significa que aquele evento de chuva tem **probabilidade de 4% de ocorrer
+    em qualquer ano**. Não significa que vai chover exatamente assim a cada 25 anos exatos
+    — pode ocorrer dois anos seguidos, ou não ocorrer por 40 anos. É uma forma estatística
+    de descrever a *raridade* do evento. Quanto maior o Tr, mais rara é a chuva.
+    
+    **Como foram calculados os valores?**
+    
+    Para cada duração de chuva (1h, 2h, etc.), identificamos o maior evento registrado
+    em cada ano do histórico. Com esses valores extremos anuais, ajustamos uma
+    *distribuição de Gumbel* — modelo estatístico especificamente desenvolvido para análise
+    de máximos. Ele extrapola para períodos de retorno mais longos do que o período de dados
+    disponível, com incerteza crescente para Tr muito maiores que o histórico.
+    
+    **Como usar a tabela abaixo:**
+    
+    Cada célula mostra a *intensidade média* (mm/h) da chuva de projeto para aquela
+    combinação de duração e Tr. Por exemplo, "Tr 25a / 1h" é a intensidade de uma chuva
+    que dura 1 hora e tem Tr = 25 anos — o cenário que a norma NBR 10844 exige que o
+    sistema suporte.
+    
+    A linha tracejada vermelha no gráfico indica a intensidade a partir da qual a bomba
+    instalada não consegue mais acompanhar o enchimento do poço (ponto de saturação).
+            """
+        )
+        if idf_rep:
+            _idf_rows = []
+            for _lbl in _DURACOES:
+                if _lbl not in idf_rep:
+                    continue
+                row = {"Duração": _lbl}
+                row.update({f"Tr {tr}a": f"{idf_rep[_lbl][tr]:.1f} mm/h" for tr in _TRS})
+                _idf_rows.append(row)
+            st.dataframe(pd.DataFrame(_idf_rows).set_index("Duração"), width="stretch")
+    
+            # Gráfico IDF
+            fig_idf_r = go.Figure()
+            _colors = px.colors.qualitative.Set2
+            for _i, tr in enumerate(_TRS):
+                _xv = [_DURACOES[l] for l in _DURACOES if l in idf_rep]
+                _yv = [idf_rep[l][tr] for l in _DURACOES if l in idf_rep]
+                fig_idf_r.add_trace(go.Scatter(
+                    x=_xv, y=_yv, mode="lines+markers", name=f"Tr {tr}a",
+                    line=dict(color=_colors[_i % len(_colors)],
+                              width=3 if tr == _TR_NORMA else 1.5,
+                              dash="solid" if tr == _TR_NORMA else "dot"),
+                    marker=dict(size=8 if tr == _TR_NORMA else 5),
+                ))
+            # Linha de saturação da bomba
+            _sat_mmh = r_pump_param / factor_mm_cm
+            fig_idf_r.add_hline(
+                y=_sat_mmh, line_dash="dash", line_color="#e74c3c",
+                annotation_text=f"Saturação bomba: {_sat_mmh:.1f} mm/h",
+                annotation_position="top right",
+                annotation_font_color="#e74c3c",
             )
-            # Explicar o que acontece na pratica
-            _excesso_norma = _q_norma_cmh - r_pump_total_param
-            if _excesso_norma > 0 and dist_borda_cm > 0:
-                _t_buf = dist_borda_cm / _excesso_norma * 60
-                st.info(
-                    f"📌 O que acontece durante uma chuva de Tr = {_TR_NORMA} anos:\n\n"
-                    f"A água entra no poço a **{_q_norma_cmh:.1f} cm/h** mas as bombas só conseguem "
-                    f"remover **{r_pump_total_param:.1f} cm/h**. A diferença de **{_excesso_norma:.1f} cm/h** "
-                    f"faz o nível subir mesmo com a bomba ligada. Com os **{dist_borda_cm:.0f} cm** de "
-                    f"buffer disponível, o poço levaria cerca de **{_t_buf:.0f} minutos** para transbordar "
-                    f"(assumindo chuva contínua na intensidade máxima — o que raramente ocorre na prática, mas é teoricamente possível e por isso a norma exige esse cálculo)."
+            fig_idf_r.update_layout(
+                title="Curva IDF – linha tracejada vermelha = limite de saturação da bomba instalada",
+                xaxis_title="Duração (horas)", yaxis_title="Intensidade média (mm/h)",
+                height=400,
+                legend=dict(orientation="h", y=-0.28, x=0.5, xanchor="center"),
+            )
+            st.plotly_chart(fig_idf_r, width="stretch")
+        else:
+            st.warning("IDF não calculada — dados insuficientes.")
+    
+        # -- SEÇÃO 4: ADEQUAÇÃO -----------------------------------------------------------------------
+        st.markdown("### 4. Comparação: Chuva de Projeto vs Capacidade da Bomba")
+        st.markdown(
+            f"""
+    **Como a bomba é comparada com a chuva de projeto?**
+    
+    A lógica é simples: a chuva entra no poço a uma certa taxa (cm/h), e a bomba precisa
+    remover água a uma taxa igual ou maior para que o nível não suba continuamente.
+    
+    Para converter chuva (mm/h) em taxa de enchimento do poço (cm/h), usamos o
+    **Fator de Amplificação** de {factor_mm_cm:.2f} calibrado em eventos reais:
+    cada 1 mm/h de chuva sobre a área de drenagem eleva o nível do poço em **{factor_mm_cm:.2f} cm/h**.
+    
+    A *duração de referência de 1 hora* é a mais crítica para bombas de recalque:
+    é o tempo suficiente para saturar o poço, e é o padrão que a maioria das normas usa
+    para dimensionar sistemas de bombeamento de águas pluviais.
+    
+    **Como ler a tabela e o gráfico:**
+    - Cada linha mostra: qual chuva (mm/h) ocorre naquele Tr, como isso se traduz em
+      taxa de enchimento (cm/h), e se a bomba instalada consegue ou não acompanhar.
+    - As barras coloridas no gráfico mostram o quanto a bomba precisa trabalhar.
+    - A linha verde é a capacidade real da bomba instalada.
+    - Barras **acima** da linha verde = a bomba **não consegue acompanhar** essa chuva.
+    - Barras **abaixo** da linha = a bomba **dá conta** e o nível não sobe indefinidamente.
+            """
+        )
+        if adequacy_rep:
+            _adq_rows = []
+            for tr in _TRS:
+                a = adequacy_rep[tr]
+                _adq_rows.append({
+                    "Tr (anos)": tr,
+                    "Intensidade 1h (mm/h)": a["q_mmh"],
+                    "Taxa de enchimento (cm/h)": a["q_cmh"],
+                    "Capacidade da Bomba (cm/h)": a["pump_cmh"],
+                    "Margem (%)": f"{a['margem_pct']:+.1f}%",
+                    "Resultado": "✅ Bomba dá conta" if a["adequate"] else "❌ Bomba insuficiente",
+                })
+            st.dataframe(pd.DataFrame(_adq_rows).set_index("Tr (anos)"), width="stretch")
+            st.caption(
+                f"Margem positiva = bomba tem folga. Margem negativa = falta capacidade. "
+                f"A norma NBR 10844 exige que a bomba seja adequada para Tr = {_TR_NORMA} anos."
+            )
+    
+            fig_adq_r = go.Figure()
+            fig_adq_r.add_trace(go.Bar(
+                x=[str(tr) for tr in _TRS],
+                y=[adequacy_rep[tr]["q_cmh"] for tr in _TRS],
+                name="Taxa de enchimento do poço (chuva de projeto)",
+                marker_color=["#e74c3c" if not adequacy_rep[tr]["adequate"] else "#f39c12" for tr in _TRS],
+            ))
+            fig_adq_r.add_hline(
+                y=r_pump_total_param, line_dash="dash", line_color="#27ae60",
+                annotation_text=f"Bomba(s) instalada(s): {r_pump_total_param:.1f} cm/h ({vazao_total_m3h:.1f} m³/h)",
+                annotation_position="top left", annotation_font_color="#27ae60",
+            )
+            fig_adq_r.update_layout(
+                title="Barras vermelhas = bomba insuficiente | Amarelas = bomba adequada | Linha verde = capacidade instalada",
+                xaxis_title="Período de Retorno (anos)",
+                yaxis_title="Taxa de enchimento necessária (cm/h)",
+                height=350,
+            )
+            st.plotly_chart(fig_adq_r, width="stretch")
+    
+        # -- SEÇÃO 5: BUFFER --------------------------------------------------------------------------
+        st.markdown("### 5. Tempo de Amortecimento do Poço (Margem de Segurança Física)")
+        st.markdown(
+            f"""
+    **O poço como reservatório de segurança**
+    
+    Mesmo que a bomba instalada não consiga remover água tão rápido quanto ela entra
+    durante uma chuva forte, o poço ainda tem uma margem física antes de transbordar:
+    são **{dist_borda_cm:.0f} cm** entre o sensor e a borda superior. Esses {dist_borda_cm:.0f} cm
+    funcionam como um reservatório de emergência.
+    
+    O **tempo de amortecimento** é quanto tempo leva para o poço se encher completamente
+    com o excesso de água que a bomba não consegue remover. Isso importa porque a maioria
+    das chuvas intensas não sustenta sua intensidade máxima por mais de 30 a 60 minutos.
+    Se o poço aguentar esse pico sem transbordar, a bomba consegue esvaziar o restante
+    depois que a chuva diminuir.
+    
+    **Como ler a tabela:**
+    - "Excesso não removido" = taxa de enchimento menos capacidade da bomba.
+      Se for zero, a bomba dá conta e o poço nunca enche completamente naquele Tr.
+    - "Tempo até transbordo" = quanto tempo o poço aguenta com chuva contínua na
+      intensidade máxima de projeto. Na prática, o sistema normalmente resiste mais tempo
+      porque a intensidade varia ao longo do evento de chuva.
+            """
+        )
+        if adequacy_rep:
+            _buf_rows = []
+            for tr in _TRS:
+                a = adequacy_rep[tr]
+                excesso = max(a["q_cmh"] - r_pump_total_param, 0.0)
+                if excesso > 0:
+                    t_min = round(dist_borda_cm / excesso * 60, 0)
+                    nota = f"{t_min:.0f} min até transbordo"
+                else:
+                    nota = "Sem risco — bomba suficiente para esse Tr"
+                _buf_rows.append({
+                    "Tr (anos)": tr,
+                    "Excesso não removido (cm/h)": round(excesso, 1),
+                    "Buffer disponível (cm)": dist_borda_cm,
+                    "Tempo até transbordo": nota,
+                })
+            st.dataframe(pd.DataFrame(_buf_rows).set_index("Tr (anos)"), width="stretch")
+            st.caption(
+                "Nota: o tempo até transbordo assume chuva contínua na intensidade máxima de projeto. "
+                "Cenário conservador — na prática, a intensidade varia e o sistema geralmente aguenta mais."
+            )
+    
+        # -- SEÇÃO 6: NORMAS --------------------------------------------------------------------------
+        st.markdown("### 6. Normas e Critérios de Projeto Aplicados")
+        st.markdown(
+            f"""
+    As normas de engenharia estabelecem o **nível mínimo de proteção** que uma instalação
+    deve ter, equilibrando custo e risco. Elas foram desenvolvidas por especialistas com base
+    em dados históricos e experiência acumulada ao longo de décadas:
+    
+    - **ABNT NBR 10844:1989** — *Instalações prediais de águas pluviais*: a principal norma
+      brasileira para dimensionamento de calhas, condutores e bombas de águas pluviais em
+      edificações. Para uso coletivo (condomínios, comércio), exige que o sistema suporte
+      chuvas com **Tr ≥ 25 anos**. Isso significa que há no máximo 4% de chance
+      por ano de a chuva superar o que o sistema foi projetado para suportar.
+    
+    - **ABNT NBR 5626:2020** — Norma geral para dimensionamento de sistemas prediais hidráulicos.
+    
+    - **Manual de Drenagem DAEE/SP** — utilizado amplamente no Brasil para drenagem urbana;
+      recomenda Tr entre 10 e 100 anos dependendo do risco (área residencial, via pública,
+      área crítica, etc.).
+    
+    **Por que Tr = 25 anos foi escolhido como critério principal?**
+    
+    Um critério mais conservador (ex: Tr = 100 anos) seria mais seguro, mas exigiria uma bomba
+    muito maior e mais cara. Um critério muito brando (Tr = 2 anos) significaria transbordamento
+    frequente. Tr = 25 anos é o balanço estabelecido pela NBR 10844 para edificações coletivas —
+    um transbordamento esperado *no pior caso* a cada 25 anos de operação.
+    
+    | Norma | Aplicação | Tr recomendado |
+    |---|---|---|
+    | **ABNT NBR 10844:1989** | Instalações prediais de águas pluviais | **Tr ≥ 25 anos** (uso coletivo) |
+    | **ABNT NBR 5626:2020** | Sistemas de água fria e quente | Dimensionamento geral |
+    | **Manual DAEE/SP** | Drenagem urbana | Tr 10–100 anos conforme risco |
+    | **ERA5 + DC Blumenau** | Dados históricos locais | Corrigido por ×{era5_correction:.2f} |
+            """
+        )
+    
+        # -- SEÇÃO 7: PARECER TÉCNICO FINAL -----------------------------------------------------------
+        st.markdown("### 7. Parecer Técnico Final")
+        if not adequacy_rep:
+            st.warning("Dados insuficientes para emitir parecer.")
+        else:
+            _tr_max_ok = max((tr for tr in _TRS if adequacy_rep[tr]["adequate"]), default=None)
+            if bomba_ok is True:
+                _mg = vered.get("margem_pct", 0)
+                _conf = "alta" if _mg >= 50 else ("moderada" if _mg >= 20 else "baixa — margem estreita")
+                _txt_sistema = f"de 2 bombas em paralelo ({vazao_total_m3h:.1f} m³/h = {r_pump_total_param:.1f} cm/h)" if tem_bomba2 else f"da bomba instalada ({vazao_bomba_m3h:.1f} m³/h = {r_pump_param:.1f} cm/h)"
+                st.success(
+                    f"✅ APROVADO — O sistema está dimensionado conforme a norma NBR 10844.\n\n"
+                    f"A capacidade do sistema {_txt_sistema} "
+                    f"consegue remover água mais rápido do que ela entra durante uma chuva de "
+                    f"período de retorno de **{_TR_NORMA} anos** (probabilidade de 4% ao ano). "
+                    f"A margem de segurança é de **{_mg:+.1f}%** — confiabilidade **{_conf}**."
                 )
-
-        # Recomendações
-        st.markdown("#### Recomendações")
-        _recs = []
-        if bomba_ok is False:
-            _q_min = vered.get("q_cmh", r_pump_total_param * 1.3) / fator_m3h_para_cmh
-            if not tem_bomba2:
-                _recs.append(
-                    f"**Instalar 2ª bomba em paralelo:** a capacidade necessária para a NBR 10844 (Tr 25a) "
-                    f"é de **{_q_min:.1f} m³/h**. Adicionar uma 2ª bomba idêntica de {vazao_bomba_m3h:.1f} m³/h "
-                    f"em paralelo eleva a capacidade total para {vazao_bomba_m3h*2:.1f} m³/h."
-                )
+                if _mg < 20:
+                    st.warning(
+                        f"Atenção: apesar de aprovada, a margem de {_mg:.1f}% é estreita. "
+                        f"Qualquer redução de vazão por desgaste da bomba, entupimento das grades "
+                        f"ou aumento da área de drenagem pode tornar o sistema insuficiente. "
+                        f"Recomenda-se monitoramento periódico e medição da vazão real da bomba."
+                    )
             else:
-                _recs.append(
-                    f"**Aumentar capacidade dos conjuntos motobomba:** mesmo com 2 bombas em paralelo "
-                    f"({vazao_total_m3h:.1f} m³/h), a NBR 10844 exige **{_q_min:.1f} m³/h**. "
-                    f"Recomenda-se substituir os conjuntos por bombas de maior vazão unitária."
+                _def = abs(vered.get("margem_pct", 0))
+                _q_needed = vered.get("q_cmh", r_pump_total_param * 1.3) / fator_m3h_para_cmh
+                _q_norma_cmh = vered.get("q_cmh", r_pump_total_param * 1.3)
+                _txt_sistema = f"de 2 bombas em paralelo ({vazao_total_m3h:.1f} m³/h = {r_pump_total_param:.1f} cm/h)" if tem_bomba2 else f"da bomba instalada ({vazao_bomba_m3h:.1f} m³/h = {r_pump_param:.1f} cm/h)"
+                st.error(
+                    f"❌ REPROVADO — O sistema está subdimensionado para a norma NBR 10844.\n\n"
+                    f"A capacidade do sistema {_txt_sistema} "
+                    f"NÃO CONSEGUE remover água na mesma velocidade que ela entra durante "
+                    f"uma chuva de Tr = {_TR_NORMA} anos. O sistema está com **{_def:.1f}%** menos "
+                    f"capacidade do que o necessário segundo a norma. "
+                    + (
+                        f"O sistema atual só é suficiente para chuvas de até Tr = **{_tr_max_ok} anos** "
+                        f"(probabilidade de {100//_tr_max_ok}% ao ano). "
+                        if _tr_max_ok else ""
+                    )
+                    + f"Para cumprir a norma, seria necessária uma capacidade total de pelo menos **{_q_needed:.1f} m³/h**."
                 )
-        if dist_borda_cm < 50:
+                # Explicar o que acontece na pratica
+                _excesso_norma = _q_norma_cmh - r_pump_total_param
+                if _excesso_norma > 0 and dist_borda_cm > 0:
+                    _t_buf = dist_borda_cm / _excesso_norma * 60
+                    st.info(
+                        f"📌 O que acontece durante uma chuva de Tr = {_TR_NORMA} anos:\n\n"
+                        f"A água entra no poço a **{_q_norma_cmh:.1f} cm/h** mas as bombas só conseguem "
+                        f"remover **{r_pump_total_param:.1f} cm/h**. A diferença de **{_excesso_norma:.1f} cm/h** "
+                        f"faz o nível subir mesmo com a bomba ligada. Com os **{dist_borda_cm:.0f} cm** de "
+                        f"buffer disponível, o poço levaria cerca de **{_t_buf:.0f} minutos** para transbordar "
+                        f"(assumindo chuva contínua na intensidade máxima — o que raramente ocorre na prática, mas é teoricamente possível e por isso a norma exige esse cálculo)."
+                    )
+    
+            # Recomendações
+            st.markdown("#### Recomendações")
+            _recs = []
+            if bomba_ok is False:
+                _q_min = vered.get("q_cmh", r_pump_total_param * 1.3) / fator_m3h_para_cmh
+                if not tem_bomba2:
+                    _recs.append(
+                        f"**Instalar 2ª bomba em paralelo:** a capacidade necessária para a NBR 10844 (Tr 25a) "
+                        f"é de **{_q_min:.1f} m³/h**. Adicionar uma 2ª bomba idêntica de {vazao_bomba_m3h:.1f} m³/h "
+                        f"em paralelo eleva a capacidade total para {vazao_bomba_m3h*2:.1f} m³/h."
+                    )
+                else:
+                    _recs.append(
+                        f"**Aumentar capacidade dos conjuntos motobomba:** mesmo com 2 bombas em paralelo "
+                        f"({vazao_total_m3h:.1f} m³/h), a NBR 10844 exige **{_q_min:.1f} m³/h**. "
+                        f"Recomenda-se substituir os conjuntos por bombas de maior vazão unitária."
+                    )
+            if dist_borda_cm < 50:
+                _recs.append(
+                    f"**Ampliar a margem de segurança física:** a distância atual do sensor à borda é de apenas "
+                    f"{dist_borda_cm:.0f} cm. Aumentar para pelo menos 80 cm (rebaixando o sensor ou elevando "
+                    f"a borda do poço) dá mais tempo para o sistema agir antes de transbordar — especialmente "
+                    f"útil durante picos de chuva quando a bomba não dá conta."
+                )
+            if era5_correction > 1.5:
+                _recs.append(
+                    f"**Instalar pluviômetro local:** o fator de correção ERA5 de ×{era5_correction:.2f} indica "
+                    f"que os dados de satélite subestimam significativamente a chuva neste local. "
+                    f"Um pluviômetro próprio forneceria dados muito mais precisos para calibração "
+                    f"do sistema e do fator de amplificação."
+                )
             _recs.append(
-                f"**Ampliar a margem de segurança física:** a distância atual do sensor à borda é de apenas "
-                f"{dist_borda_cm:.0f} cm. Aumentar para pelo menos 80 cm (rebaixando o sensor ou elevando "
-                f"a borda do poço) dá mais tempo para o sistema agir antes de transbordar — especialmente "
-                f"útil durante picos de chuva quando a bomba não dá conta."
+                "**Prever grupo gerador ou nobreak:** eventos de chuva forte frequentemente causam "
+                "queda de energia elétrica. Sem energia, a bomba para e o poço pode transbordar muito "
+                "mais rápido. Um no-break ou gerador garante operação contínua nos momentos mais críticos."
             )
-        if era5_correction > 1.5:
             _recs.append(
-                f"**Instalar pluviômetro local:** o fator de correção ERA5 de ×{era5_correction:.2f} indica "
-                f"que os dados de satélite subestimam significativamente a chuva neste local. "
-                f"Um pluviômetro próprio forneceria dados muito mais precisos para calibração "
-                f"do sistema e do fator de amplificação."
+                "**Manutenção semestral obrigatória:** ao longo do tempo, a vazão real da bomba "
+                "diminui por desgaste, incrustações e sedimentos. É essencial medir a vazão real "
+                "semestralmente, limpar as grades de entrada e verificar as bóias. Uma bomba envelhecida "
+                "pode estar entregando apenas 70% da vazão nominal na prática."
             )
-        _recs.append(
-            "**Prever grupo gerador ou nobreak:** eventos de chuva forte frequentemente causam "
-            "queda de energia elétrica. Sem energia, a bomba para e o poço pode transbordar muito "
-            "mais rápido. Um no-break ou gerador garante operação contínua nos momentos mais críticos."
-        )
-        _recs.append(
-            "**Manutenção semestral obrigatória:** ao longo do tempo, a vazão real da bomba "
-            "diminui por desgaste, incrustações e sedimentos. É essencial medir a vazão real "
-            "semestralmente, limpar as grades de entrada e verificar as bóias. Uma bomba envelhecida "
-            "pode estar entregando apenas 70% da vazão nominal na prática."
-        )
-        for _r in _recs:
-            st.markdown(f"- {_r}")
-
-    # -- DOWNLOAD & IMPRESSÃO ----------------------------------------------------------------------
-    st.markdown("---")
-    col_dl1, col_dl2 = st.columns(2)
-    with col_dl1:
-        _rpt_txt = (
-            f"RELATORIO DE ADEQUACAO - POCO DE DRENAGEM\n"
-            f"Data: {_now_br.strftime('%d/%m/%Y %H:%M')} (Horario de Brasilia)\n"
-            f"Local: lat {latitude:.4f}, lon {longitude:.4f}\n\n"
-            f"SISTEMA INSTALADO\n"
-            f"  Bomba: {vazao_bomba_m3h:.1f} m3/h = {r_pump_param:.1f} cm/h\n"
-            f"  Secao do poco: {area_poco_m2:.2f} m2\n"
-            f"  Area de drenagem estimada: {area_drenagem_m2:.0f} m2\n"
-            f"  Capacidade total: {capacidade_total_cm:.0f} cm\n\n"
-            f"CRITERIO DE PROJETO\n"
-            f"  Norma: ABNT NBR 10844:1989 | Tr = {_TR_NORMA} anos | Duracao ref.: 1h\n\n"
-            f"RESULTADO\n"
-            f"  {'APROVADO' if bomba_ok else 'REPROVADO'}\n"
-            f"  Margem Tr 25a: {vered.get('margem_pct', 'N/A')}%\n"
-        )
-        st.download_button(
-            "⬇️ Baixar Resumo do Relatório (.txt)",
-            data=_rpt_txt.encode("utf-8"),
-            file_name=f"relatorio_poco_{_dt.date.today().isoformat()}.txt",
-            mime="text/plain",
-        )
-
-    with col_dl2:
-        with st.expander("🖨️ Visualizar Documento para Impressão / PDF", expanded=False):
-            _txt_bom = f"{vazao_total_m3h:.1f} m³/h ({'2 bombas em paralelo' if tem_bomba2 else '1 bomba isolada'})"
-            _bg_card = "#e8f5e9" if bomba_ok else "#ffebee"
-            _bd_card = "#2e7d32" if bomba_ok else "#c62828"
-            _status_txt = "SISTEMA APROVADO (NBR 10844)" if bomba_ok else "SISTEMA REPROVADO (SUBDIMENSIONADO)"
-            _expl_txt = (
-                "O sistema instalado cumpre integralmente as exigências de remoção de vazão para o período de retorno Tr = 25 anos exigido pela NBR 10844."
-                if bomba_ok else
-                f"A capacidade instalada ({r_pump_total_param:.1f} cm/h) não atinge a taxa de afluxo requerida pela NBR 10844 (Tr 25a: {vered.get('q_cmh', 0):.1f} cm/h)."
+            for _r in _recs:
+                st.markdown(f"- {_r}")
+    
+        # -- DOWNLOAD & IMPRESSÃO ----------------------------------------------------------------------
+        st.markdown("---")
+        col_dl1, col_dl2 = st.columns(2)
+        with col_dl1:
+            _rpt_txt = (
+                f"RELATORIO DE ADEQUACAO - POCO DE DRENAGEM\n"
+                f"Data: {_now_br.strftime('%d/%m/%Y %H:%M')} (Horario de Brasilia)\n"
+                f"Local: lat {latitude:.4f}, lon {longitude:.4f}\n\n"
+                f"SISTEMA INSTALADO\n"
+                f"  Bomba: {vazao_bomba_m3h:.1f} m3/h = {r_pump_param:.1f} cm/h\n"
+                f"  Secao do poco: {area_poco_m2:.2f} m2\n"
+                f"  Area de drenagem estimada: {area_drenagem_m2:.0f} m2\n"
+                f"  Capacidade total: {capacidade_total_cm:.0f} cm\n\n"
+                f"CRITERIO DE PROJETO\n"
+                f"  Norma: ABNT NBR 10844:1989 | Tr = {_TR_NORMA} anos | Duracao ref.: 1h\n\n"
+                f"RESULTADO\n"
+                f"  {'APROVADO' if bomba_ok else 'REPROVADO'}\n"
+                f"  Margem Tr 25a: {vered.get('margem_pct', 'N/A')}%\n"
             )
-            st.markdown(
-                f"""
-                <div style="background-color: white; padding: 20px; border: 1px solid #ccc; border-radius: 8px; color: #222;">
-                    <div style="text-align: center; border-bottom: 2px solid #0056b3; padding-bottom: 8px; margin-bottom: 15px;">
-                        <h3 style="margin: 0; color: #0056b3;">PARECER TÉCNICO DE ADEQUAÇÃO HIDRÁULICA</h3>
-                        <p style="margin: 3px 0 0 0; color: #555; font-size: 13px;">CONDOMÍNIO RESIDENCIAL — POÇO DE DRENAGEM PLUVIAL</p>
-                        <p style="margin: 2px 0 0 0; color: #777; font-size: 11px;">Emissão: {_now_br.strftime('%d/%m/%Y às %H:%M')} (Horário de Brasília)</p>
+            st.download_button(
+                "⬇️ Baixar Resumo do Relatório (.txt)",
+                data=_rpt_txt.encode("utf-8"),
+                file_name=f"relatorio_poco_{_dt.date.today().isoformat()}.txt",
+                mime="text/plain",
+            )
+    
+        with col_dl2:
+            with st.expander("Visualizar documento para impressão / PDF", icon=":material/print:", expanded=False):
+                _txt_bom = f"{vazao_total_m3h:.1f} m³/h ({'2 bombas em paralelo' if tem_bomba2 else '1 bomba isolada'})"
+                _bg_card = "#e8f5e9" if bomba_ok else "#ffebee"
+                _bd_card = "#2e7d32" if bomba_ok else "#c62828"
+                _status_txt = "SISTEMA APROVADO (NBR 10844)" if bomba_ok else "SISTEMA REPROVADO (SUBDIMENSIONADO)"
+                _expl_txt = (
+                    "O sistema instalado cumpre integralmente as exigências de remoção de vazão para o período de retorno Tr = 25 anos exigido pela NBR 10844."
+                    if bomba_ok else
+                    f"A capacidade instalada ({r_pump_total_param:.1f} cm/h) não atinge a taxa de afluxo requerida pela NBR 10844 (Tr 25a: {vered.get('q_cmh', 0):.1f} cm/h)."
+                )
+                st.markdown(
+                    f"""
+                    <div style="background-color: white; padding: 20px; border: 1px solid #ccc; border-radius: 8px; color: #222;">
+                        <div style="text-align: center; border-bottom: 2px solid #0056b3; padding-bottom: 8px; margin-bottom: 15px;">
+                            <h3 style="margin: 0; color: #0056b3;">PARECER TÉCNICO DE ADEQUAÇÃO HIDRÁULICA</h3>
+                            <p style="margin: 3px 0 0 0; color: #555; font-size: 13px;">CONDOMÍNIO RESIDENCIAL — POÇO DE DRENAGEM PLUVIAL</p>
+                            <p style="margin: 2px 0 0 0; color: #777; font-size: 11px;">Emissão: {_now_br.strftime('%d/%m/%Y às %H:%M')} (Horário de Brasília)</p>
+                        </div>
+                        <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
+                            <tr style="background-color: #f8f9fa;">
+                                <td style="padding: 6px; border: 1px solid #ddd;"><b>Localização:</b> Lat {latitude:.4f}, Lon {longitude:.4f}</td>
+                                <td style="padding: 6px; border: 1px solid #ddd;"><b>Norma Técnica:</b> ABNT NBR 10844 (Tr = 25 anos)</td>
+                            </tr>
+                            <tr>
+                                <td style="padding: 6px; border: 1px solid #ddd;"><b>Capacidade Instalada:</b> {_txt_bom}</td>
+                                <td style="padding: 6px; border: 1px solid #ddd;"><b>Vazão de Esvaziamento:</b> {r_pump_total_param:.1f} cm/h</td>
+                            </tr>
+                        </table>
+                        <div style="background-color: {_bg_card}; border-left: 4px solid {_bd_card}; padding: 12px; margin-bottom: 15px;">
+                            <h4 style="margin: 0 0 4px 0; color: {_bd_card};">{_status_txt}</h4>
+                            <p style="margin: 0; font-size: 13px;">{_expl_txt}</p>
+                        </div>
+                        <p style="font-size: 11px; color: #888; text-align: center; margin: 10px 0 0 0;">
+                            Documento emitido pelo Sistema de Monitoramento e Análise Hidráulica de Poços de Drenagem.
+                        </p>
                     </div>
-                    <table style="width: 100%; border-collapse: collapse; margin-bottom: 15px; font-size: 13px;">
-                        <tr style="background-color: #f8f9fa;">
-                            <td style="padding: 6px; border: 1px solid #ddd;"><b>Localização:</b> Lat {latitude:.4f}, Lon {longitude:.4f}</td>
-                            <td style="padding: 6px; border: 1px solid #ddd;"><b>Norma Técnica:</b> ABNT NBR 10844 (Tr = 25 anos)</td>
-                        </tr>
-                        <tr>
-                            <td style="padding: 6px; border: 1px solid #ddd;"><b>Capacidade Instalada:</b> {_txt_bom}</td>
-                            <td style="padding: 6px; border: 1px solid #ddd;"><b>Vazão de Esvaziamento:</b> {r_pump_total_param:.1f} cm/h</td>
-                        </tr>
-                    </table>
-                    <div style="background-color: {_bg_card}; border-left: 4px solid {_bd_card}; padding: 12px; margin-bottom: 15px;">
-                        <h4 style="margin: 0 0 4px 0; color: {_bd_card};">{_status_txt}</h4>
-                        <p style="margin: 0; font-size: 13px;">{_expl_txt}</p>
-                    </div>
-                    <p style="font-size: 11px; color: #888; text-align: center; margin: 10px 0 0 0;">
-                        Documento emitido pelo Sistema de Monitoramento e Análise Hidráulica de Poços de Drenagem.
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+                    """,
+                    unsafe_allow_html=True
+                )
