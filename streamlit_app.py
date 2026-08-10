@@ -4039,7 +4039,7 @@ with tab9:
                         f"são necessários pelo menos 3\n"
                         "2. Aumente o período de análise na aba **Histórico & IDF**\n"
                         "3. Se a API retornar dados muito recentes, aguarde alguns dias para "
-                        "o período se completar"
+                        f"o período se completar"
                     )
                 else:
                     st.markdown(
@@ -4083,32 +4083,27 @@ with tab9:
         ) if tem_bomba2 else ""
     
         st.markdown(
-            f"""
-    **O que esses números significam na prática?**
-    
-    - A capacidade total instalada de bombeamento é de **{r_pump_total_param:.1f} cm/h** ({vazao_total_m3h:.1f} m³/h).
-      Isso significa: se a chuva parar agora, o sistema leva cerca de **{_t_esvaziar} horas**
-      para esvaziar completamente o poço a partir do nível máximo.
-    - A área de drenagem de **{area_drenagem_m2:.0f} m²** significa que cada 1 mm de chuva coloca
-      aproximadamente **{_vol_1mm:.0f} litros** de água dentro do poço.
-    - O poço tem capacidade total de **{capacidade_total_cm:.0f} cm** de coluna d'água:
-      {FUNDODOPOCO} cm do sensor até o fundo + {dist_borda_cm:.0f} cm do sensor até a borda superior.
-    
-    💡 **Nota Técnica — Por que a área/volume equivalente é maior que a seção do cilindro de concreto?**
-    > Embora a camisa cilíndrica de concreto do poço tenha um diâmetro físico de **1,20 m** (seção transversal de **1,13 m²**), o poço não opera de forma isolada. As galerias e tubulações de drenagem que deságuam nele estão instaladas em diferentes cotas com inclinação suave (semi-horizontais).
-    >
-    > Quando o nível de água sobe no poço, ocorre o **efeito de remanso (backwater effect)**: a água retrocede e invade a rede de tubulações a montante. Para subir cada 1 cm no sensor do poço, a chuva precisa preencher não apenas o tubo vertical do poço, mas também metros de galerias conectadas (*Pipe Storage*). Esse volume em rede funciona como um **reservatório de amortecimento físico**, fazendo com que a seção acumuladora equivalente de água se comporte como uma área significativamente maior do que a camisa cilíndrica de 1,20 m.
-    
-    | Parâmetro | Valor | Interpretação |
-    |---|---|---|
-    | Profundidade sensor → fundo | **{FUNDODOPOCO} cm** | Reservatório principal de água |
-    | Sensor → borda superior | **{dist_borda_cm:.0f} cm** | Margem de segurança extra antes do transbordamento |
-    | Capacidade total do poço | **{capacidade_total_cm:.0f} cm** | Volume total que o poço suporta |
-    | Volume de segurança acima do sensor | **{volume_buffer_L:.0f} L** | Reserva que ganha tempo antes do transbordo |
-    | Bóia 1 LIGA quando distância | **≤ {d_on:.0f} cm** | Quando a água sobe e aciona a 1ª bomba |
-    | Bóia 1 DESLIGA quando distância | **≥ {d_off:.0f} cm** | Quando o poço esvazia até desligar a 1ª bomba |
-    {_bomba2_rows}| Fator correção ERA5 aplicado | **×{era5_correction:.2f}** | Ajuste dos dados climáticos (ver Seção 2) |
-            """
+            f"**O que esses números significam na prática?**\n\n"
+            f"- A capacidade total instalada de bombeamento é de **{r_pump_total_param:.1f} cm/h** ({vazao_total_m3h:.1f} m³/h).\n"
+            f"  Isso significa: se a chuva parar agora, o sistema leva cerca de **{_t_esvaziar} horas** "
+            f"para esvaziar completamente o poço a partir do nível máximo.\n"
+            f"- A área de drenagem de **{area_drenagem_m2:.0f} m²** significa que cada 1 mm de chuva coloca "
+            f"aproximadamente **{_vol_1mm:.0f} litros** de água dentro do poço.\n"
+            f"- O poço tem capacidade total de **{capacidade_total_cm:.0f} cm** de coluna d'água: "
+            f"{FUNDODOPOCO} cm do sensor até o fundo + {dist_borda_cm:.0f} cm do sensor até a borda superior.\n\n"
+            f"💡 **Nota Técnica — Por que a área/volume equivalente é maior que a seção do cilindro de concreto?**\n"
+            f"> Embora a camisa cilíndrica de concreto do poço tenha um diâmetro físico de **1,20 m** (seção transversal de **1,13 m²**), o poço não opera de forma isolada. As galerias e tubulações de drenagem que deságuam nele estão instaladas em diferentes cotas com inclinação suave (semi-horizontais).\n>\n"
+            f"> Quando o nível de água sobe no poço, ocorre o **efeito de remanso (backwater effect)**: a água retrocede e invade a rede de tubulações a montante. Para subir cada 1 cm no sensor do poço, a chuva precisa preencher não apenas o tubo vertical do poço, mas também metros de galerias conectadas (*Pipe Storage*). Esse volume em rede funciona como um **reservatório de amortecimento físico**, fazendo com que a seção acumuladora equivalente de água se comporte como uma área significativamente maior do que a camisa cilíndrica de 1,20 m.\n\n"
+            f"| Parâmetro | Valor | Interpretação |\n"
+            f"|---|---|---|\n"
+            f"| Profundidade sensor → fundo | **{FUNDODOPOCO} cm** | Reservatório principal de água |\n"
+            f"| Sensor → borda superior | **{dist_borda_cm:.0f} cm** | Margem de segurança extra antes do transbordamento |\n"
+            f"| Capacidade total do poço | **{capacidade_total_cm:.0f} cm** | Volume total que o poço suporta |\n"
+            f"| Volume de segurança acima do sensor | **{volume_buffer_L:.0f} L** | Reserva que ganha tempo antes do transbordo |\n"
+            f"| Bóia 1 LIGA quando distância | **≤ {d_on:.0f} cm** | Quando a água sobe e aciona a 1ª bomba |\n"
+            f"| Bóia 1 DESLIGA quando distância | **≥ {d_off:.0f} cm** | Quando o poço esvazia até desligar a 1ª bomba |\n"
+            f"{_bomba2_rows}"
+            f"| Fator correção ERA5 aplicado | **×{era5_correction:.2f}** | Ajuste dos dados climáticos (ver Seção 2) |"
         )
     
     
