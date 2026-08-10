@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import requests
 from urllib3.exceptions import InsecureRequestWarning
 import streamlit as st
@@ -480,8 +481,8 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(ttl="30m", max_entries=20)
 def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
-    """Busca dados horários de precipitação na API Open-Meteo.
-    Retorna DataFrame com índice datetime e coluna 'precipitation' (mm/h).
+    """Busca dados horários de precipitação e temperatura na API Open-Meteo.
+    Retorna DataFrame com índice datetime e colunas 'precipitation' (mm/h) e 'temperature_2m' (°C).
     Inclui histórico (archive) e previsão (forecast) conforme as datas solicitadas."""
     today = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
     start_ts = pd.Timestamp(start_date, tz="America/Sao_Paulo")
@@ -498,7 +499,7 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
             "longitude": lon,
             "start_date": start_ts.strftime("%Y-%m-%d"),
             "end_date": archive_end.strftime("%Y-%m-%d"),
-            "hourly": "precipitation",
+            "hourly": "precipitation,temperature_2m",
             "timezone": "America/Sao_Paulo",
         }
         try:
@@ -506,8 +507,9 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
             if r.status_code == 200:
                 d = r.json()
                 times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
-                precip = d["hourly"]["precipitation"]
-                frames.append(pd.DataFrame({"precipitation": precip}, index=times))
+                precip = d["hourly"].get("precipitation", [0.0] * len(times))
+                temp = d["hourly"].get("temperature_2m", [None] * len(times))
+                frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
         except Exception:
             pass
 
@@ -518,7 +520,7 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
         params_forecast = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "precipitation",
+            "hourly": "precipitation,temperature_2m",
             "timezone": "America/Sao_Paulo",
             "forecast_days": 8,
         }
@@ -527,16 +529,19 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
             if r.status_code == 200:
                 d = r.json()
                 times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
-                precip = d["hourly"]["precipitation"]
-                frames.append(pd.DataFrame({"precipitation": precip}, index=times))
+                precip = d["hourly"].get("precipitation", [0.0] * len(times))
+                temp = d["hourly"].get("temperature_2m", [None] * len(times))
+                frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
         except Exception:
             pass
 
     if not frames:
-        return pd.DataFrame(columns=["precipitation"])
+        return pd.DataFrame(columns=["precipitation", "temperature_2m"])
 
     result = pd.concat(frames).sort_index()
     result = result[~result.index.duplicated(keep="first")]
+    if "temperature_2m" in result.columns:
+        result["temperature_2m"] = pd.to_numeric(result["temperature_2m"], errors="coerce").ffill().bfill()
     return result
 
 
@@ -561,6 +566,56 @@ def build_precip_5min(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex | p
     )
     precip_reindexed.name = "precipitation_5min"
     return precip_reindexed
+
+
+def build_temp_grid(weather_df: pd.DataFrame, grid_index: pd.DatetimeIndex | pd.Series) -> pd.Series:
+    """Interpola a temperatura horária para os instantes exatos da grade de medições do sensor."""
+    grid_dt = pd.DatetimeIndex(grid_index)
+    if weather_df.empty or "temperature_2m" not in weather_df.columns or len(grid_dt) < 2:
+        return pd.Series(np.nan, index=grid_dt, name="temperatura_c")
+
+    hourly_temp = weather_df["temperature_2m"].dropna()
+    if hourly_temp.empty:
+        return pd.Series(np.nan, index=grid_dt, name="temperatura_c")
+
+    temp_reindexed = (
+        hourly_temp.reindex(hourly_temp.index.union(grid_dt))
+        .interpolate(method="time")
+        .reindex(grid_dt)
+        .ffill()
+        .bfill()
+    )
+    temp_reindexed.name = "temperatura_c"
+    return temp_reindexed
+
+
+def compute_ultrasonic_temperature_error(df: pd.DataFrame, v_esp32: float = 343.0) -> pd.DataFrame:
+    """Calcula o erro de distância do sensor ultrassônico decorrente da variação de temperatura no ar.
+
+    ESP32 assume velocidade constante v0 = 343 m/s (0.0343 cm/us).
+    Velocidade real do som: v(T) = 331.3 * sqrt(1 + T / 273.15) m/s.
+    Retorna cópia do DataFrame com colunas:
+    - 'v_som_m_s': velocidade real do som (m/s)
+    - 'distancia_corrigida_cm': distância real corrigida (cm)
+    - 'erro_distancia_cm': d_esp32 - d_corrigida (cm)
+    - 'erro_relativo_pct': porcentagem de desvio (%)
+    """
+    res = df.copy()
+    if "temperatura_c" not in res.columns:
+        res["temperatura_c"] = 20.0
+
+    temp_c = res["temperatura_c"].fillna(20.0)
+    v_real = 331.3 * np.sqrt(1.0 + temp_c / 273.15)
+    res["v_som_m_s"] = v_real
+
+    dist_raw = res["distancia_sensor_cm"] if "distancia_sensor_cm" in res.columns else res["nivel_cm"]
+    dist_raw_clean = pd.to_numeric(dist_raw, errors="coerce").fillna(FUNDODOPOCO / 2.0)
+
+    res["distancia_corrigida_cm"] = dist_raw_clean * (v_real / v_esp32)
+    res["erro_distancia_cm"] = dist_raw_clean - res["distancia_corrigida_cm"]
+    res["erro_relativo_pct"] = (1.0 - (v_real / v_esp32)) * 100.0
+
+    return res
 
 
 @st.cache_data(ttl="24h", max_entries=10)  # cache de 24h
@@ -1064,9 +1119,37 @@ if not weather_df.empty and era5_correction != 1.0:
     weather_df = weather_df.copy()
     weather_df["precipitation"] = weather_df["precipitation"] * era5_correction
 
+# Métricas de temperatura local (Open-Meteo)
+latest_temp = None
+temp_min_24h = None
+temp_max_24h = None
+temp_min_period = None
+temp_max_period = None
+temp_avg_period = None
+
+if not weather_df.empty and "temperature_2m" in weather_df.columns:
+    _now_temp_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+    _hist_temp_series = weather_df[weather_df.index <= _now_temp_tz]["temperature_2m"].dropna()
+    if not _hist_temp_series.empty:
+        latest_temp = float(_hist_temp_series.iloc[-1])
+        _last_24h_temp = weather_df[(weather_df.index >= (_now_temp_tz - pd.Timedelta(hours=24))) & (weather_df.index <= _now_temp_tz)]["temperature_2m"].dropna()
+        if not _last_24h_temp.empty:
+            temp_min_24h = float(_last_24h_temp.min())
+            temp_max_24h = float(_last_24h_temp.max())
+    
+    _sensor_temp_series = weather_df[(weather_df.index >= _sensor_min) & (weather_df.index <= _sensor_max)]["temperature_2m"].dropna()
+    if not _sensor_temp_series.empty:
+        temp_min_period = float(_sensor_temp_series.min())
+        temp_max_period = float(_sensor_temp_series.max())
+        temp_avg_period = float(_sensor_temp_series.mean())
+
 # Precipitação em 5min alinhada ao grid do sensor
 precip_5min_series = build_precip_5min(weather_df, filled_df["dt_round"])
 filled_df["precipitation_5min"] = precip_5min_series.values
+
+# Temperatura horária alinhada ao grid do sensor
+temp_sensor_series = build_temp_grid(weather_df, filled_df["dt_round"])
+filled_df["temperatura_c"] = temp_sensor_series.values
 
 latest_valid = filled_df[filled_df["nivel_cm"].notna()]
 if not latest_valid.empty:
@@ -1130,7 +1213,7 @@ else:
             f"(Sensor a {dist_sensor_agua:.0f} cm da água | Bomba Liga a {d_on:.0f} cm | Desliga a {d_off:.0f} cm)"
         )
 
-col1, col2, col3, col4 = st.columns(4)
+col1, col2, col3, col4, col5 = st.columns(5)
 total_obs = len(filled_df)
 missing_obs = filled_df["nivel_cm"].isna().sum()
 missing_pct = (missing_obs / total_obs) * 100
@@ -1138,6 +1221,11 @@ col1.metric("Total de Leituras Esperadas", f"{total_obs:,}")
 col2.metric("Leituras Validadas", f"{total_obs - missing_obs:,}")
 col3.metric("Dados Preenchidos (Gaps)", f"{missing_obs:,} ({missing_pct:.1f}%)")
 col4.metric("Faixa de Operação", f"{d_on:.1f} cm - {d_off:.1f} cm")
+if latest_temp is not None:
+    temp_delta_str = f"Mín {temp_min_24h:.1f}°C | Máx {temp_max_24h:.1f}°C (24h)" if temp_min_24h is not None and temp_max_24h is not None else None
+    col5.metric("🌡️ Temp. Local Atual", f"{latest_temp:.1f} °C", delta=temp_delta_str, delta_color="normal")
+else:
+    col5.metric("🌡️ Temp. Local Atual", "N/A")
 
 
 @st.cache_data(ttl="1h", max_entries=5)  # cache de 1h
@@ -1292,7 +1380,7 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
     ":material/analytics: Visualização e Imputação",
     ":material/architecture: Modelo Matemático",
     ":material/water: Simulador Pluviométrico",
-    ":material/cloud: Chuvas",
+    ":material/thermostat: Chuvas & Clima",
     ":material/auto_awesome: Previsão do Nível",
     ":material/history: Histórico & IDF",
     ":material/shield: Defesa Civil Blumenau",
@@ -1302,10 +1390,11 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
 
 with tab1:
     if tab1.open:
+        from plotly.subplots import make_subplots
         st.subheader("Série Temporal do Nível do Poço")
         st.caption(
-            "O eixo Y esquerdo (invertido) mostra a distância do sensor à linha d'água. "
-            "O eixo Y direito mostra a intensidade de precipitação em mm/hora."
+            "Painel sincronizado em tempo real: o gráfico superior mostra o nível do poço (esq.) e a chuva (dir.). "
+            "O gráfico inferior mostra a variação da temperatura local (°C) em alinhamento temporal perfeito com as medições."
         )
     
         trend = compute_recent_rising_trend(
@@ -1320,10 +1409,22 @@ with tab1:
         )
     
         has_rain_data = "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0
-    
-        fig = go.Figure()
+        has_temp_data = "temperatura_c" in filled_df.columns and filled_df["temperatura_c"].notna().any()
+
+        if has_temp_data:
+            fig = make_subplots(
+                rows=2,
+                cols=1,
+                shared_xaxes=True,
+                vertical_spacing=0.07,
+                row_heights=[0.68, 0.32],
+                specs=[[{"secondary_y": True}], [{"secondary_y": False}]],
+            )
+        else:
+            fig = go.Figure()
     
         # Barras de precipitação no eixo secundário (renderizadas primeiro para ficarem atrás)
+        w_fut = pd.DataFrame()
         if not weather_df.empty:
             sensor_min = filled_df["dt_round"].min()
             sensor_max = filled_df["dt_round"].max()
@@ -1341,25 +1442,29 @@ with tab1:
                 w_fut = w_chart[w_chart.index > sensor_max]
     
                 if not w_hist.empty:
-                    fig.add_trace(
-                        go.Bar(
-                            x=w_hist.index,
-                            y=w_hist["precipitation"],
-                            name="Chuva Recente (mm/h)",
-                            marker_color="rgba(30, 144, 255, 0.35)",
-                            yaxis="y2",
-                        )
+                    trace_rain_hist = go.Bar(
+                        x=w_hist.index,
+                        y=w_hist["precipitation"],
+                        name="Chuva Recente (mm/h)",
+                        marker_color="rgba(30, 144, 255, 0.35)",
                     )
+                    if has_temp_data:
+                        fig.add_trace(trace_rain_hist, row=1, col=1, secondary_y=True)
+                    else:
+                        trace_rain_hist.yaxis = "y2"
+                        fig.add_trace(trace_rain_hist)
                 if not w_fut.empty:
-                    fig.add_trace(
-                        go.Bar(
-                            x=w_fut.index,
-                            y=w_fut["precipitation"],
-                            name="Previsão Chuva ERA5 (mm/h)",
-                            marker_color="rgba(46, 204, 113, 0.45)",
-                            yaxis="y2",
-                        )
+                    trace_rain_fut = go.Bar(
+                        x=w_fut.index,
+                        y=w_fut["precipitation"],
+                        name="Previsão Chuva ERA5 (mm/h)",
+                        marker_color="rgba(46, 204, 113, 0.45)",
                     )
+                    if has_temp_data:
+                        fig.add_trace(trace_rain_fut, row=1, col=1, secondary_y=True)
+                    else:
+                        trace_rain_fut.yaxis = "y2"
+                        fig.add_trace(trace_rain_fut)
         elif "precipitation_5min" in filled_df.columns and filled_df["precipitation_5min"].sum() > 0:
             if len(filled_df) > 1:
                 step_min = (filled_df["dt_round"].iloc[1] - filled_df["dt_round"].iloc[0]).total_seconds() / 60.0
@@ -1369,93 +1474,258 @@ with tab1:
                 step_min = 5.0
             precip_mmh = filled_df["precipitation_5min"] * (60.0 / step_min)
     
-            fig.add_trace(
-                go.Bar(
-                    x=filled_df["dt_round"],
-                    y=precip_mmh,
-                    name="Chuva (mm/h)",
-                    marker_color="rgba(30, 144, 255, 0.35)",
-                    yaxis="y2",
-                )
+            trace_rain_grid = go.Bar(
+                x=filled_df["dt_round"],
+                y=precip_mmh,
+                name="Chuva (mm/h)",
+                marker_color="rgba(30, 144, 255, 0.35)",
             )
+            if has_temp_data:
+                fig.add_trace(trace_rain_grid, row=1, col=1, secondary_y=True)
+            else:
+                trace_rain_grid.yaxis = "y2"
+                fig.add_trace(trace_rain_grid)
     
-        fig.add_trace(
-            go.Scatter(
-                x=filled_df["dt_round"],
-                y=filled_df["nivel_cm"],
-                mode="markers",
-                name="Dados Reais (Sensor)",
-                marker=dict(size=4, color="#1f77b4"),
-            )
+        trace_sensor = go.Scatter(
+            x=filled_df["dt_round"],
+            y=filled_df["nivel_cm"],
+            mode="markers",
+            name="Dados Reais (Sensor)",
+            marker=dict(size=4, color="#1f77b4"),
         )
-        fig.add_trace(
-            go.Scatter(
-                x=filled_df["dt_round"],
-                y=filled_df["nivel_imputed"],
-                mode="lines",
-                name="Modelo Estimado (Sem Gaps)",
-                line=dict(color="#ff7f0e", width=1.5),
-            )
+        trace_imputed = go.Scatter(
+            x=filled_df["dt_round"],
+            y=filled_df["nivel_imputed"],
+            mode="lines",
+            name="Modelo Estimado (Sem Gaps)",
+            line=dict(color="#ff7f0e", width=1.5),
         )
+
+        if has_temp_data:
+            fig.add_trace(trace_sensor, row=1, col=1, secondary_y=False)
+            fig.add_trace(trace_imputed, row=1, col=1, secondary_y=False)
+        else:
+            fig.add_trace(trace_sensor)
+            fig.add_trace(trace_imputed)
     
         if trend and trend["rate_cmh"] > 0:
             t_latest = trend["latest_time"]
             t_sensor_dt = t_latest + pd.Timedelta(hours=trend["time_sensor_h"])
             t_overflow_dt = t_latest + pd.Timedelta(hours=trend["time_overflow_h"])
     
-            # Projeção Linear Base (Sem Chuva)
-            fig.add_trace(
-                go.Scatter(
-                    x=[t_latest, t_sensor_dt, t_overflow_dt],
-                    y=[trend["curr_d"], 0, d_overflow],
-                    mode="lines+markers",
-                    name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
-                    line=dict(color="#777777", width=2, dash="dash"),
-                    marker=dict(size=5, symbol="circle"),
-                )
+            trace_proj_base = go.Scatter(
+                x=[t_latest, t_sensor_dt, t_overflow_dt],
+                y=[trend["curr_d"], 0, d_overflow],
+                mode="lines+markers",
+                name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
+                line=dict(color="#777777", width=2, dash="dash"),
+                marker=dict(size=5, symbol="circle"),
             )
+            if has_temp_data:
+                fig.add_trace(trace_proj_base, row=1, col=1, secondary_y=False)
+            else:
+                fig.add_trace(trace_proj_base)
     
             # Projeção Corrigida com Previsão ERA5 (Com Chuva Futura)
             if trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=trend["era5_sim_df"]["dt_round"],
-                        y=trend["era5_sim_df"]["nivel_imputed"],
-                        mode="lines",
-                        name="Projeção Corrigida (ERA5 + Chuva)",
-                        line=dict(color="#d9534f", width=2.5, dash="dot"),
-                    )
+                trace_proj_era5 = go.Scatter(
+                    x=trend["era5_sim_df"]["dt_round"],
+                    y=trend["era5_sim_df"]["nivel_imputed"],
+                    mode="lines",
+                    name="Projeção Corrigida (ERA5 + Chuva)",
+                    line=dict(color="#d9534f", width=2.5, dash="dot"),
                 )
+                if has_temp_data:
+                    fig.add_trace(trace_proj_era5, row=1, col=1, secondary_y=False)
+                else:
+                    fig.add_trace(trace_proj_era5)
+
         b1_on_label = "Bomba 1 Liga (Água Alta)" if tem_bomba2 else "Bomba Liga (Água Alta)"
         b1_off_label = "Bomba 1 Desliga (Água Baixa)" if tem_bomba2 else "Bomba Desliga (Água Baixa)"
-        fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label)
-        fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label)
-        if tem_bomba2:
-            fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
-            fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
-        fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)")
-        fig.update_layout(
-            yaxis=dict(
+
+        if has_temp_data:
+            fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label, row=1, col=1)
+            fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label, row=1, col=1)
+            if tem_bomba2:
+                fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)", row=1, col=1)
+                fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga", row=1, col=1)
+            fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)", row=1, col=1)
+
+            # ── Subplot 2: Temperatura Local sincronizada no tempo ──
+            fig.add_trace(
+                go.Scatter(
+                    x=filled_df["dt_round"],
+                    y=filled_df["temperatura_c"],
+                    mode="lines",
+                    name="Temperatura Local (°C)",
+                    line=dict(color="#ff6b6b", width=2),
+                    hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Temperatura: <b>%{y:.1f} °C</b><extra></extra>",
+                ),
+                row=2, col=1
+            )
+            if not w_fut.empty and "temperature_2m" in w_fut.columns:
+                fig.add_trace(
+                    go.Scatter(
+                        x=w_fut.index,
+                        y=w_fut["temperature_2m"],
+                        mode="lines",
+                        name="Previsão Temp. (°C)",
+                        line=dict(color="#f39c12", width=2, dash="dash"),
+                        hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Previsão Temp.: <b>%{y:.1f} °C</b><extra></extra>",
+                    ),
+                    row=2, col=1
+                )
+
+            fig.update_yaxes(
+                title_text="Nível (cm)",
                 autorange="reversed",
-                title="Nível da Água (cm abaixo do topo do poço)",
-            ),
-            yaxis2=dict(
-                title="Precipitação (mm/h)",
-                overlaying="y",
-                side="right",
+                row=1, col=1, secondary_y=False
+            )
+            fig.update_yaxes(
+                title_text="Chuva (mm/h)",
                 showgrid=False,
                 rangemode="tozero",
                 tickfont=dict(color="rgba(30, 144, 255, 0.8)"),
                 title_font=dict(color="rgba(30, 144, 255, 0.8)"),
-            ),
-            xaxis=dict(title="Data / Hora"),
-            legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
-            height=520,
-            margin=dict(l=20, r=60, t=30, b=40),
-            bargap=0,
-        )
+                row=1, col=1, secondary_y=True
+            )
+            fig.update_yaxes(
+                title_text="Temp. (°C)",
+                tickfont=dict(color="#e74c3c"),
+                title_font=dict(color="#e74c3c"),
+                row=2, col=1
+            )
+            fig.update_xaxes(title_text="Data / Hora", row=2, col=1)
+
+            fig.update_layout(
+                height=640,
+                margin=dict(l=20, r=60, t=30, b=40),
+                legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+                bargap=0,
+                hovermode="x unified",
+            )
+        else:
+            fig.add_hline(y=d_on, line_dash="dash", line_color="red", annotation_text=b1_on_label)
+            fig.add_hline(y=d_off, line_dash="dash", line_color="green", annotation_text=b1_off_label)
+            if tem_bomba2:
+                fig.add_hline(y=d_on2, line_dash="dash", line_color="#f0ad4e", annotation_text="Bomba 2 Liga (Emergência)")
+                fig.add_hline(y=d_off2, line_dash="dash", line_color="#5cb85c", annotation_text="Bomba 2 Desliga")
+            fig.add_hline(y=d_overflow, line_dash="dot", line_color="black", annotation_text="Topo do Poço / Borda Superior (0 cm)")
+            fig.update_layout(
+                yaxis=dict(
+                    autorange="reversed",
+                    title="Nível da Água (cm abaixo do topo do poço)",
+                ),
+                yaxis2=dict(
+                    title="Precipitação (mm/h)",
+                    overlaying="y",
+                    side="right",
+                    showgrid=False,
+                    rangemode="tozero",
+                    tickfont=dict(color="rgba(30, 144, 255, 0.8)"),
+                    title_font=dict(color="rgba(30, 144, 255, 0.8)"),
+                ),
+                xaxis=dict(title="Data / Hora"),
+                legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                height=520,
+                margin=dict(l=20, r=60, t=30, b=40),
+                bargap=0,
+            )
+
         st.plotly_chart(fig, width="stretch")
-    
+
+        # Resumo Estatístico da Temperatura no Período de Monitoramento (Tab 1)
+        if has_temp_data:
+            w_temp_valid = filled_df["temperatura_c"].dropna()
+            if not w_temp_valid.empty:
+                with st.expander("🌡️ Resumo da Temperatura Local Sincronizada", expanded=False):
+                    col_tp1, col_tp2, col_tp3 = st.columns(3)
+                    col_tp1.metric("Temperatura Mínima", f"{w_temp_valid.min():.1f} °C")
+                    col_tp2.metric("Temperatura Média", f"{w_temp_valid.mean():.1f} °C")
+                    col_tp3.metric("Temperatura Máxima", f"{w_temp_valid.max():.1f} °C")
+
+        # Análise de Erro do Sensor Ultrassônico por Variação Térmica (ESP32 vs Temp. Real)
+        if has_temp_data:
+            err_df = compute_ultrasonic_temperature_error(filled_df, v_esp32=343.0)
+            if not err_df.empty and "erro_distancia_cm" in err_df.columns:
+                with st.expander("📏 Análise de Erro do Sensor Ultrassônico por Variação Térmica (ESP32 vs Temp. Real)", expanded=False):
+                    st.markdown(
+                        "O firmware do ESP32 utiliza velocidade do som constante: "
+                        "`float distancia = duracao * 0.0343 / 2.0;` ($v_0 = 343.0\\text{ m/s}$, válida para $T \\approx 19.3^\\circ\\text{C}$).\n\n"
+                        "A velocidade real do som varia com a temperatura ambiente segundo a física: "
+                        "$v(T) = 331.3 \\times \\sqrt{1 + \\frac{T}{273.15}}\\text{ m/s}$. "
+                        "Abaixo é apresentado o impacto real dessa variação de temperatura nas medições do poço:"
+                    )
+
+                    max_abs_err = err_df["erro_distancia_cm"].abs().max()
+                    mean_err = err_df["erro_distancia_cm"].mean()
+                    max_pct_err = err_df["erro_relativo_pct"].abs().max()
+                    v_min = err_df["v_som_m_s"].min()
+                    v_max = err_df["v_som_m_s"].max()
+
+                    col_err1, col_err2, col_err3, col_err4 = st.columns(4)
+                    col_err1.metric("Erro Absoluto Máximo", f"{max_abs_err:.1f} cm", help="Diferença máxima entre o medido pela ESP32 e o valor real corrigido")
+                    col_err2.metric("Erro Médio de Leitura", f"{mean_err:+.1f} cm", help="Desvio médio em todo o período monitorado")
+                    col_err3.metric("Desvio Relativo Máximo", f"{max_pct_err:.2f} %", help="Percentual máximo de variação gerado pela temperatura")
+                    col_err4.metric("Velocidade do Som Variação", f"{v_min:.1f} a {v_max:.1f} m/s", help="Constante ESP32: 343.0 m/s")
+
+                    st.markdown("---")
+
+                    fig_err = make_subplots(
+                        rows=2,
+                        cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.08,
+                        row_heights=[0.6, 0.4],
+                        specs=[[{"secondary_y": False}], [{"secondary_y": False}]],
+                    )
+
+                    fig_err.add_trace(
+                        go.Scatter(
+                            x=err_df["dt_round"],
+                            y=err_df["nivel_cm"],
+                            mode="markers",
+                            name="Medição Bruta ESP32 (v0=343 m/s)",
+                            marker=dict(size=4, color="#1f77b4"),
+                        ),
+                        row=1, col=1
+                    )
+                    fig_err.add_trace(
+                        go.Scatter(
+                            x=err_df["dt_round"],
+                            y=err_df["distancia_corrigida_cm"],
+                            mode="lines",
+                            name="Distância Real Corrigida (Temp. Real)",
+                            line=dict(color="#2ecc71", width=2),
+                        ),
+                        row=1, col=1
+                    )
+
+                    fig_err.add_trace(
+                        go.Scatter(
+                            x=err_df["dt_round"],
+                            y=err_df["erro_distancia_cm"],
+                            mode="lines",
+                            name="Erro Absoluto d_ESP32 - d_Real (cm)",
+                            line=dict(color="#e74c3c", width=1.8),
+                            fill="tozeroy",
+                            fillcolor="rgba(231, 76, 60, 0.15)",
+                        ),
+                        row=2, col=1
+                    )
+
+                    fig_err.update_yaxes(title_text="Distância ao Sensor (cm)", autorange="reversed", row=1, col=1)
+                    fig_err.update_yaxes(title_text="Erro (cm)", row=2, col=1)
+                    fig_err.update_xaxes(title_text="Data / Hora", row=2, col=1)
+
+                    fig_err.update_layout(
+                        height=520,
+                        margin=dict(l=20, r=20, t=20, b=30),
+                        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+                        hovermode="x unified",
+                    )
+                    st.plotly_chart(fig_err, width="stretch")
+
         if not has_rain_data:
             st.info("ℹ️ Dados de precipitação não disponíveis para o período exibido (API Open-Meteo).")
     
@@ -2187,19 +2457,19 @@ with tab3:
     
 with tab4:
     if tab4.open:
-        st.subheader("🌦️ Dados de Precipitação – Open-Meteo")
+        st.subheader("🌦️ Dados de Precipitação e Temperatura Local – Open-Meteo")
         st.caption(f"Localização: lat {latitude:.4f}, lon {longitude:.4f} | Fonte: Open-Meteo (histórico + previsão 7 dias)")
-    
+
         if weather_df.empty:
-            st.error("Não foi possível obter dados de precipitação da API Open-Meteo. Verifique a conexão ou as coordenadas.")
+            st.error("Não foi possível obter dados meteorológicos da API Open-Meteo. Verifique a conexão ou as coordenadas.")
         else:
             now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
-    
+
             # Separar histórico e previsão
             hist_df = weather_df[weather_df.index <= now_tz].copy()
             fcast_df = weather_df[weather_df.index > now_tz].copy()
-    
-            # Métricas principais
+
+            # Métricas principais de precipitação
             last_24h = weather_df[weather_df.index >= (now_tz - pd.Timedelta(hours=24))]
             next_24h = weather_df[
                 (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=24)))
@@ -2212,20 +2482,30 @@ with tab4:
             ]
             total_7d_precip = next_7d["precipitation"].sum() if not next_7d.empty else 0.0
             max_intensity = weather_df["precipitation"].max()
-    
+
+            st.markdown("#### 🌧️ Métricas de Precipitação")
             col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
             col_w1.metric("Acumulado últimas 24h", f"{last_24h['precipitation'].sum():.1f} mm")
             col_w2.metric("Previsão próximas 24h", f"{next_24h['precipitation'].sum():.1f} mm")
             col_w3.metric("Previsão próximas 48h", f"{next_48h['precipitation'].sum():.1f} mm")
             col_w4.metric("Previsão próximos 7 dias", f"{total_7d_precip:.1f} mm")
             col_w5.metric("Intensidade máx.", f"{max_intensity:.1f} mm/h")
-    
+
+            if "temperature_2m" in weather_df.columns:
+                st.markdown("#### 🌡️ Métricas de Temperatura Local")
+                col_wt1, col_wt2, col_wt3, col_wt4, col_wt5 = st.columns(5)
+                col_wt1.metric("Temperatura Atual", f"{latest_temp:.1f} °C" if latest_temp is not None else "N/A")
+                col_wt2.metric("Temp. Mínima (24h)", f"{temp_min_24h:.1f} °C" if temp_min_24h is not None else "N/A")
+                col_wt3.metric("Temp. Máxima (24h)", f"{temp_max_24h:.1f} °C" if temp_max_24h is not None else "N/A")
+                col_wt4.metric("Faixa no Período", f"{temp_min_period:.1f}°C a {temp_max_period:.1f}°C" if temp_min_period is not None else "N/A")
+                col_wt5.metric("Média no Período", f"{temp_avg_period:.1f} °C" if temp_avg_period is not None else "N/A")
+
             st.markdown("---")
-    
+
             # Gráfico de precipitação horária completo
             st.subheader("Precipitação Horária – Histórico e Previsão (7 Dias)")
             fig_rain = go.Figure()
-    
+
             if not hist_df.empty:
                 fig_rain.add_trace(
                     go.Bar(
@@ -2235,7 +2515,7 @@ with tab4:
                         marker_color="rgba(30, 100, 220, 0.7)",
                     )
                 )
-    
+
             if not fcast_df.empty:
                 fig_rain.add_trace(
                     go.Bar(
@@ -2245,7 +2525,7 @@ with tab4:
                         marker_color="rgba(100, 200, 100, 0.7)",
                     )
                 )
-    
+
             _now_str = now_tz.strftime("%Y-%m-%d %H:%M:%S")
             fig_rain.add_shape(
                 type="line",
@@ -2274,6 +2554,62 @@ with tab4:
                 margin=dict(l=20, r=20, t=20, b=40),
             )
             st.plotly_chart(fig_rain, width="stretch")
+
+            # Gráfico de Variação da Temperatura Local Horária (Histórico + Previsão)
+            if "temperature_2m" in weather_df.columns and not weather_df["temperature_2m"].dropna().empty:
+                st.subheader("🌡️ Variação da Temperatura Local – Histórico e Previsão (7 Dias)")
+                fig_temp = go.Figure()
+
+                if not hist_df.empty and "temperature_2m" in hist_df.columns:
+                    fig_temp.add_trace(
+                        go.Scatter(
+                            x=hist_df.index,
+                            y=hist_df["temperature_2m"],
+                            mode="lines",
+                            name="Temperatura Histórica (°C)",
+                            line=dict(color="#e74c3c", width=2),
+                            hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Temp. Histórica: <b>%{y:.1f} °C</b><extra></extra>",
+                        )
+                    )
+                if not fcast_df.empty and "temperature_2m" in fcast_df.columns:
+                    fig_temp.add_trace(
+                        go.Scatter(
+                            x=fcast_df.index,
+                            y=fcast_df["temperature_2m"],
+                            mode="lines",
+                            name="Previsão Temperatura (°C)",
+                            line=dict(color="#f39c12", width=2, dash="dash"),
+                            hovertemplate="%{x|%d/%m/%Y %H:%M}<br>Previsão Temp.: <b>%{y:.1f} °C</b><extra></extra>",
+                        )
+                    )
+
+                fig_temp.add_shape(
+                    type="line",
+                    x0=_now_str,
+                    x1=_now_str,
+                    y0=0,
+                    y1=1,
+                    yref="paper",
+                    line=dict(dash="dash", color="orange", width=1.5),
+                )
+                fig_temp.add_annotation(
+                    x=_now_str,
+                    y=1,
+                    yref="paper",
+                    text="Agora",
+                    showarrow=False,
+                    xanchor="left",
+                    font=dict(color="orange"),
+                )
+                fig_temp.update_layout(
+                    xaxis_title="Data / Hora",
+                    yaxis_title="Temperatura (°C)",
+                    legend=dict(orientation="h", y=-0.2, x=0.5, xanchor="center"),
+                    height=380,
+                    margin=dict(l=20, r=20, t=20, b=40),
+                    hovermode="x unified",
+                )
+                st.plotly_chart(fig_temp, width="stretch")
     
             # Resumo Diário da Previsão dos Próximos 7 Dias
             st.subheader("📅 Resumo Diário da Previsão – Próximos 7 Dias")
@@ -2326,14 +2662,13 @@ with tab4:
             # Previsão detalhada próximas 48h
             st.subheader("📋 Previsão Detalhada – Próximas 48 Horas")
             if not next_48h.empty:
-                fcast_table = next_48h.copy()
+                fcast_table = next_48h.rename(columns={"precipitation": "Precipitação (mm/h)", "temperature_2m": "Temperatura (°C)"}).copy()
                 fcast_table.index = pd.to_datetime(fcast_table.index).strftime("%d/%m/%Y %H:%M")
-                fcast_table.columns = ["Precipitação (mm/h)"]
-                fcast_table = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
-                if fcast_table.empty:
+                fcast_table_rain = fcast_table[fcast_table["Precipitação (mm/h)"] > 0]
+                if fcast_table_rain.empty:
                     st.success("✅ Nenhuma precipitação prevista nas próximas 48 horas.")
                 else:
-                    st.dataframe(fcast_table, width="stretch")
+                    st.dataframe(fcast_table_rain, width="stretch")
                     total_prev = next_48h["precipitation"].sum()
                     nivel_equiv_cm = total_prev * factor_mm_cm
                     st.info(
@@ -2346,9 +2681,8 @@ with tab4:
             # Previsão Horária Completa (7 dias)
             with st.expander("Ver previsão horária completa (próximos 7 dias)", icon=":material/calendar_month:"):
                 if not fcast_df.empty:
-                    show_fcast_7d = fcast_df.copy()
+                    show_fcast_7d = fcast_df.rename(columns={"precipitation": "Precipitação (mm/h)", "temperature_2m": "Temperatura (°C)"}).copy()
                     show_fcast_7d.index = pd.to_datetime(show_fcast_7d.index).strftime("%d/%m/%Y %H:%M")
-                    show_fcast_7d.columns = ["Precipitação (mm/h)"]
                     st.dataframe(show_fcast_7d, width="stretch")
                 else:
                     st.write("Sem previsão horária disponível.")
@@ -2356,16 +2690,15 @@ with tab4:
             # Histórico completo dos últimos dias
             with st.expander("Ver histórico de precipitação (últimos dias)", icon=":material/folder:"):
                 if not hist_df.empty:
-                    show_hist = hist_df.copy()
+                    show_hist = hist_df.rename(columns={"precipitation": "Precipitação (mm/h)", "temperature_2m": "Temperatura (°C)"}).copy()
                     show_hist.index = pd.to_datetime(show_hist.index).strftime("%d/%m/%Y %H:%M")
-                    show_hist.columns = ["Precipitação (mm/h)"]
                     st.dataframe(show_hist, width="stretch")
                 else:
                     st.write("Sem dados históricos disponíveis.")
     
 with tab5:
     if tab5.open:
-        st.subheader("🔮 Previsão do Nível do Poço – Próximas 48 Horas")
+        st.subheader("🔮 Previsão do Nível do Poço – Próximas 120 Horas")
         st.caption(
             "Simulação a partir do nível atual real do sensor, aplicando o modelo de balanço de massa "
             "com a previsão horária de precipitação da Open-Meteo."
@@ -2373,12 +2706,12 @@ with tab5:
     
         now_tz5 = pd.Timestamp.now(tz="America/Sao_Paulo")
     
-        # Previsão de precipitação nas próximas 48h (dados horários)
-        fcast_48h = pd.DataFrame()
+        # Previsão de precipitação nas próximas 120h (dados horários)
+        fcast_120h = pd.DataFrame()
         if not weather_df.empty:
-            fcast_48h = weather_df[
+            fcast_120h = weather_df[
                 (weather_df.index > now_tz5) &
-                (weather_df.index <= now_tz5 + pd.Timedelta(hours=48))
+                (weather_df.index <= now_tz5 + pd.Timedelta(hours=120))
             ].copy()
     
         # Controles da simulação
@@ -2391,7 +2724,7 @@ with tab5:
             )
         with col_s2:
             horizonte_h = st.slider(
-                "Horizonte da Previsão (horas)", min_value=6, max_value=48, value=24, step=6,
+                "Horizonte da Previsão (horas)", min_value=6, max_value=120, value=24, step=6,
                 key="horizonte_tab5",
             )
     
@@ -2420,11 +2753,11 @@ with tab5:
     
         for i, t in enumerate(sim_times):
             # Precipitação horária correspondente ao instante t
-            if not fcast_48h.empty:
+            if not fcast_120h.empty:
                 # pegar a hora exata ou anterior mais próxima
-                idx_candidates = fcast_48h.index[fcast_48h.index <= t]
+                idx_candidates = fcast_120h.index[fcast_120h.index <= t]
                 if len(idx_candidates) > 0:
-                    precip_mmh = float(fcast_48h.loc[idx_candidates[-1], "precipitation"])
+                    precip_mmh = float(fcast_120h.loc[idx_candidates[-1], "precipitation"])
                 else:
                     precip_mmh = 0.0
             else:
@@ -2478,7 +2811,7 @@ with tab5:
         # ── Métricas resumo ──
         nivel_final = sim_levels[-1]
         nivel_min = min(sim_levels)
-        chuva_total_prev = fcast_48h["precipitation"].sum() if not fcast_48h.empty else 0.0
+        chuva_total_prev = fcast_120h["precipitation"].sum() if not fcast_120h.empty else 0.0
         chuva_periodo = (
             weather_df[
                 (weather_df.index > now_tz5) &
@@ -2501,8 +2834,8 @@ with tab5:
         fig5 = go.Figure()
     
         # Barras de chuva prevista (eixo secundário)
-        if not fcast_48h.empty:
-            fcast_plot = fcast_48h[fcast_48h.index <= now_tz5 + pd.Timedelta(hours=horizonte_h)]
+        if not fcast_120h.empty:
+            fcast_plot = fcast_120h[fcast_120h.index <= now_tz5 + pd.Timedelta(hours=horizonte_h)]
             if not fcast_plot.empty:
                 fig5.add_trace(
                     go.Bar(
@@ -2609,7 +2942,7 @@ with tab5:
                 f"({delta_h}h {delta_m}min a partir de agora)."
             )
         else:
-            intensidade_max_prev = fcast_48h["precipitation"].max() if not fcast_48h.empty else 0.0
+            intensidade_max_prev = fcast_120h["precipitation"].max() if not fcast_120h.empty else 0.0
             intensidade_sat = r_pump_param / factor_mm_cm
             if intensidade_max_prev > intensidade_sat and bomba_status5 == "Operacional (Ligada)":
                 st.warning(
@@ -2629,8 +2962,8 @@ with tab5:
             hourly_sim["Altura Água (cm)"] = (FUNDODOPOCO - hourly_sim["nivel_cm"]).clip(lower=0).round(1)
     
             # Merge com precipitação horária prevista
-            if not fcast_48h.empty:
-                fcast_merge = fcast_48h.resample("1h").sum().rename(columns={"precipitation": "Chuva Prevista (mm/h)"})
+            if not fcast_120h.empty:
+                fcast_merge = fcast_120h.resample("1h").sum().rename(columns={"precipitation": "Chuva Prevista (mm/h)"})
                 hourly_sim = hourly_sim.join(fcast_merge, how="left")
                 hourly_sim["Chuva Prevista (mm/h)"] = hourly_sim["Chuva Prevista (mm/h)"].fillna(0.0).round(2)
     
