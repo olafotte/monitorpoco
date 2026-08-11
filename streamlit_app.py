@@ -497,57 +497,89 @@ def fill_gaps(df: pd.DataFrame) -> pd.DataFrame:
 def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -> pd.DataFrame:
     """Busca dados horários de precipitação e temperatura na API Open-Meteo.
     Retorna DataFrame com índice datetime e colunas 'precipitation' (mm/h) e 'temperature_2m' (°C).
-    Inclui histórico (archive) e previsão (forecast) conforme as datas solicitadas."""
+    Inclui histórico (archive / past_days) e previsão (forecast) conforme as datas solicitadas."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     today = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
     start_ts = pd.Timestamp(start_date, tz="America/Sao_Paulo")
     end_ts = pd.Timestamp(end_date, tz="America/Sao_Paulo")
 
+    days_past = (today - start_ts).days
+    days_future = (end_ts - today).days
+
     frames = []
 
-    # Histórico via open-meteo archive
-    archive_end = min(end_ts, today - pd.Timedelta(days=1))
-    if start_ts <= archive_end:
-        url_archive = "https://archive-api.open-meteo.com/v1/archive"
-        params_archive = {
-            "latitude": lat,
-            "longitude": lon,
-            "start_date": start_ts.strftime("%Y-%m-%d"),
-            "end_date": archive_end.strftime("%Y-%m-%d"),
-            "hourly": "precipitation,temperature_2m",
-            "timezone": "America/Sao_Paulo",
-        }
-        try:
-            r = requests.get(url_archive, params=params_archive, timeout=15)
-            if r.status_code == 200:
-                d = r.json()
-                times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
-                precip = d["hourly"].get("precipitation", [0.0] * len(times))
-                temp = d["hourly"].get("temperature_2m", [None] * len(times))
-                frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
-        except Exception:
-            pass
-
-    # Previsão via open-meteo forecast
-    forecast_start = max(start_ts, today)
-    if forecast_start <= end_ts:
+    # 1. Primeira tentativa: API Forecast com past_days (cobre até 92 dias do passado + previsão em 1 chamada rápida)
+    if days_past <= 90:
         url_forecast = "https://api.open-meteo.com/v1/forecast"
+        p_past = max(1, min(days_past + 2, 92))
+        p_fut = max(1, min(days_future + 2, 16))
         params_forecast = {
             "latitude": lat,
             "longitude": lon,
             "hourly": "precipitation,temperature_2m",
             "timezone": "America/Sao_Paulo",
-            "forecast_days": 8,
+            "past_days": p_past,
+            "forecast_days": p_fut,
         }
         try:
-            r = requests.get(url_forecast, params=params_forecast, timeout=15)
+            r = requests.get(url_forecast, params=params_forecast, headers=headers, timeout=15)
             if r.status_code == 200:
                 d = r.json()
                 times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
                 precip = d["hourly"].get("precipitation", [0.0] * len(times))
                 temp = d["hourly"].get("temperature_2m", [None] * len(times))
-                frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
+                df_f = pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times)
+                df_f = df_f[(df_f.index >= start_ts) & (df_f.index <= end_ts + pd.Timedelta(days=1))]
+                if not df_f.empty:
+                    frames.append(df_f)
         except Exception:
             pass
+
+    # 2. Segunda tentativa / passado distante (> 90 dias): Archive API
+    if not frames or days_past > 90:
+        archive_end = min(end_ts, today - pd.Timedelta(days=2))
+        if start_ts <= archive_end:
+            url_archive = "https://archive-api.open-meteo.com/v1/archive"
+            params_archive = {
+                "latitude": lat,
+                "longitude": lon,
+                "start_date": start_ts.strftime("%Y-%m-%d"),
+                "end_date": archive_end.strftime("%Y-%m-%d"),
+                "hourly": "precipitation,temperature_2m",
+                "timezone": "America/Sao_Paulo",
+            }
+            try:
+                r = requests.get(url_archive, params=params_archive, headers=headers, timeout=20)
+                if r.status_code == 200:
+                    d = r.json()
+                    times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
+                    precip = d["hourly"].get("precipitation", [0.0] * len(times))
+                    temp = d["hourly"].get("temperature_2m", [None] * len(times))
+                    frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
+            except Exception:
+                pass
+
+        # Previsão complementar se buscou do archive
+        forecast_start = max(start_ts, today)
+        if forecast_start <= end_ts:
+            url_forecast = "https://api.open-meteo.com/v1/forecast"
+            params_forecast = {
+                "latitude": lat,
+                "longitude": lon,
+                "hourly": "precipitation,temperature_2m",
+                "timezone": "America/Sao_Paulo",
+                "forecast_days": 8,
+            }
+            try:
+                r = requests.get(url_forecast, params=params_forecast, headers=headers, timeout=15)
+                if r.status_code == 200:
+                    d = r.json()
+                    times = pd.to_datetime(d["hourly"]["time"]).tz_localize("America/Sao_Paulo")
+                    precip = d["hourly"].get("precipitation", [0.0] * len(times))
+                    temp = d["hourly"].get("temperature_2m", [None] * len(times))
+                    frames.append(pd.DataFrame({"precipitation": precip, "temperature_2m": temp}, index=times))
+            except Exception:
+                pass
 
     if not frames:
         return pd.DataFrame(columns=["precipitation", "temperature_2m"])
@@ -658,9 +690,10 @@ def fetch_historical_5years_precip(lat: float, lon: float, start_date_str: str =
         "hourly": "precipitation",
         "timezone": "UTC",   # UTC evita DST — convertemos para local depois com tz_convert()
     }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     empty = pd.DataFrame(columns=["precipitation"])
     try:
-        r = requests.get(url, params=params, timeout=90)
+        r = requests.get(url, params=params, headers=headers, timeout=90)
         if r.status_code == 200:
             d = r.json()
             # tz_localize("UTC") nunca tem ambiguidade; tz_convert() também não levanta DST
