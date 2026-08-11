@@ -11,6 +11,7 @@ import re
 import warnings
 import datetime as _dt
 import textwrap
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -42,6 +43,21 @@ from src.data.sensor_config import (
     get_dist_borda_series,
 )
 from src.models.gumbel import fit_gumbel, gumbel_quantile
+
+LOCAL_TZ = ZoneInfo("America/Sao_Paulo")
+
+def now_local() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=LOCAL_TZ)
+
+
+def normalize_local_ts(ts):
+    if ts is None or pd.isna(ts):
+        return pd.NaT
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return ts.tz_localize(LOCAL_TZ)
+    return ts.tz_convert(LOCAL_TZ)
+
 
 st.set_page_config(
     page_title="Monitoramento de Poço - Condomínio",
@@ -499,9 +515,9 @@ def fetch_weather_data(lat: float, lon: float, start_date: str, end_date: str) -
     Retorna DataFrame com índice datetime e colunas 'precipitation' (mm/h) e 'temperature_2m' (°C).
     Inclui histórico (archive / past_days) e previsão (forecast) conforme as datas solicitadas."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    today = pd.Timestamp.now(tz="America/Sao_Paulo").normalize()
-    start_ts = pd.Timestamp(start_date, tz="America/Sao_Paulo")
-    end_ts = pd.Timestamp(end_date, tz="America/Sao_Paulo")
+    today = now_local().normalize()
+    start_ts = pd.Timestamp(start_date, tz=LOCAL_TZ)
+    end_ts = pd.Timestamp(end_date, tz=LOCAL_TZ)
 
     days_past = (today - start_ts).days
     days_future = (end_ts - today).days
@@ -671,7 +687,7 @@ def fetch_historical_5years_precip(lat: float, lon: float, start_date_str: str =
     Se end_date_str for fornecido, usa essa data como fim; caso contrário usa ontem.
     Retorna (DataFrame, erro_str) – erro_str é vazio em caso de sucesso."""
     # Usar datas naïve para a query (evita tz_localize extra)
-    today = pd.Timestamp.now().normalize()
+    today = now_local().normalize()
     if end_date_str:
         end_date = pd.Timestamp(end_date_str)
     else:
@@ -1157,7 +1173,7 @@ filled_df = fill_gaps(processed_df)
 _sensor_min = filled_df["dt_round"].min()
 _sensor_max = filled_df["dt_round"].max()
 _weather_start = (_sensor_min - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-_weather_end = (pd.Timestamp.now(tz="America/Sao_Paulo") + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
+_weather_end = (now_local() + pd.Timedelta(days=7)).strftime("%Y-%m-%d")
 
 weather_df = fetch_weather_data(latitude, longitude, _weather_start, _weather_end)
 
@@ -1175,7 +1191,7 @@ temp_max_period = None
 temp_avg_period = None
 
 if not weather_df.empty and "temperature_2m" in weather_df.columns:
-    _now_temp_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+    _now_temp_tz = now_local()
     _hist_temp_series = weather_df[weather_df.index <= _now_temp_tz]["temperature_2m"].dropna()
     if not _hist_temp_series.empty:
         latest_temp = float(_hist_temp_series.iloc[-1])
@@ -1225,12 +1241,9 @@ latest_ts = latest_row.get("dt_round") or latest_row.get("timestamp")
 if latest_ts is not None:
     if not isinstance(latest_ts, pd.Timestamp):
         latest_ts = pd.to_datetime(latest_ts)
-    if latest_ts.tzinfo is None:
-        latest_ts = latest_ts.tz_localize("America/Sao_Paulo")
-    else:
-        latest_ts = latest_ts.tz_convert("America/Sao_Paulo")
+    latest_ts = normalize_local_ts(latest_ts)
 
-    now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+    now_tz = now_local()
     delay_min = (now_tz - latest_ts).total_seconds() / 60.0
 
     if delay_min > 7.0:
@@ -2512,7 +2525,7 @@ with tab4:
         if weather_df.empty:
             st.error("Não foi possível obter dados meteorológicos da API Open-Meteo. Verifique a conexão ou as coordenadas.")
         else:
-            now_tz = pd.Timestamp.now(tz="America/Sao_Paulo")
+            now_tz = now_local()
 
             # Separar histórico e previsão
             hist_df = weather_df[weather_df.index <= now_tz].copy()
@@ -2753,7 +2766,7 @@ with tab5:
             "com a previsão horária de precipitação da Open-Meteo."
         )
     
-        now_tz5 = pd.Timestamp.now(tz="America/Sao_Paulo")
+        now_tz5 = now_local()
     
         # Previsão de precipitação nas próximas 120h (dados horários)
         fcast_120h = pd.DataFrame()
@@ -3047,7 +3060,7 @@ with tab6:
                 fetch_historical_5years_precip.clear()
                 st.rerun()
     
-        end_ref = pd.Timestamp.now(tz="America/Sao_Paulo").normalize() - pd.Timedelta(days=1)
+        end_ref = now_local().normalize() - pd.Timedelta(days=1)
         hist_start_str = (end_ref - pd.DateOffset(years=anos_analise)).strftime("%Y-%m-%d")
         hist_start_label = f"{anos_analise} ano{'s' if anos_analise != 1 else ''} (desde {hist_start_str})"
     
