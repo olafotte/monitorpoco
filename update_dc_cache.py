@@ -1,5 +1,9 @@
-"""Gera/atualiza dc_rankings_cache.json com dados atuais da Defesa Civil de Blumenau."""
-import json, re, warnings, requests
+"""Gera/atualiza dc_rankings_cache.json com dados atuais da Defesa Civil de Blumenau e telemetria ao vivo da Ponte Adolfo Konder."""
+import datetime
+import json
+import re
+import warnings
+import requests
 
 try:
     from bs4 import BeautifulSoup
@@ -57,11 +61,19 @@ for ph in page_headers:
     if rows_data:
         resultado[duracao] = rows_data
 
-import datetime
+# Buscar dados ao vivo específicos da Ponte Adolfo Konder
+live_konder = {}
+try:
+    from src.data.adolfo_konder import fetch_live_adolfo_konder
+    live_konder = fetch_live_adolfo_konder()
+except Exception as e:
+    print(f"Aviso ao buscar telemetria ao vivo da Ponte Adolfo Konder: {e}")
+
 output = {
     "gerado_em": datetime.datetime.now().isoformat(),
     "fonte": url,
     "dados": resultado,
+    "ponte_adolfo_konder_live": live_konder,
 }
 
 with open("dc_rankings_cache.json", "w", encoding="utf-8") as f:
@@ -70,4 +82,6 @@ with open("dc_rankings_cache.json", "w", encoding="utf-8") as f:
 print(f"Cache gerado com {sum(len(v) for v in resultado.values())} registros:")
 for dur, rows in resultado.items():
     print(f"  {dur}: {len(rows)} registros | top: {rows[0]['Estação']} {rows[0]['Acumulado_mm']}mm")
+if live_konder.get("sucesso"):
+    print(f"  Ponte Adolfo Konder (Ao Vivo): Leitura {live_konder.get('hora_leitura')} | Chuva 1h: {live_konder.get('precip_1h_mm')}mm | Nível Rio: {live_konder.get('nivel_rio_m')}m")
 print("Salvo em: dc_rankings_cache.json")

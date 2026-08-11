@@ -30,7 +30,11 @@ from src.config import (
     DEFAULT_D_ON2,
     DEFAULT_D_OFF2,
 )
-from src.data.adolfo_konder import get_adolfo_konder_data as load_adolfo_konder_dataset
+from src.data.adolfo_konder import (
+    get_adolfo_konder_data as load_adolfo_konder_dataset,
+    fetch_live_adolfo_konder,
+    calculate_station_era5_factor,
+)
 from src.data.sensor_config import (
     load_sensor_height_config,
     save_sensor_height_config,
@@ -251,19 +255,29 @@ with st.sidebar.expander("🌦️ Parâmetros Climáticos & ERA5", expanded=True
         "Fator Amplificação (cm poço / mm chuva)", value=2.83, step=0.1,
         help="Relação calibrada entre mm de chuva e variação de cm no poço"
     )
-    default_era5_val = st.session_state.get("era5_corr_val", 2.60)
+    station_calc_info = calculate_station_era5_factor()
+    dyn_station_factor = station_calc_info.get("recommended_factor", RECOMMENDED_ERA5_FACTOR)
+
+    default_era5_val = st.session_state.get("era5_corr_val", dyn_station_factor)
     era5_correction = st.number_input(
         "Fator de Correção ERA5", min_value=0.5, max_value=5.0, value=default_era5_val, step=0.05, format="%.2f",
         key="era5_corr_input"
     )
-    if st.button("🎯 Aplicar Fator Calibrado (×2.60)"):
-        st.session_state["era5_corr_val"] = RECOMMENDED_ERA5_FACTOR
-        st.rerun()
-    st.caption("📊 Estação Ponte Adolfo Konder indica fator recomendado de **×2.60**.")
+    col_btn_e1, col_btn_e2 = st.columns(2)
+    with col_btn_e1:
+        if st.button(f"🎯 Estação (×{dyn_station_factor:.2f})", help="Aplica o fator calculado automaticamente dos picos da Estação Ponte Adolfo Konder"):
+            st.session_state["era5_corr_val"] = dyn_station_factor
+            st.rerun()
+    with col_btn_e2:
+        if st.button("⚖️ Padrão (×2.60)", help="Restaura o fator padrão recomendado ×2.60"):
+            st.session_state["era5_corr_val"] = RECOMMENDED_ERA5_FACTOR
+            st.rerun()
+
+    st.caption(f"📊 Fator calculado da Estação Ponte Adolfo Konder: **×{dyn_station_factor:.2f}** ({station_calc_info.get('method', 'Calibração Histórica')}).")
 
 with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
     record_limit = st.number_input(
-        "Número de registros a carregar", min_value=1, max_value=100000, value=300, step=50
+        "Número de registros a carregar", min_value=1, max_value=100000, value=3000, step=50
     )
     turso_freq_option = st.selectbox(
         "Frequência de Amostragem do Turso",
@@ -3625,6 +3639,34 @@ with tab6:
     # ──────────────────────────────────────────────────────────────────────────────────
 with tab7:
     if tab7.open:
+        # ── Telemetria ao Vivo da Estação Ponte Adolfo Konder ──
+        st.subheader("🌉 Estação Ponte Adolfo Konder (Telemetria ao Vivo)")
+        st.caption(
+            "Dados coletados em tempo real diretamente do portal AlertaBlu / Defesa Civil de Blumenau. "
+            "Fonte: [defesacivil.blumenau.sc.gov.br](https://defesacivil.blumenau.sc.gov.br/d/)"
+        )
+        live_konder = fetch_live_adolfo_konder()
+        if live_konder.get("sucesso"):
+            c_k1, c_k2, c_k3, c_k4, c_k5 = st.columns(5)
+            with c_k1:
+                st.metric("Chuva 15 min", f"{live_konder.get('precip_15min_mm', 0.0):.1f} mm")
+            with c_k2:
+                st.metric("Chuva 1 hora", f"{live_konder.get('precip_1h_mm', 0.0):.1f} mm")
+            with c_k3:
+                st.metric("Chuva 24 horas", f"{live_konder.get('precip_24h_mm', 0.0):.1f} mm")
+            with c_k4:
+                niv_rio = live_konder.get('nivel_rio_m')
+                niv_str = f"{niv_rio:.2f} m" if niv_rio is not None else "N/A"
+                var_rio = live_konder.get('variacao_rio_m')
+                var_str = f"{var_rio:+.2f} m/h" if var_rio is not None else None
+                st.metric("Nível do Rio", niv_str, delta=var_str)
+            with c_k5:
+                st.metric("Status do Rio", live_konder.get("status_rio", "Normalidade"))
+            st.caption(f"🕒 Leitura mais recente: **{live_konder.get('hora_leitura', 'N/A')}** | Estação Central Blumenau")
+        else:
+            st.info("ℹ️ Telemetria em tempo real temporariamente indisponível. Utilizando histórico da estação.")
+
+        st.markdown("---")
         st.subheader("🛑 Maiores Chuvas Históricas – Defesa Civil de Blumenau")
         st.caption(
             "Dados oficiais do AlertaBlu – Últimos Rankings por duração (15min, 30min, 1h, 24h, 96h). "
