@@ -1477,9 +1477,11 @@ with tab1:
             sensor_max = filled_df["dt_round"].max()
     
             max_chart_dt = sensor_max
+            if not weather_df.empty:
+                max_chart_dt = max(max_chart_dt, weather_df.index.max())
             if trend and trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
                 max_chart_dt = max(max_chart_dt, trend["era5_sim_df"]["dt_round"].max())
-    
+
             w_chart = weather_df[
                 (weather_df.index >= sensor_min) & (weather_df.index <= max_chart_dt)
             ]
