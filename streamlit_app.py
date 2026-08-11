@@ -383,13 +383,14 @@ def preprocess_time_series(
     elif freq_mode == "5min":
         target_freq = "5min"
     else:
-        # Modo automático: detecta se há amostragem em alta frequência (~1 min) no dataset
+        # Modo automático: se houver leituras em alta frequência (~1 min) em qualquer trecho do dataset,
+        # adota a grade de 1min para não descartar nenhuma leitura de 1min feita durante alertas/chuvas.
         ts_valid = pd.to_datetime(df["timestamp"]).dropna().sort_values()
         if len(ts_valid) > 5:
             diffs_min = pd.to_timedelta(ts_valid.diff()).dt.total_seconds() / 60.0  # type: ignore
-            # Se a mediana das diferenças for <= 2.5 min ou se > 15% das leituras forem <= 2.5 min
-            is_high_freq = (diffs_min.median() <= 2.5) or ((diffs_min > 0) & (diffs_min <= 2.5)).mean() > 0.15
-            target_freq = "1min" if is_high_freq else "5min"
+            # Detecta alta frequência se a mediana for <= 2.5 min ou se houver leituras de 1min (>= 3 leituras ou > 1% do dataset)
+            has_high_freq = (diffs_min.median() <= 2.5) or (((diffs_min > 0) & (diffs_min <= 2.5)).sum() >= 3)
+            target_freq = "1min" if has_high_freq else "5min"
         else:
             target_freq = "5min"
 
@@ -1237,22 +1238,20 @@ else:
 st.subheader("Diagnóstico do poço")
 
 # ── Verificação de Atraso nos Dados do Turso (> 7 minutos) ──
-latest_ts = latest_row.get("dt_round") or latest_row.get("timestamp")
-if latest_ts is not None:
-    if not isinstance(latest_ts, pd.Timestamp):
-        latest_ts = pd.to_datetime(latest_ts)
-    latest_ts = normalize_local_ts(latest_ts)
+latest_ts_raw = latest_row.get("dt_round") or latest_row.get("timestamp")
+if pd.notna(latest_ts_raw):
+    latest_ts = normalize_local_ts(latest_ts_raw)
+    if pd.notna(latest_ts) and isinstance(latest_ts, pd.Timestamp):
+        now_tz = now_local()
+        delay_min = (now_tz - latest_ts).total_seconds() / 60.0
 
-    now_tz = now_local()
-    delay_min = (now_tz - latest_ts).total_seconds() / 60.0
-
-    if delay_min > 7.0:
-        st.error(
-            f"🚨 **ERRO DE DADOS DA LEITURA (Atraso de {delay_min:.0f} min):**\n\n"
-            f"Última leitura registrada em **{latest_ts.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
-            f"O sistema está há mais de **{delay_min:.0f} minutos sem dados atualizados** do banco Turso (frequência esperada: 1 min em chuva ou 5 min em seca).\n\n"
-            f"⚠️ *Possíveis causas: Servidor Turso offline, sensores sem comunicação, falha na transmissão da ESP32 ou queda de energia.*"
-        )
+        if delay_min > 7.0:
+            st.error(
+                f"🚨 **ERRO DE DADOS DA LEITURA (Atraso de {delay_min:.0f} min):**\n\n"
+                f"Última leitura registrada em **{latest_ts.strftime('%d/%m/%Y às %H:%M:%S')}**.\n"
+                f"O sistema está há mais de **{delay_min:.0f} minutos sem dados atualizados** do banco Turso (frequência esperada: 1 min em chuva ou 5 min em seca).\n\n"
+                f"⚠️ *Possíveis causas: Servidor Turso offline, sensores sem comunicação, falha na transmissão da ESP32 ou queda de energia.*"
+            )
 
 if latest_distance is None:
     st.warning("Sem leitura válida da distância do sensor à linha d'água.")
