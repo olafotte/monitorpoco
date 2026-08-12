@@ -19,9 +19,16 @@
     {
       "id": 3,
       "start_date": "2026-08-08T11:00:00",
-      "end_date": null,
+      "end_date": "2026-08-12T15:35:00",
       "dist_borda_cm": 75.0,
-      "description": "Após 08/Ago/2026: Sensor a 75cm acima do topo do poço"
+      "description": "08/Ago a 12/Ago : Sensor a 75cm acima do topo do poço"
+    },
+    {
+      "id": 4,
+      "start_date": "2026-08-12T15:35:00",
+      "end_date": null,
+      "dist_borda_cm": 84.0,
+      "description": "Após 12/Ago/2026: Sensor a 84cm acima do topo do poço"
     }
   ]
 }
