@@ -7,28 +7,35 @@
       "start_date": "2026-07-01T00:00:00",
       "end_date": "2026-08-04T00:00:00",
       "dist_borda_cm": 80.0,
-      "description": "01/Jul a 03/Ago/2026: Sensor a 80cm acima do topo do poço"
+      "description": "01/Jul a 03/Ago/2026: Sensor a 80cm abaixo do topo do poço"
     },
     {
       "id": 2,
       "start_date": "2026-08-04T00:00:00",
       "end_date": "2026-08-08T11:00:00",
       "dist_borda_cm": 65.0,
-      "description": "04/Ago a 08/Ago/2026: Sensor a 65cm acima do topo do poço"
+      "description": "04/Ago a 08/Ago/2026: Sensor a 65cm abaixo do topo do poço"
     },
     {
       "id": 3,
       "start_date": "2026-08-08T11:00:00",
       "end_date": "2026-08-12T15:35:00",
       "dist_borda_cm": 75.0,
-      "description": "08/Ago a 12/Ago : Sensor a 75cm acima do topo do poço"
+      "description": "08/Ago a 12/Ago : Sensor a 75cm abaixo do topo do poço"
     },
     {
       "id": 4,
       "start_date": "2026-08-12T15:35:00",
-      "end_date": null,
+      "end_date": "2026-08-14T15:00:00",
       "dist_borda_cm": 84.0,
-      "description": "Após 12/Ago/2026: Sensor a 84cm acima do topo do poço"
+      "description": "Após 12/Ago/2026: Sensor a 84cm abaixo do topo do poço"
+    },
+    {
+      "id": 5,
+      "start_date": "2026-08-14T15:00:00",
+      "end_date": null,
+      "dist_borda_cm": 69.0,
+      "description": "Após 14/Ago/2026: Sensor a 69cm abaixo do topo do poço"
     }
   ]
 }
