@@ -229,7 +229,7 @@ with st.sidebar.expander("📐 Geometria do Poço & Sensor", expanded=True):
 
 with st.sidebar.expander("⚡ Automação & Bombas em Paralelo", expanded=True):
     vazao_bomba_m3h = st.number_input(
-        "Capacidade 1ª Bomba (m³/h)", value=14.0, step=0.5, help="Vazão nominal da 1ª bomba individual em m³/h"
+        "Capacidade 1ª Bomba (m³/h)", value=37.00, step=0.5, help="Vazão nominal da 1ª bomba individual em m³/h"
     )
     fator_m3h_para_cmh = st.number_input(
         "Fator Conversão (cm/h por m³/h)", value=5.471, step=0.01, format="%.3f",
@@ -1987,7 +1987,7 @@ with tab2:
         st.markdown("- Relacionada com a precipitação em mm pela taxa de amplificação do pátio:")
         st.latex(r"\text{Taxa de Entrada (cm/h)} = \frac{\text{Chuva (mm)}}{\text{Horas}} \times 2.83")
         st.markdown("**3️⃣ Esvaziamento Forçado (Bomba Ativa – Estado $S_2$)**")
-        st.latex(r"Q_{\text{saída}} = 14.000\text{ L/h} (14\text{ m}^3/h) \Rightarrow r_{\text{bomba}} \approx 76.6\text{ cm/h}")
+        st.latex(rf"Q_{{\text{{saída}}}} = {vazao_bomba_m3h * 1000:,.0f}\text{{ L/h}} ({vazao_bomba_m3h:.1f}\text{{ m}}^3/\text{{h}}) \Rightarrow r_{{\text{{bomba}}}} \approx {r_pump_param:.1f}\text{{ cm/h}}")
     
         st.markdown("---")
         st.subheader("📐 Estimativa e Calibração do Fator de Conversão (m³/h para cm/h)")
@@ -2044,7 +2044,7 @@ with tab2:
         st.caption("Alinhamento do instante exato de atracamento da bomba (quando a água atinge d_on, t = 0 min) para comparar a rampa de esvaziamento teórica com múltiplos eventos reais gravados pelo sensor ultrassônico.")
     
         # 1. Rampa Teórica de Esvaziamento (Bomba Ligada)
-        r_liq_teorico = 76.6 - r_gnd_param
+        r_liq_teorico = max(r_pump_param - r_gnd_param, 0.1)
         t_teorico_min = (d_off - d_on) / r_liq_teorico * 60.0
         t_teor_arr = np.linspace(0, max(t_teorico_min * 1.4, 35.0), 100)
         d_teor_arr = [min(d_on + (r_liq_teorico / 60.0) * t, d_off) for t in t_teor_arr]
@@ -2129,7 +2129,11 @@ with tab2:
             avg_real_dur = np.mean([c["duration_min"] for c in real_cycles])
     
             mc1, mc2, mc3 = st.columns(3)
-            mc1.metric("Taxa Esvaziamento Teórica", f"{r_liq_teorico:.1f} cm/h", help="14 m³/h menos lençol freático")
+            mc1.metric(
+                "Taxa Esvaziamento Teórica",
+                f"{r_liq_teorico:.1f} cm/h",
+                help=f"Bomba ({r_pump_param:.1f} cm/h | {vazao_bomba_m3h:.1f} m³/h) menos lençol freático ({r_gnd_param:.1f} cm/h)"
+            )
             mc2.metric(f"Média Real ({len(real_cycles)} Ciclos Medidos)", f"{avg_real_rate:.1f} cm/h", delta=f"{avg_real_rate - r_liq_teorico:+.1f} cm/h")
             mc3.metric("Tempo Médio de Rebaixamento", f"{avg_real_dur:.0f} min (Real)", delta=f"Teórico: {t_teorico_min:.1f} min")
     
