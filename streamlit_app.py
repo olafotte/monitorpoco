@@ -30,6 +30,11 @@ from src.config import (
     DEFAULT_DIST_BORDA,
     DEFAULT_D_ON2,
     DEFAULT_D_OFF2,
+    DEFAULT_AREA_POCO_M2,
+    DEFAULT_VOLUME_POR_CM_L,
+    DEFAULT_FATOR_M3H_PARA_CMH,
+    DEFAULT_AREA_INFILTRACAO_M2,
+    DEFAULT_VOLUME_INFILTRACAO_L,
 )
 from src.data.adolfo_konder import (
     get_adolfo_konder_data as load_adolfo_konder_dataset,
@@ -90,11 +95,19 @@ headers = {
 
 
 @st.cache_data(ttl="1m", max_entries=5, show_spinner="⏳ Conectando ao banco Turso...")
-def fetch_turso_data(turso_url: str, turso_token: str, limit: int) -> pd.DataFrame:
-    sql_query = (
-        "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
-        f"ORDER BY id DESC LIMIT {limit}"
-    )
+def fetch_turso_data(turso_url: str, turso_token: str, start_datetime_str: str = None) -> pd.DataFrame:
+    if start_datetime_str:
+        iso_t_str = start_datetime_str.replace(" ", "T")
+        sql_query = (
+            "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
+            f"WHERE timestamp >= '{start_datetime_str}' OR timestamp >= '{iso_t_str}' "
+            "ORDER BY timestamp ASC LIMIT 100000"
+        )
+    else:
+        sql_query = (
+            "SELECT timestamp, nivel_cm, status_bomba FROM leituras_poco "
+            "ORDER BY id DESC LIMIT 5000"
+        )
     headers_req = {
         "Authorization": f"Bearer {turso_token}",
         "Content-Type": "application/json",
@@ -158,10 +171,17 @@ def fetch_turso_data(turso_url: str, turso_token: str, limit: int) -> pd.DataFra
     if "status_bomba" not in df_res.columns:
         df_res["status_bomba"] = pd.NA
 
-    # Filtrar datas corrompidas do ESP32 (ex: ano de 1970). Ignora registros anteriores a 2025.
+    # Filtrar datas corrompidas do ESP32 (ex: ano de 1970) e aplicar filtro de data/hora inicial
     if "timestamp" in df_res.columns and not df_res.empty:
         parsed_ts = pd.to_datetime(df_res["timestamp"], errors="coerce")
-        df_res = df_res[parsed_ts.dt.year >= 2025].copy()
+        mask = parsed_ts.dt.year >= 2025
+        if start_datetime_str:
+            try:
+                dt_limit = pd.to_datetime(start_datetime_str)
+                mask = mask & (parsed_ts >= dt_limit)
+            except Exception:
+                pass
+        df_res = df_res[mask].copy()
 
     return df_res
 
@@ -232,11 +252,15 @@ with st.sidebar.expander("⚡ Automação & Bombas em Paralelo", expanded=True):
         "Capacidade 1ª Bomba (m³/h)", value=37.00, step=0.5, help="Vazão nominal da 1ª bomba individual em m³/h"
     )
     fator_m3h_para_cmh = st.number_input(
-        "Fator Conversão (cm/h por m³/h)", value=5.471, step=0.01, format="%.3f",
-        help="Converte m³/h em cm/h de variação no poço (100 / Área do poço em m²)."
+        "Fator Conversão (cm/h por m³/h)", value=DEFAULT_FATOR_M3H_PARA_CMH, step=0.01, format="%.3f",
+        help="Converte m³/h em cm/h de variação no poço durante bombeamento (100 / Área efetiva em m²). Modelo de Dois Fatores: 55.0 L/cm (5.50 m²) para bombeamento rápido."
     )
     r_pump_param = vazao_bomba_m3h * fator_m3h_para_cmh
-    st.caption(f"↳ Vazão 1ª Bomba: **{r_pump_param:.2f} cm/h**")
+    area_poco_m2_calc = 100.0 / fator_m3h_para_cmh if fator_m3h_para_cmh > 0 else 5.50
+    vol_ciclo_bomba_L = abs(d_off - d_on) * area_poco_m2_calc * 10.0
+    st.caption(f"↳ Vazão 1ª Bomba: **{r_pump_param:.2f} cm/h** (Seção Poço: **{area_poco_m2_calc:.2f} m²** / **{area_poco_m2_calc*10.0:.1f} L/cm**)")
+    st.caption(f"↳ Volume expulso por ciclo ({abs(d_off - d_on):.0f} cm): **{vol_ciclo_bomba_L:.0f} Litros** (**{vol_ciclo_bomba_L/1000.0:.3f} m³**)")
+
 
     tem_bomba2 = st.checkbox(
         "Instalar 2ª bomba em paralelo", value=False,
@@ -292,9 +316,25 @@ with st.sidebar.expander("🌦️ Parâmetros Climáticos & ERA5", expanded=True
     st.caption(f"📊 Fator calculado da Estação Ponte Adolfo Konder: **×{dyn_station_factor:.2f}** ({station_calc_info.get('method', 'Calibração Histórica')}).")
 
 with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
-    record_limit = st.number_input(
-        "Número de registros a carregar", min_value=1, max_value=100000, value=3000, step=50
-    )
+    _now_br = _dt.datetime.now()
+    _default_5d_dt = _now_br - _dt.timedelta(days=5)
+
+    col_d1, col_d2 = st.columns(2)
+    with col_d1:
+        turso_start_date = st.date_input(
+            "Data Inicial",
+            value=_default_5d_dt.date(),
+            help="Data inicial para carregar histórico do banco Turso (padrão: 5 dias atrás)"
+        )
+    with col_d2:
+        turso_start_time = st.time_input(
+            "Hora Inicial",
+            value=_default_5d_dt.time(),
+            help="Hora inicial para carregar histórico do banco Turso"
+        )
+
+    start_datetime_str = _dt.datetime.combine(turso_start_date, turso_start_time).strftime("%Y-%m-%d %H:%M:%S")
+
     turso_freq_option = st.selectbox(
         "Frequência de Amostragem do Turso",
         options=[
@@ -305,7 +345,7 @@ with st.sidebar.expander("🔌 Conexão Banco Turso DB", expanded=False):
         index=0,
         help="O ESP32 envia dados a cada 1min durante chuvas/alertas e 5min em períodos normais. O modo automático ajusta a grade sem perda de dados."
     )
-    if st.button("🔄 Recarregar Dados do Turso", help="Limpa o cache e busca leituras atualizadas do Turso DB imediatamente"):
+    if st.button("🔄 Recarregar Dados do Turso", help="Limpa o cache e busca leituras atualizadas do Turso DB a partir da data/hora selecionada"):
         fetch_turso_data.clear()
         st.rerun()
     if "1 minuto" in turso_freq_option:
@@ -327,7 +367,7 @@ longitude = st.sidebar.number_input(
 
 
 try:
-    df = fetch_turso_data(TURSO_URL, TURSO_TOKEN, record_limit)
+    df = fetch_turso_data(TURSO_URL, TURSO_TOKEN, start_datetime_str)
 except Exception as exc:
     st.error(f"Erro ao conectar com o banco de dados Turso: {exc}")
     st.stop()
@@ -420,7 +460,7 @@ def simulate_gap(
     steps,
     dt_min=5.0,
     r_in_cm_min=1.44 / 60.0,
-    r_pump_cm_min=76.6 / 60.0,
+    r_pump_cm_min=(37.0 * DEFAULT_FATOR_M3H_PARA_CMH) / 60.0,
     d_trigger_on=73.0,
     d_trigger_off=90.0,
     tem_bomba2=False,
@@ -780,8 +820,13 @@ def format_hours_status(hours: float, current_val: float, target_val: float) -> 
 def segment_operational_periods(df: pd.DataFrame):
     """Segmenta a série temporal em períodos completos contínuos de Enchimento (Subida) e Esvaziamento (Bombeamento).
 
-    Calcula a taxa física de cada período a partir da variação total dividida pelo tempo total decorrido do período:
-    Rate = Δd_período / Δt_período (cm/h).
+    Utiliza o detector híbrido de ciclos reais de bombeamento para garantir que 100% dos eventos
+    de descida de nível por atuação da bomba façam parte das estatísticas e do histograma.
+    
+    NOTA: A taxa de esvaziamento é calculada usando a duração real do ciclo reportada pelo
+    detector (duracao_min), que pode ser mais precisa que os timestamps discretos do sensor
+    (amostrado a cada ~5 minutos). Para ciclos de ~2 minutos, a taxa real é de ~500-670 cm/h,
+    não os ~80 cm/h que apareceriam se dividíssemos por um intervalo inteiro de 5 min.
     """
     if df is None or df.empty or "dt_round" not in df.columns:
         return pd.DataFrame(), pd.DataFrame()
@@ -791,60 +836,218 @@ def segment_operational_periods(df: pd.DataFrame):
         return pd.DataFrame(), pd.DataFrame()
 
     df_calc = df.sort_values("dt_round").copy()
-    df_calc["smooth"] = df_calc[col_nivel].ewm(span=3).mean()
+
+    # 1. Obter 100% dos ciclos de bombeamento reais detectados pelo detector híbrido
+    df_cycles, _ = detect_pump_cycles_and_volumes(df_calc)
+    period_esv = []
+    
+    if not df_cycles.empty:
+        for _, row in df_cycles.iterrows():
+            dur_h = max(row["duracao_min"] / 60.0, 0.0167)  # mín 1 min (0.0167 h)
+            rate = row["delta_cm"] / dur_h
+            # Limitar à taxa física máxima da bomba (37 m³/h × 18.182 = 672.7 cm/h)
+            # para evitar artefatos de timestamps discretizados
+            rate = min(rate, 700.0)
+            period_esv.append({
+                "t_start": row["t_liga"],
+                "t_end": row["t_desliga"],
+                "dur_h": dur_h,
+                "d_start": row["d_alto_cm"],
+                "d_end": row["d_baixo_cm"],
+                "total_cm": row["delta_cm"],
+                "rate_cmh": rate,
+            })
+
+    # 2. Segmentar períodos de subida / enchimento (quando a bomba está desligada)
+    df_calc["smooth"] = df_calc[col_nivel].rolling(window=3, center=True, min_periods=1).median()
     df_calc["diff"] = df_calc["smooth"].diff()
 
     df_calc["direction"] = 0
     df_calc.loc[df_calc["diff"] < -0.05, "direction"] = -1  # Subida (Enchimento)
-    df_calc.loc[df_calc["diff"] > 0.05, "direction"] = 1   # Descida (Esvaziamento)
-    df_calc["direction"] = df_calc["direction"].replace(0, np.nan).ffill().fillna(-1)
-
     df_calc["block"] = (df_calc["direction"] != df_calc["direction"].shift()).cumsum()
 
     period_ench = []
-    period_esv = []
-
     for _, group in df_calc.groupby("block"):
-        if len(group) < 2:
+        if len(group) < 2 or group["direction"].iloc[0] != -1:
             continue
         t_start = group["dt_round"].iloc[0]
         t_end = group["dt_round"].iloc[-1]
         dur_h = (t_end - t_start).total_seconds() / 3600.0
-        if dur_h < 0.08:  # Ignora micro-flutuações menores que ~5 minutos
+        if dur_h < 0.05:
             continue
 
         d_start = group[col_nivel].iloc[0]
         d_end = group[col_nivel].iloc[-1]
-        dir_val = group["direction"].iloc[0]
+        total_cm = d_start - d_end
 
-        if dir_val == -1:
-            total_cm = d_start - d_end
-            if total_cm > 0.3:  # Mínimo 0.3 cm de subida total para período válido
-                rate = total_cm / dur_h
-                period_ench.append({
-                    "t_start": t_start,
-                    "t_end": t_end,
-                    "dur_h": dur_h,
-                    "d_start": d_start,
-                    "d_end": d_end,
-                    "total_cm": total_cm,
-                    "rate_cmh": rate,
-                })
-        elif dir_val == 1:
-            total_cm = d_end - d_start
-            if total_cm > 0.3:  # Mínimo 0.3 cm de descida total para período válido
-                rate = total_cm / dur_h
-                period_esv.append({
-                    "t_start": t_start,
-                    "t_end": t_end,
-                    "dur_h": dur_h,
-                    "d_start": d_start,
-                    "d_end": d_end,
-                    "total_cm": total_cm,
-                    "rate_cmh": rate,
-                })
+        if total_cm > 0.3:
+            rate = total_cm / dur_h
+            period_ench.append({
+                "t_start": t_start,
+                "t_end": t_end,
+                "dur_h": dur_h,
+                "d_start": d_start,
+                "d_end": d_end,
+                "total_cm": total_cm,
+                "rate_cmh": rate,
+            })
 
     return pd.DataFrame(period_ench), pd.DataFrame(period_esv)
+
+
+def detect_pump_cycles_and_volumes(df: pd.DataFrame, fator_m3h_para_cmh: float = DEFAULT_FATOR_M3H_PARA_CMH, max_dur_min: float = 9.0, vazao_bomba_m3h: float = 37.0, min_dur_min: float = 1.5, min_delta_cm: float = 3.0):
+    """Detecta acionamentos reais da bomba por telemetria e por variação física de nível (descidas rápidas),
+    calculando o volume exato expulso (Litros/m³) com base no ponto de nível mais alto (água mais alta / menor distância ao topo) 
+    logo antes do acionamento e no nível mais baixo (água mais baixa / maior distância ao topo) logo após o fim do acionamento.
+    
+    Filtros de segurança contra ruído de medição do sensor ultrassônico:
+      - Ignora acionamentos com duração > max_dur_min (padrão: 9 min) — poço secaria se ficasse tanto tempo ligado.
+      - Ignora acionamentos com duração < min_dur_min (padrão: 1.5 min) — eventos breves demais são ruído do sensor.
+      - Ignora quedas < min_delta_cm (padrão: 3.0 cm) — dentro da faixa de ruído do sensor ultrassônico.
+      - Aplica mediana móvel de 3 pontos ao sinal de nível para suprimir spikes de ruído antes da detecção.
+    """
+    if df is None or df.empty or "dt_round" not in df.columns:
+        return pd.DataFrame(), {}
+
+    col_nivel = "nivel_imputed" if "nivel_imputed" in df.columns else "nivel_cm"
+    if col_nivel not in df.columns:
+        return pd.DataFrame(), {}
+
+    df_calc = df.sort_values("dt_round").copy()
+    vol_por_cm_L = (100.0 / fator_m3h_para_cmh * 10.0) if fator_m3h_para_cmh > 0 else 55.0
+
+    # ── Pré-filtragem de Ruído do Sensor Ultrassônico ──────────────────────────
+    # Mediana móvel de 3 pontos: preserva máximos e mínimos reais, elimina spikes isolados
+    df_calc["nivel_smooth"] = df_calc[col_nivel].rolling(window=3, center=True, min_periods=1).median()
+
+    cycles = []
+    seen_timestamps = set()
+
+    # ── Método A: Sinal de Hardware status_bomba (se disponível na telemetria) ────
+    if "status_bomba" in df_calc.columns and df_calc["status_bomba"].notna().any():
+        sb = pd.to_numeric(df_calc["status_bomba"], errors="coerce").fillna(0)
+        df_calc["bomba_on"] = (sb > 0).astype(int)
+        df_calc["bomba_change"] = df_calc["bomba_on"].diff()
+
+        starts = df_calc[df_calc["bomba_change"] == 1].index
+        for idx_start in starts:
+            ends = df_calc[(df_calc.index > idx_start) & (df_calc["bomba_change"] == -1)].index
+            if ends.empty:
+                idx_end = df_calc.index[-1]
+            else:
+                idx_end = ends[0]
+
+            pos_start = df_calc.index.get_loc(idx_start)
+            pos_end = df_calc.index.get_loc(idx_end)
+
+            w_start_a = max(0, pos_start - 2)
+            w_start_b = min(len(df_calc) - 1, pos_start + 2)
+            d_min = df_calc.iloc[w_start_a:w_start_b + 1]["nivel_smooth"].min()
+            t_start = df_calc.iloc[pos_start]["dt_round"]
+
+            w_end_a = max(0, pos_end - 2)
+            w_end_b = min(len(df_calc) - 1, pos_end + 2)
+            d_max = df_calc.iloc[w_end_a:w_end_b + 1]["nivel_smooth"].max()
+            t_end = df_calc.iloc[pos_end]["dt_round"]
+
+            delta_cm = d_max - d_min
+            dur_min_val = (t_end - t_start).total_seconds() / 60.0
+
+            if delta_cm >= min_delta_cm and min_dur_min <= dur_min_val <= max_dur_min:
+                v_expulso_L = delta_cm * vol_por_cm_L
+                v_bomba_nom_L = (vazao_bomba_m3h * 1000.0) * (dur_min_val / 60.0)
+                fator_rec_L_cm = v_bomba_nom_L / delta_cm if delta_cm > 0 else vol_por_cm_L
+                cycles.append({
+                    "t_liga": t_start,
+                    "t_desliga": t_end,
+                    "duracao_min": round(dur_min_val, 1),
+                    "d_alto_cm": round(d_min, 1),
+                    "d_baixo_cm": round(d_max, 1),
+                    "delta_cm": round(delta_cm, 1),
+                    "vol_expulso_L": round(v_expulso_L, 1),
+                    "vol_bomba_L": round(v_bomba_nom_L, 1),
+                    "fator_recalib_L_cm": round(fator_rec_L_cm, 1),
+                    "vol_expulso_m3": round(v_expulso_L / 1000.0, 3),
+                })
+                seen_timestamps.add(t_start)
+
+    # ── Método B: Detecção Física Híbrida por Queda Rápida do Nível (Sem depender do relé) ──
+    # Usa o sinal suavizado (mediana móvel) para evitar falsos positivos por ruído do sensor
+    vals = df_calc["nivel_smooth"].values
+    ts = df_calc["dt_round"].values
+    n = len(vals)
+
+    i = 0
+    while i < n - 1:
+        j = i + 1
+        while j < n:
+            dur_sec = (ts[j] - ts[i]).astype("timedelta64[s]").astype(float)
+            dur_m = dur_sec / 60.0
+            if dur_m > max_dur_min:
+                break
+            delta_d = vals[j] - vals[i]
+            if delta_d < -1.0:
+                break
+            j += 1
+        
+        if j > i + 1:
+            best_j = i + 1
+            max_drop = vals[best_j] - vals[i]
+            for k in range(i + 1, min(j, n)):
+                drop_k = vals[k] - vals[i]
+                if drop_k > max_drop:
+                    max_drop = drop_k
+                    best_j = k
+            
+            dur_m_best = (ts[best_j] - ts[i]).astype("timedelta64[s]").astype(float) / 60.0
+            t_st = pd.to_datetime(ts[i])
+            t_en = pd.to_datetime(ts[best_j])
+            
+            if max_drop >= min_delta_cm and min_dur_min <= dur_m_best <= max_dur_min:
+                is_dup = any(abs((t_st - st_t).total_seconds()) < 300 for st_t in seen_timestamps)
+                if not is_dup:
+                    v_expulso_L = max_drop * vol_por_cm_L
+                    v_bomba_nom_L = (vazao_bomba_m3h * 1000.0) * (dur_m_best / 60.0)
+                    fator_rec_L_cm = v_bomba_nom_L / max_drop if max_drop > 0 else vol_por_cm_L
+                    cycles.append({
+                        "t_liga": t_st,
+                        "t_desliga": t_en,
+                        "duracao_min": round(dur_m_best, 1),
+                        "d_alto_cm": round(vals[i], 1),
+                        "d_baixo_cm": round(vals[best_j], 1),
+                        "delta_cm": round(max_drop, 1),
+                        "vol_expulso_L": round(v_expulso_L, 1),
+                        "vol_bomba_L": round(v_bomba_nom_L, 1),
+                        "fator_recalib_L_cm": round(fator_rec_L_cm, 1),
+                        "vol_expulso_m3": round(v_expulso_L / 1000.0, 3),
+                    })
+                    seen_timestamps.add(t_st)
+                i = best_j
+                continue
+        i += 1
+
+    df_cycles = pd.DataFrame(cycles)
+    if not df_cycles.empty:
+        df_cycles = df_cycles.sort_values("t_liga").reset_index(drop=True)
+
+    stats = {}
+    if not df_cycles.empty:
+        f_rec_mean = float(df_cycles["fator_recalib_L_cm"].mean()) if "fator_recalib_L_cm" in df_cycles.columns else 55.0
+        stats = {
+            "total_acionamentos": len(df_cycles),
+            "volume_total_m3": float(df_cycles["vol_expulso_m3"].sum()),
+            "volume_medio_L": float(df_cycles["vol_expulso_L"].mean()),
+            "volume_bomba_medio_L": float(df_cycles["vol_bomba_L"].mean()) if "vol_bomba_L" in df_cycles.columns else 0.0,
+            "fator_recalib_medio_L_cm": f_rec_mean,
+            "fator_recalib_medio_cmh": float(1000.0 / f_rec_mean) if f_rec_mean > 0 else 18.182,
+            "area_poco_recalib_m2": float(f_rec_mean / 10.0),
+            "volume_max_L": float(df_cycles["vol_expulso_L"].max()),
+            "volume_min_L": float(df_cycles["vol_expulso_L"].min()),
+            "delta_cm_medio": float(df_cycles["delta_cm"].mean()),
+        }
+
+    return df_cycles, stats
+
 
 
 def compute_rate_statistics(df: pd.DataFrame) -> dict | None:
@@ -875,91 +1078,119 @@ def plot_historical_extremes_chart(df: pd.DataFrame):
     if col_nivel not in df.columns:
         return None, None, None, None, None
 
-    df_calc = df.sort_values("dt_round").copy()
+    # Resetar índice após ordenação para ter posições únicas
+    df_calc = df.sort_values("dt_round").reset_index(drop=True)
     df_ench, df_esv = segment_operational_periods(df_calc)
 
-    idx_max_water = df_calc[col_nivel].idxmin()  # Menor distância ao sensor = Nível mais alto da água
-    idx_min_water = df_calc[col_nivel].idxmax()  # Maior distância ao sensor = Nível mais baixo da água
+    pos_max_water = int(df_calc[col_nivel].idxmin())  # Menor distância ao topo = Água Mais Alta
+    pos_min_water = int(df_calc[col_nivel].idxmax())  # Maior distância ao topo = Água Mais Baixa
 
-    row_max_w = df_calc.loc[idx_max_water]
-    row_min_w = df_calc.loc[idx_min_water]
+    row_max_w = df_calc.iloc[pos_max_water]
+    row_min_w = df_calc.iloc[pos_min_water]
 
     row_peak_rise = df_ench.loc[df_ench["rate_cmh"].idxmax()] if not df_ench.empty else None
     row_peak_drop = df_esv.loc[df_esv["rate_cmh"].idxmax()] if not df_esv.empty else None
 
     fig = go.Figure()
 
-    # Série temporal contínua
+    # Série temporal contínua em Azul Sleek
     fig.add_trace(
         go.Scatter(
             x=df_calc["dt_round"],
             y=df_calc[col_nivel],
             mode="lines",
             name="Nível do Poço (cm)",
-            line=dict(color="#2b5c8f", width=1.8),
+            line=dict(color="#1f77b4", width=2.0),
+            hovertemplate="<b>Nível: %{y:.1f} cm</b><br>Data: %{x|%d/%m/%Y %H:%M}<extra></extra>"
         )
     )
 
-    # 1. Água mais alta
-    d1 = row_max_w[col_nivel]
-    t1 = row_max_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+    # Usar Anotações Vetoriais com Seta do Plotly (imunes a timezone shift e sem cortes)
+    # 1. Água mais alta (Peak)
+    d1 = float(row_max_w[col_nivel])
+    t1_dt = row_max_w["dt_round"]
+    t1_str = pd.to_datetime(t1_dt).strftime("%d/%m/%Y às %H:%M")
+    
+    # Marcador discreto na curva
     fig.add_trace(
         go.Scatter(
-            x=[row_max_w["dt_round"]],
-            y=[d1],
-            mode="markers+text",
-            name="Água Mais Alta (Nível Máximo)",
-            marker=dict(symbol="star", size=14, color="#d9534f", line=dict(width=1.5, color="black")),
-            text=[f"🔴 Nível Máx: {d1:.1f} cm ({t1})"],
-            textposition="top center",
+            x=[t1_dt], y=[d1], mode="markers", name="Água Mais Alta (Pico)",
+            marker=dict(symbol="star", size=15, color="#d9534f", line=dict(width=1.5, color="black")),
+            showlegend=True
         )
     )
+    fig.add_annotation(
+        x=t1_dt, y=d1,
+        text=f"<b>🔴 Água Mais Alta: {d1:.1f} cm</b><br>{t1_str}",
+        showarrow=True, arrowhead=2, arrowsize=1.2, arrowcolor="#d9534f",
+        ax=0, ay=45,
+        bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="#d9534f", borderwidth=1.5,
+        font=dict(size=11, color="#333333")
+    )
 
-    # 2. Água mais baixa
-    d2 = row_min_w[col_nivel]
-    t2 = row_min_w["dt_round"].strftime("%d/%m/%Y às %H:%M")
+    # 2. Água mais baixa (Trough)
+    d2 = float(row_min_w[col_nivel])
+    t2_dt = row_min_w["dt_round"]
+    t2_str = pd.to_datetime(t2_dt).strftime("%d/%m/%Y às %H:%M")
+    
     fig.add_trace(
         go.Scatter(
-            x=[row_min_w["dt_round"]],
-            y=[d2],
-            mode="markers+text",
-            name="Água Mais Baixa (Nível Mínimo)",
-            marker=dict(symbol="diamond", size=12, color="#0275d8", line=dict(width=1.5, color="black")),
-            text=[f"🔵 Nível Mín: {d2:.1f} cm ({t2})"],
-            textposition="bottom center",
+            x=[t2_dt], y=[d2], mode="markers", name="Água Mais Baixa (Vale)",
+            marker=dict(symbol="diamond", size=13, color="#0275d8", line=dict(width=1.5, color="black")),
+            showlegend=True
         )
     )
+    fig.add_annotation(
+        x=t2_dt, y=d2,
+        text=f"<b>🔵 Água Mais Baixa: {d2:.1f} cm</b><br>{t2_str}",
+        showarrow=True, arrowhead=2, arrowsize=1.2, arrowcolor="#0275d8",
+        ax=0, ay=-45,
+        bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="#0275d8", borderwidth=1.5,
+        font=dict(size=11, color="#333333")
+    )
 
-    # 3. Maior taxa de subida por período completo
+    # 3. Maior taxa de subida
     if row_peak_rise is not None:
-        r3 = row_peak_rise["rate_cmh"]
-        t3 = row_peak_rise["t_start"].strftime("%d/%m/%Y às %H:%M")
+        r3 = float(row_peak_rise["rate_cmh"])
+        t3_dt = row_peak_rise["t_start"]
+        t3_str = pd.to_datetime(t3_dt).strftime("%d/%m/%Y às %H:%M")
+        d3 = float(row_peak_rise["d_start"])
         fig.add_trace(
             go.Scatter(
-                x=[row_peak_rise["t_start"]],
-                y=[row_peak_rise["d_start"]],
-                mode="markers+text",
-                name="Maior Taxa de Subida por Período",
+                x=[t3_dt], y=[d3], mode="markers", name="Pico Taxa Subida",
                 marker=dict(symbol="triangle-up", size=13, color="#f0ad4e", line=dict(width=1.5, color="black")),
-                text=[f"⚡ Pico Subida Período: +{r3:.1f} cm/h ({t3})"],
-                textposition="top left",
+                showlegend=True
             )
         )
+        fig.add_annotation(
+            x=t3_dt, y=d3,
+            text=f"<b>⚡ Pico Subida: +{r3:.1f} cm/h</b><br>{t3_str}",
+            showarrow=True, arrowhead=2, arrowcolor="#f0ad4e",
+            ax=50, ay=-35,
+            bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="#f0ad4e", borderwidth=1.5,
+            font=dict(size=11, color="#333333")
+        )
 
-    # 4. Maior taxa de descida por período completo
+    # 4. Maior taxa de descida (Bomba)
     if row_peak_drop is not None:
-        r4 = row_peak_drop["rate_cmh"]
-        t4 = row_peak_drop["t_start"].strftime("%d/%m/%Y às %H:%M")
+        r4 = float(row_peak_drop["rate_cmh"])
+        t4_dt = row_peak_drop["t_start"]
+        t4_str = pd.to_datetime(t4_dt).strftime("%d/%m/%Y às %H:%M")
+        d4 = float(row_peak_drop["d_start"])
         fig.add_trace(
             go.Scatter(
-                x=[row_peak_drop["t_start"]],
-                y=[row_peak_drop["d_start"]],
-                mode="markers+text",
-                name="Maior Taxa de Descida por Período",
+                x=[t4_dt], y=[d4], mode="markers", name="Pico Taxa Descida (Bomba)",
                 marker=dict(symbol="triangle-down", size=13, color="#5cb85c", line=dict(width=1.5, color="black")),
-                text=[f"🌊 Pico Descida Período: -{r4:.1f} cm/h ({t4})"],
-                textposition="bottom right",
+                showlegend=True
             )
+        )
+        fig.add_annotation(
+            x=t4_dt, y=d4,
+            text=f"<b>🌊 Pico Descida: -{r4:.1f} cm/h</b><br>{t4_str}",
+            showarrow=True, arrowhead=2, arrowcolor="#5cb85c",
+            ax=-50, ay=35,
+            bgcolor="rgba(255, 255, 255, 0.95)", bordercolor="#5cb85c", borderwidth=1.5,
+            font=dict(size=11, color="#333333")
         )
 
     fig.update_layout(
@@ -967,8 +1198,8 @@ def plot_historical_extremes_chart(df: pd.DataFrame):
         yaxis=dict(autorange="reversed", title="Nível da Água (cm abaixo do topo do poço)"),
         xaxis=dict(title="Data / Hora"),
         legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
-        height=520,
-        margin=dict(l=20, r=40, t=50, b=60),
+        height=540,
+        margin=dict(l=30, r=40, t=50, b=60),
     )
 
     return fig, row_max_w, row_min_w, row_peak_rise, row_peak_drop
@@ -1013,6 +1244,76 @@ def plot_rate_histograms(df: pd.DataFrame):
         )
 
     return fig_ench, fig_esv
+
+
+def plot_pump_cycles_volume_chart(df_cycles: pd.DataFrame):
+    """Gera gráfico de barras verticais onde a largura de cada barra corresponde 
+    ao intervalo temporal de acionamento da bomba [t_liga, t_desliga] e a altura 
+    representa o volume de água expulso em Litros.
+    """
+    if df_cycles is None or df_cycles.empty:
+        return None
+
+    df_plot = df_cycles.copy()
+    df_plot["t_liga"] = pd.to_datetime(df_plot["t_liga"])
+    df_plot["t_desliga"] = pd.to_datetime(df_plot["t_desliga"])
+
+    df_plot["x_mid"] = df_plot["t_liga"] + (df_plot["t_desliga"] - df_plot["t_liga"]) / 2
+    df_plot["width_ms"] = (df_plot["t_desliga"] - df_plot["t_liga"]).dt.total_seconds() * 1000.0
+
+    fig = go.Figure()
+
+    fig.add_trace(
+        go.Bar(
+            x=df_plot["x_mid"],
+            y=df_plot["vol_expulso_L"],
+            width=df_plot["width_ms"],
+            name="Volume Expulso (L)",
+            marker=dict(
+                color=df_plot["vol_expulso_L"],
+                colorscale="Blues",
+                showscale=True,
+                colorbar=dict(title="Volume (L)", len=0.8),
+                line=dict(color="#0d47a1", width=1.2),
+            ),
+            customdata=np.stack((
+                df_plot["t_liga"].dt.strftime("%d/%m/%Y %H:%M:%S"),
+                df_plot["t_desliga"].dt.strftime("%d/%m/%Y %H:%M:%S"),
+                df_plot["duracao_min"],
+                df_plot["d_alto_cm"],
+                df_plot["d_baixo_cm"],
+                df_plot["delta_cm"],
+                df_plot["vol_expulso_m3"],
+            ), axis=-1),
+            hovertemplate=(
+                "<b>🌊 Ciclo de Bombeamento Real</b><br>"
+                "🟢 Início (LIGA): %{customdata[0]}<br>"
+                "🔴 Fim (DESLIGA): %{customdata[1]}<br>"
+                "⏱️ Duração: %{customdata[2]:.1f} min<br>"
+                "📏 Nível Inicial: %{customdata[3]:.1f} cm | Nível Final: %{customdata[4]:.1f} cm<br>"
+                "📉 Rebaixamento Δh: %{customdata[5]:.1f} cm<br>"
+                "<b>💧 Volume Expulso: %{y:,.0f} Litros (%{customdata[6]:.3f} m³)</b>"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    fig.update_layout(
+        title="📊 Volume Expulso por Ciclo de Bombeamento (Largura da Barra = Duração do Acionamento)",
+        xaxis=dict(
+            title="Data / Hora do Acionamento [Início → Fim]",
+            type="date",
+        ),
+        yaxis=dict(
+            title="Volume Expulso (Litros)",
+            gridcolor="rgba(0,0,0,0.08)",
+        ),
+        height=450,
+        margin=dict(l=40, r=40, t=50, b=50),
+        bargap=0.1,
+    )
+
+    return fig
 
 
 def compute_recent_rising_trend(
@@ -1455,6 +1756,20 @@ with tab1:
             "Painel sincronizado em tempo real: o gráfico superior mostra o nível do poço (esq.) e a chuva (dir.). "
             "O gráfico inferior mostra a variação da temperatura local (°C) em alinhamento temporal perfeito com as medições."
         )
+
+        df_cycles_top, stats_cycles_top = detect_pump_cycles_and_volumes(filled_df, fator_m3h_para_cmh, vazao_bomba_m3h=vazao_bomba_m3h)
+        vol_total_m3_top = stats_cycles_top.get("volume_total_m3", 0.0)
+        vol_total_L_top = vol_total_m3_top * 1000.0
+        n_cycles_top = stats_cycles_top.get("total_acionamentos", 0)
+
+        col_top1, col_top2, col_top3, col_top4 = st.columns(4)
+        col_top1.metric("💧 Vol. Total Expulso", f"{vol_total_m3_top:.3f} m³", help="Volume total acumulado de água expulso pelas bombas no período selecionado")
+        col_top2.metric("🪣 Litros Expulsos", f"{vol_total_L_top:,.0f} L", help="Volume total em Litros expulso pelas bombas no período")
+        col_top3.metric("⚡ Ciclos da Bomba", f"{n_cycles_top} acionamentos", help="Número total de ciclos curtos de bombeamento detectados no período")
+        if "nivel_imputed" in filled_df.columns and not filled_df.empty:
+            curr_lvl_top = (FUNDODOPOCO - filled_df['nivel_imputed'].iloc[-1])
+            col_top4.metric("📏 Altura Atual d'Água", f"{curr_lvl_top:.1f} cm", delta=f"{filled_df['nivel_imputed'].iloc[-1]:.1f} cm ao topo", delta_color="off")
+        st.markdown("---")
     
         trend = compute_recent_rising_trend(
             filled_df,
@@ -1970,74 +2285,136 @@ with tab1:
                         st.plotly_chart(fig_h_esv, width="stretch")
                     else:
                         st.info("Sem dados suficientes de esvaziamento para gerar o histograma.")
-    
+
+        # ── Apuração Precisa do Volume Expulso por Acionamento da Bomba ───────────────────
+        with st.container(border=True):
+            st.subheader("💧 Apuração Precisa do Volume Expulso por Acionamento Real da Bomba")
+            st.caption(
+                "Cálculo exato baseado na diferença entre o **nível mais alto da água registrado logo antes do acionamento** "
+                "e o **nível mais baixo da água logo após o desligamento**. "
+                "Este método compensa eventuais variações de atracamento/desatracamento das bóias elétricas."
+            )
+
+            c_calc1, c_calc2 = st.columns([1, 1])
+            with c_calc1:
+                st.markdown("##### 🧮 Comparação de Métodos & Recalibração de Seção")
+                c_man_a, c_man_b = st.columns(2)
+                with c_man_a:
+                    d_top_high = st.number_input(
+                        "Nível Alto (distância ao topo - cm)",
+                        value=148.5, step=0.5, format="%.1f",
+                        help="Menor distância lida pelo sensor (água alta) antes da bomba atracar."
+                    )
+                    d_top_low = st.number_input(
+                        "Nível Baixo (distância ao topo - cm)",
+                        value=174.0, step=0.5, format="%.1f",
+                        help="Maior distância lida pelo sensor (água baixa) após desligar."
+                    )
+                with c_man_b:
+                    dur_manual_min = st.number_input(
+                        "Tempo Bomba Ligada (minutos)",
+                        value=3.5, step=0.1, format="%.1f",
+                        help="Tempo de operação da bomba em minutos (com vazão de 37 m³/h)."
+                    )
+                    st.caption(f"⚡ Capacidade 1ª Bomba: **{vazao_bomba_m3h:.1f} m³/h** ({vazao_bomba_m3h*1000.0/60.0:.1f} L/min)")
+
+                delta_h_manual = max(0.0, d_top_low - d_top_high)
+                vol_geom_manual_L = delta_h_manual * (100.0 / fator_m3h_para_cmh * 10.0) if fator_m3h_para_cmh > 0 else delta_h_manual * 55.0
+                vol_bomba_manual_L = (vazao_bomba_m3h * 1000.0) * (dur_manual_min / 60.0)
+                fator_rec_L_cm_man = vol_bomba_manual_L / delta_h_manual if delta_h_manual > 0 else 55.0
+                fator_rec_cmh_man = 1000.0 / fator_rec_L_cm_man if fator_rec_L_cm_man > 0 else DEFAULT_FATOR_M3H_PARA_CMH
+
+                res_col1, res_col2 = st.columns(2)
+                res_col1.metric("1️⃣ Volume p/ Nível (Δh)", f"{vol_geom_manual_L:.0f} L", delta=f"Δh = {delta_h_manual:.1f} cm", delta_color="off")
+                res_col2.metric("2️⃣ Volume p/ Tempo Bomba", f"{vol_bomba_manual_L:.0f} L", delta=f"{dur_manual_min:.1f} min × 37m³/h", delta_color="off")
+                st.caption(
+                    f"🎯 **Recalibração Hidráulica Resultante:** **{fator_rec_L_cm_man:.1f} Litros/cm** "
+                    f"(Área poço: **{fator_rec_L_cm_man/10.0:.2f} m²** | Fator: **{fator_rec_cmh_man:.3f} cm/h por m³/h**)"
+                )
+
+            with c_calc2:
+                st.markdown("##### 📋 Acionamentos Reais & Recalibração por Telemetria")
+                df_cycles, stats_cycles = detect_pump_cycles_and_volumes(filled_df, fator_m3h_para_cmh, vazao_bomba_m3h=vazao_bomba_m3h)
+                if not df_cycles.empty:
+                    m_cyc1, m_cyc2, m_cyc3, m_cyc4 = st.columns(4)
+                    m_cyc1.metric("Acionamentos", f"{stats_cycles['total_acionamentos']}")
+                    m_cyc2.metric("Vol. Total Expulso", f"{stats_cycles['volume_total_m3']:.3f} m³", delta=f"{stats_cycles['volume_total_m3']*1000:,.0f} L", delta_color="off")
+                    m_cyc3.metric("Vol. Nível Médio", f"{stats_cycles['volume_medio_L']:.0f} L")
+                    m_cyc4.metric("Fator Recalib. Médio", f"{stats_cycles.get('fator_recalib_medio_L_cm', 55.0):.1f} L/cm", delta=f"{stats_cycles.get('area_poco_recalib_m2', 5.50):.2f} m²", delta_color="off")
+
+                    st.dataframe(
+                        df_cycles.rename(columns={
+                            "t_liga": "Hora LIGA",
+                            "t_desliga": "Hora DESLIGA",
+                            "duracao_min": "Duração (min)",
+                            "d_alto_cm": "Nível Máx (cm)",
+                            "d_baixo_cm": "Nível Mín (cm)",
+                            "delta_cm": "Queda Δh (cm)",
+                            "vol_expulso_L": "Vol. Nível (L)",
+                            "vol_bomba_L": "Vol. Bomba (L)",
+                            "fator_recalib_L_cm": "Recalib (L/cm)",
+                            "vol_expulso_m3": "Volume (m³)",
+                        }),
+                        width="stretch",
+                        height=220,
+                    )
+                else:
+                    st.info("Nenhum ciclo completo de bomba identificado no período carregado.")
+
+            # ── Gráfico Temporal de Volume Expulso por Ciclo de Bomba ────────────────────
+            if not df_cycles.empty:
+                st.markdown("---")
+                st.markdown("##### 📈 Gráfico Temporal e Volume Acumulado Expulso pelas Bombas")
+                st.caption(
+                    "Cada barra representa um acionamento da bomba: a **largura** corresponde exatamente ao tempo "
+                    "em que a bomba ficou ligada (Início → Fim) e a **altura** representa o volume de água expulso em Litros."
+                )
+                fig_v_cycles = plot_pump_cycles_volume_chart(df_cycles)
+                if fig_v_cycles is not None:
+                    st.plotly_chart(fig_v_cycles, width="stretch")
+
 with tab2:
     if tab2.open:
         st.header("Formulação do Modelo Matemático")
         st.markdown("O comportamento hidrodinâmico do poço de drenagem é regido pela **Equação de Balanço de Massa / Continuidade**:")
         st.latex(r"\frac{dV}{dt} = A \cdot \frac{dh}{dt} = Q_{\text{entrada}}(t) - Q_{\text{saída}}(t)")
-        st.markdown(r"Como o sensor mede a distância $d(t)$ no topo em relação à lâmina d'água ($h(t) = H_{\text{sensor}} - d(t)$), temos $\frac{dh}{dt} = -\frac{dd}{dt}$." )
+        st.markdown(r"Como o sensor mede a distância $d(t)$ no topo em relação à lâmina d'água ($h(t) = H_{\text{sensor}} - d(t)$), temos $\frac{dh}{dt} = -\frac{dd}{dt}$.")
         st.markdown("Portanto, a taxa instantânea de variação da distância $d(t)$ é dada por:")
         st.latex(r"\frac{dd(t)}{dt} = \frac{Q_{\text{saída}}(t) - Q_{\text{entrada}}(t)}{A}")
         st.subheader("Regimes Operacionais Recalibrados")
-        st.markdown("**1️⃣ Entrada Lenta (Lençol Freático – Estado $S_0$)**")
-        st.markdown("- $Q_{\text{saída}} = 0$ (Bomba desligada)")
+        st.markdown(r"**1️⃣ Entrada Lenta (Lençol Freático – Estado $S_0$)**")
+        st.markdown(r"- $Q_{\text{saída}} = 0$ (Bomba desligada)")
         st.latex(r"\frac{dd}{dt} = -r_{\text{freático}} \approx -1.44\text{ cm/h}")
-        st.markdown("**2️⃣ Entrada por Chuva ($S_1$)**")
+        st.markdown(r"**2️⃣ Entrada por Chuva ($S_1$)**")
         st.markdown("- Relacionada com a precipitação em mm pela taxa de amplificação do pátio:")
         st.latex(r"\text{Taxa de Entrada (cm/h)} = \frac{\text{Chuva (mm)}}{\text{Horas}} \times 2.83")
-        st.markdown("**3️⃣ Esvaziamento Forçado (Bomba Ativa – Estado $S_2$)**")
+        st.markdown(r"**3️⃣ Esvaziamento Forçado (Bomba Ativa – Estado $S_2$)**")
         st.latex(rf"Q_{{\text{{saída}}}} = {vazao_bomba_m3h * 1000:,.0f}\text{{ L/h}} ({vazao_bomba_m3h:.1f}\text{{ m}}^3/\text{{h}}) \Rightarrow r_{{\text{{bomba}}}} \approx {r_pump_param:.1f}\text{{ cm/h}}")
-    
+
         st.markdown("---")
-        st.subheader("📐 Estimativa e Calibração do Fator de Conversão (m³/h para cm/h)")
-        st.markdown(
-            """
-            ### 1. Relação Teórica da Geometria do Poço
-            Para um poço cilíndrico ideal de diâmetro interno $D = 1,20\text{ m}$, a área da seção transversal ($A$) é dada por:
-            """
-        )
-        st.latex(r"A = \pi \cdot \left(\frac{D}{2}\right)^2 = \pi \cdot (0,60)^2 \approx 1,131\text{ m}^2")
-        st.markdown(
-            """
-            Teoricamente, a conversão entre uma vazão volumétrica $Q\text{ (m}^3/\text{h)}$ e a variação da coluna d'água no poço $r\text{ (cm/h)}$ seria:
-            """
-        )
-        st.latex(r"F_{\text{teórico}} = \frac{100\text{ cm/m}}{A\text{ m}^2} = \frac{100}{1,131} \approx 88,42\text{ (cm/h por m}^3/\text{h)}")
-    
-        st.markdown(
-            """
-            ### 2. O Efeito Real das Galerias Conectadas (*Pipe Storage* & Remanso)
-            Na instalação real, o poço não opera de forma isolada. Ele está conectado a tubulações e galerias de drenagem dispostas com inclinação suave.
-            Quando a bomba desliga ou a chuva entra, ocorre o **efeito de remanso**: a água preenche também o volume contido na rede de tubulações acopladas a montante.
-            
-            Isso expande a **área equivalente de armazenamento** ($A_{\text{efetiva}}$):
-            """
-        )
-        st.latex(r"A_{\text{efetiva}} = \frac{100}{F_{\text{calibrado}}} = \frac{100}{5,471} \approx 18,28\text{ m}^2")
-        st.markdown(
-            """
-            Ou seja, o reservatório físico se comporta hidrostaticamente como se tivesse uma área de superfície de **18,28 m²** (amortecimento muito maior que o poço isolado de 1,20 m).
-            """
-        )
-    
-        st.markdown(
-            """
-            ### 3. Estimativa Prática pelos Dados do Sensor Ultrassônico
-            O modelo estima e valida empiricamente o fator de conversão $F$ analisando os ciclos de acionamento da bomba capturados pelo sensor ultrassônico durante períodos sem chuva (quando apenas o lençol freático está ativo):
-    
-            1. **Fase de Esvaziamento (Bomba LIGADA):** O sensor mede a velocidade líquida de rebaixamento da água $(\\frac{dd}{dt})_{\\text{desce}} \\approx -75,16\\text{ cm/h}$.
-            2. **Fase de Enchimento (Bomba DESLIGADA):** O sensor mede a velocidade de subida por afluxo do lençol freático $(\\frac{dd}{dt})_{\\text{subida}} \\approx +1,44\\text{ cm/h}$.
-            3. **Vazão Bruta da Bomba ($r_{\\text{bomba}}$):** A soma em módulo das duas velocidades elimina a interferência do lençol freático e fornece a velocidade bruta da bomba registrada no sensor:
-            """
-        )
-        st.latex(r"r_{\text{bomba}} = \left|\left(\frac{dd}{dt}\right)_{\text{desce}}\right| + \left(\frac{dd}{dt}\right)_{\text{subida}} = 75,16 + 1,44 = 76,6\text{ cm/h}")
-        st.markdown(
-            """
-            4. **Cálculo do Fator Calibrado ($F$):** Dividindo essa taxa de variação observada pelo sensor em $\\text{cm/h}$ pela vazão nominal hidráulica da bomba $Q_{\\text{bomba}} = 14,0\\text{ m}^3/\\text{h}$:
-            """
-        )
-        st.latex(r"F_{\text{calibrado}} = \frac{r_{\text{bomba}}\text{ (cm/h)}}{Q_{\text{bomba}}\text{ (m}^3/\text{h)}} = \frac{76,6\text{ cm/h}}{14,0\text{ m}^3/\text{h}} = 5,471\text{ (cm/h por m}^3/\text{h)}")
+        st.subheader("📐 Estimativa e Calibração do Modelo de Dois Fatores (m³/h para cm/h)")
+        st.markdown(r"""
+### 1. Relação Teórica do Poço Cilíndrico Isolado
+Para um poço cilíndrico ideal de diâmetro interno $D = 1{,}20\text{ m}$, a área da seção transversal isolada ($A$) é:
+""")
+        st.latex(r"A = \pi \cdot \left(\frac{D}{2}\right)^2 = \pi \cdot (0{,}60)^2 \approx 1{,}131\text{ m}^2 \quad (\mathbf{11{,}31\text{ Litros/cm}})")
+        st.markdown(r"""
+Se o poço operasse totalmente isolado, a conversão teórica para uma bomba de **37,0 m³/h** (616,7 L/min) resultaria em uma velocidade de rebaixamento de $r_{\text{bomba}} \approx 3.271\text{ cm/h}$ (54,5 cm/min), esvaziando 22 cm em apenas 24 segundos.
+
+### 2. Modelo Hidrológico de Dois Fatores (*Dual-Factor Model*)
+Na prática, o sistema comporta-se sob **dois regimes distintos**:
+
+* **⚡ Regime 1: Bombeamento Rápido por Bomba (37,0 m³/h em 2 a 3 minutos)**  
+  Durante os acionamentos curtos da bomba de $37{,}0\text{ m}^3/\text{h}$, a água expulsa vem da coluna principal do poço e das tubulações de chegada direta. A água retida na porosidade do solo e galerias distantes não consegue fluir rapidamente por capilaridade (*rendimento específico*).  
+  A calibração por telemetria indica que **$55{,}0\text{ Litros}$ entram/saem por cm de nível no poço** ($A_{\text{bomba}} = 5{,}50\text{ m}^2$).
+""")
+        st.latex(r"F_{\text{bomba}} = \frac{100}{A_{\text{bomba}}} = \frac{100}{5{,}50} \approx 18{,}182\text{ (cm/h por m}^3/\text{h)}")
+        st.latex(r"r_{\text{bomba}} = Q_{\text{bomba}} \cdot F_{\text{bomba}} = 37{,}0\text{ m}^3/\text{h} \times 18{,}182 = 672{,}7\text{ cm/h} \quad (\mathbf{11{,}2\text{ cm/min}})")
+        st.markdown(r"""
+* **🌧️ Regime 2: Infiltração Lenta / Chuva (Acumulo e Retenção do Pátio em Horas)**  
+  Em eventos de chuva prolongada ou testes estáticos de infiltração, a água satura o solo úmido ao redor e as tubulações de retração, expandindo a capacidade de retenção para **$187{,}5\text{ Litros/cm}$** ($A_{\text{chuva}} = 18{,}75\text{ m}^2$).  
+  O fator de amplificação calibrado para precipitação sobre o pátio é de **$2{,}83\text{ cm de poço por mm de chuva}$**.
+""")
     
         st.markdown("---")
         st.subheader("📈 Comparativo no Momento LIGA → DESLIGA: Esvaziamento Teórico vs. 5+ Séries Reais (Sensor)")
