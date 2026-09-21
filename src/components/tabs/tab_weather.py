@@ -7,7 +7,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.config import DEFAULT_FATOR_M3H_PARA_CMH, DEFAULT_VAZAO_BOMBA_M3H
 from src.utils import now_local
+from src.components.charts import (
+    plot_rain_vs_pump_correlation_scatter,
+    plot_rain_vs_pump_cumulative_timeline,
+)
 
 
 def render_tab_weather(
@@ -15,6 +20,9 @@ def render_tab_weather(
     latitude: float,
     longitude: float,
     factor_mm_cm: float,
+    filled_df: Optional[pd.DataFrame] = None,
+    fator_m3h_para_cmh: float = DEFAULT_FATOR_M3H_PARA_CMH,
+    vazao_bomba_m3h: float = DEFAULT_VAZAO_BOMBA_M3H,
     latest_temp: Optional[float] = None,
     temp_min_24h: Optional[float] = None,
     temp_max_24h: Optional[float] = None,
@@ -36,6 +44,40 @@ def render_tab_weather(
     hist_df = weather_df[weather_df.index <= now_tz].copy()
     fcast_df = weather_df[weather_df.index > now_tz].copy()
 
+    # ── Acumulado de chuva no período mostrado no dashboard ──────────────────────
+    precip_period = None
+    window_str = "Período"
+    period_help = "Chuva acumulada na janela selecionada no dashboard"
+
+    if filled_df is not None and not filled_df.empty:
+        t_col = "dt_round" if "dt_round" in filled_df.columns else "timestamp"
+        if t_col in filled_df.columns:
+            t_min = filled_df[t_col].min()
+            t_max = filled_df[t_col].max()
+            if pd.notna(t_min) and pd.notna(t_max):
+                delta_h = (t_max - t_min).total_seconds() / 3600.0
+                if delta_h >= 48:
+                    window_str = f"{delta_h / 24.0:.1f} dias"
+                elif delta_h > 0:
+                    window_str = f"{delta_h:.0f}h"
+                else:
+                    window_str = "Período"
+
+                if "precipitation_5min" in filled_df.columns:
+                    precip_period = float(filled_df["precipitation_5min"].sum())
+                elif not weather_df.empty:
+                    precip_period = float(
+                        weather_df[(weather_df.index >= t_min) & (weather_df.index <= t_max)]["precipitation"].sum()
+                    )
+
+                if precip_period is not None:
+                    aporte_cm = precip_period * factor_mm_cm
+                    period_help = (
+                        f"Chuva acumulada total na janela carregada no dashboard: "
+                        f"{t_min.strftime('%d/%m/%Y %H:%M')} até {t_max.strftime('%d/%m/%Y %H:%M')} ({window_str}). "
+                        f"Aporte teórico estimado no poço: {aporte_cm:.1f} cm (fator {factor_mm_cm:.2f} cm/mm)."
+                    )
+
     last_24h = weather_df[weather_df.index >= (now_tz - pd.Timedelta(hours=24))]
     next_24h = weather_df[
         (weather_df.index > now_tz) & (weather_df.index <= (now_tz + pd.Timedelta(hours=24)))
@@ -50,7 +92,14 @@ def render_tab_weather(
     max_intensity = weather_df["precipitation"].max()
 
     st.markdown("#### 🌧️ Métricas de Precipitação")
-    col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(5)
+    col_w0, col_w1, col_w2, col_w3, col_w4, col_w5 = st.columns(6)
+    col_w0.metric(
+        "Acumulado no Período",
+        f"{precip_period:.1f} mm" if precip_period is not None else "N/A",
+        delta=f"Janela: {window_str}" if window_str else None,
+        delta_color="off",
+        help=period_help,
+    )
     col_w1.metric("Acumulado últimas 24h", f"{last_24h['precipitation'].sum():.1f} mm")
     col_w2.metric("Previsão próximas 24h", f"{next_24h['precipitation'].sum():.1f} mm")
     col_w3.metric("Previsão próximas 48h", f"{next_48h['precipitation'].sum():.1f} mm")
@@ -176,6 +225,89 @@ def render_tab_weather(
             hovermode="x unified",
         )
         st.plotly_chart(fig_temp, width="stretch")
+
+    # ── Correlação Hidráulica: Chuva Acumulada (mm) vs. Volume Expulso (Litros) ──
+    if filled_df is not None and not filled_df.empty:
+        st.markdown("---")
+        st.subheader("💧 Correlação Hidráulica: Chuva Acumulada (mm) vs. Volume Expulso (Litros)")
+        st.caption(
+            "Análise quantitativa empírica baseada no histórico de telemetria do poço: correlaciona diretamente os milímetros de chuva "
+            "com os Litros de água efetivamente expulsos pelos acionamentos reais da bomba."
+        )
+
+        fig_scatter, stats_corr = plot_rain_vs_pump_correlation_scatter(
+            filled_df,
+            fator_m3h_para_cmh=fator_m3h_para_cmh,
+            vazao_bomba_m3h=vazao_bomba_m3h,
+        )
+
+        fig_cum = plot_rain_vs_pump_cumulative_timeline(
+            filled_df,
+            fator_m3h_para_cmh=fator_m3h_para_cmh,
+            vazao_bomba_m3h=vazao_bomba_m3h,
+        )
+
+        if stats_corr and stats_corr.get("days_count", 0) > 0:
+            c_cr1, c_cr2, c_cr3, c_cr4, c_cr5 = st.columns(5)
+            c_cr1.metric("🌧️ Chuva no Histórico", f"{stats_corr['total_rain_mm']:.1f} mm")
+            c_cr2.metric(
+                "💧 Vol. Total Expulso",
+                f"{stats_corr['total_vol_L']:,.0f} L",
+                delta=f"{stats_corr['total_vol_m3']:.2f} m³",
+                delta_color="off",
+            )
+            c_cr3.metric("⚡ Ciclos da Bomba", f"{stats_corr['total_cycles']} ciclos")
+
+            r2_val = stats_corr["r2"]
+            r_val = stats_corr["r_pearson"]
+            r_qual = "Forte" if abs(r_val) >= 0.7 else ("Moderada" if abs(r_val) >= 0.4 else "Fraca / Lençol")
+            c_cr4.metric(
+                "📈 Correlação (R²)",
+                f"{r2_val:.2f}",
+                delta=f"R = {r_val:+.2f} ({r_qual})",
+                delta_color="normal" if r_val > 0.5 else "off",
+            )
+
+            area_efetiva = stats_corr["area_efetiva_m2"]
+            c_cr5.metric(
+                "📐 Área Efetiva Estimada",
+                f"{area_efetiva:.0f} m²",
+                delta=f"{stats_corr['slope_L_mm']:.1f} L/mm",
+                delta_color="off",
+                help="Relação empírica entre Litros expulsos e milímetros de chuva (1 mm = 1 L/m² de área de captação).",
+            )
+
+            tipo_grafico = st.radio(
+                "Modo de Visualização:",
+                options=["📈 Dispersão Diária & Linha de Tendência", "⏱️ Evolução Temporal Contínua (Eixos Duplos)"],
+                horizontal=True,
+                key="tipo_graf_corr",
+            )
+
+            if "Dispersão" in tipo_grafico and fig_scatter is not None:
+                st.plotly_chart(fig_scatter, width="stretch")
+            elif fig_cum is not None:
+                st.plotly_chart(fig_cum, width="stretch")
+
+            df_daily_show = stats_corr.get("df_daily")
+            if df_daily_show is not None and not df_daily_show.empty:
+                with st.expander("Ver tabela de dados diários de chuva vs. volume expulso", icon=":material/table_chart:"):
+                    st.dataframe(
+                        df_daily_show[[
+                            "data_str", "chuva_mm", "vol_expulso_L", "vol_expulso_m3", "n_ciclos", "ratio_L_mm"
+                        ]].rename(columns={
+                            "data_str": "Data",
+                            "chuva_mm": "Chuva no Dia (mm)",
+                            "vol_expulso_L": "Volume Expulso (Litros)",
+                            "vol_expulso_m3": "Volume Expulso (m³)",
+                            "n_ciclos": "Acionamentos da Bomba",
+                            "ratio_L_mm": "Relação (L/mm)",
+                        }),
+                        width="stretch",
+                        hide_index=True,
+                    )
+        else:
+            st.info("Dados insuficientes para gerar correlação no período selecionado.")
 
     # Resumo Diário da Previsão dos Próximos 7 Dias
     st.subheader("📅 Resumo Diário da Previsão – Próximos 7 Dias")

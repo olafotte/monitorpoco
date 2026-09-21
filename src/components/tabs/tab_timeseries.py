@@ -21,6 +21,8 @@ from src.components.charts import (
     plot_historical_extremes_chart,
     plot_rate_histograms,
     plot_pump_cycles_volume_chart,
+    plot_rain_vs_pump_correlation_scatter,
+    plot_rain_vs_pump_cumulative_timeline,
 )
 
 
@@ -661,3 +663,12 @@ def render_tab_timeseries(
             fig_v_cycles = plot_pump_cycles_volume_chart(df_cycles)
             if fig_v_cycles is not None:
                 st.plotly_chart(fig_v_cycles, width="stretch")
+
+            with st.expander("🌧️ Ver Correlação: Chuva Acumulada (mm) vs. Volume Expulso (Litros)", icon=":material/scatter_plot:"):
+                fig_corr_ts, stats_corr_ts = plot_rain_vs_pump_correlation_scatter(
+                    filled_df,
+                    fator_m3h_para_cmh=fator_m3h_para_cmh,
+                    vazao_bomba_m3h=vazao_bomba_m3h,
+                )
+                if fig_corr_ts is not None:
+                    st.plotly_chart(fig_corr_ts, width="stretch")

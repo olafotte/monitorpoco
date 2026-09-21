@@ -2,13 +2,15 @@
 Componentes visuais e gráficos Plotly reutilizáveis para o sistema de monitoramento de poço.
 """
 
-from typing import Tuple, Optional, Any
+from typing import Tuple, Optional, Any, Dict
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-from src.models.pump_cycles import segment_operational_periods
+from src.config import DEFAULT_FATOR_M3H_PARA_CMH, DEFAULT_VAZAO_BOMBA_M3H
+from src.models.pump_cycles import segment_operational_periods, detect_pump_cycles_and_volumes
 
 
 def plot_historical_extremes_chart(
@@ -252,3 +254,276 @@ def plot_pump_cycles_volume_chart(df_cycles: pd.DataFrame) -> Optional[go.Figure
     )
 
     return fig
+
+
+def plot_rain_vs_pump_correlation_scatter(
+    filled_df: pd.DataFrame,
+    fator_m3h_para_cmh: float = DEFAULT_FATOR_M3H_PARA_CMH,
+    vazao_bomba_m3h: float = DEFAULT_VAZAO_BOMBA_M3H,
+) -> Tuple[Optional[go.Figure], Dict[str, Any]]:
+    """Gera gráfico de dispersão com linha de tendência correlacionando milímetros de chuva diários
+    com litros de água expulsos pela bomba no mesmo dia.
+    
+    Retorna (figura Plotly, dicionário de estatísticas de correlação).
+    """
+    if filled_df is None or filled_df.empty or "dt_round" not in filled_df.columns:
+        return None, {}
+
+    df_work = filled_df.copy()
+    df_work["date"] = pd.to_datetime(df_work["dt_round"]).dt.date
+
+    # 1. Agregação diária da precipitação
+    col_precip = "precipitation_5min" if "precipitation_5min" in df_work.columns else None
+    if col_precip:
+        daily_rain = df_work.groupby("date")[col_precip].sum().reset_index()
+        daily_rain.columns = ["date", "chuva_mm"]
+    else:
+        daily_rain = pd.DataFrame({"date": df_work["date"].unique(), "chuva_mm": 0.0})
+
+    # 2. Agregação diária dos volumes de bombeamento
+    df_cycles, _ = detect_pump_cycles_and_volumes(
+        filled_df,
+        fator_m3h_para_cmh=fator_m3h_para_cmh,
+        vazao_bomba_m3h=vazao_bomba_m3h,
+    )
+
+    if not df_cycles.empty:
+        df_cycles = df_cycles.copy()
+        df_cycles["date"] = pd.to_datetime(df_cycles["t_liga"]).dt.date
+        daily_pump = df_cycles.groupby("date").agg(
+            vol_expulso_L=("vol_expulso_L", "sum"),
+            n_ciclos=("vol_expulso_L", "count"),
+        ).reset_index()
+        df_daily = pd.merge(daily_rain, daily_pump, on="date", how="left").fillna(0.0)
+    else:
+        df_daily = daily_rain.copy()
+        df_daily["vol_expulso_L"] = 0.0
+        df_daily["n_ciclos"] = 0
+
+    df_daily["vol_expulso_m3"] = df_daily["vol_expulso_L"] / 1000.0
+    df_daily["data_str"] = pd.to_datetime(df_daily["date"]).dt.strftime("%d/%m/%Y")
+    df_daily["ratio_L_mm"] = np.where(
+        df_daily["chuva_mm"] > 0,
+        df_daily["vol_expulso_L"] / df_daily["chuva_mm"],
+        0.0,
+    )
+
+    total_rain = float(df_daily["chuva_mm"].sum())
+    total_vol = float(df_daily["vol_expulso_L"].sum())
+    total_cycles = int(df_daily["n_ciclos"].sum())
+    days_count = len(df_daily)
+
+    # 3. Regressão linear OLS
+    x_vals = df_daily["chuva_mm"].values
+    y_vals = df_daily["vol_expulso_L"].values
+
+    slope = 0.0
+    intercept = 0.0
+    r_val = 0.0
+    r2_val = 0.0
+
+    if len(df_daily) >= 2 and np.std(x_vals) > 1e-6:
+        try:
+            poly = np.polyfit(x_vals, y_vals, 1)
+            slope = float(poly[0])
+            intercept = float(poly[1])
+            r_mat = np.corrcoef(x_vals, y_vals)
+            if not np.isnan(r_mat[0, 1]):
+                r_val = float(r_mat[0, 1])
+                r2_val = float(r_val ** 2)
+        except Exception:
+            pass
+
+    stats = {
+        "r_pearson": r_val,
+        "r2": r2_val,
+        "slope_L_mm": slope,
+        "area_efetiva_m2": max(0.0, slope),
+        "intercept_L": intercept,
+        "total_rain_mm": total_rain,
+        "total_vol_L": total_vol,
+        "total_vol_m3": total_vol / 1000.0,
+        "total_cycles": total_cycles,
+        "days_count": days_count,
+        "ratio_global_L_mm": (total_vol / total_rain) if total_rain > 0 else 0.0,
+        "df_daily": df_daily,
+    }
+
+    fig = go.Figure()
+
+    # Dispersão diária
+    fig.add_trace(
+        go.Scatter(
+            x=df_daily["chuva_mm"],
+            y=df_daily["vol_expulso_L"],
+            mode="markers+text",
+            text=df_daily["data_str"].apply(lambda s: s[:5]),
+            textposition="top center",
+            textfont=dict(size=9, color="#555555"),
+            name="Dias Monitorados",
+            marker=dict(
+                size=np.clip(10 + df_daily["n_ciclos"] * 2.5, 10, 26),
+                color=df_daily["vol_expulso_L"],
+                colorscale="Blues",
+                showscale=True,
+                colorbar=dict(title="Volume (L)", len=0.8),
+                line=dict(color="#0d47a1", width=1.5),
+            ),
+            customdata=np.stack((
+                df_daily["data_str"],
+                df_daily["vol_expulso_m3"],
+                df_daily["n_ciclos"],
+                df_daily["ratio_L_mm"],
+            ), axis=-1),
+            hovertemplate=(
+                "<b>📅 Data: %{customdata[0]}</b><br>"
+                "🌧️ Chuva no Dia: <b>%{x:.1f} mm</b><br>"
+                "💧 Volume Expulso: <b>%{y:,.0f} Litros (%{customdata[1]:.3f} m³)</b><br>"
+                "⚡ Acionamentos: <b>%{customdata[2]:.0f} ciclos</b><br>"
+                "📐 Relação no Dia: <b>%{customdata[3]:.1f} L/mm</b>"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    # Linha de tendência
+    if len(df_daily) >= 2 and np.std(x_vals) > 1e-6:
+        x_trend = np.linspace(0.0, max(float(x_vals.max()) * 1.1, 5.0), 50)
+        y_trend = np.maximum(slope * x_trend + intercept, 0.0)
+        eq_label = f"Tendência: {slope:.1f} L/mm ({max(slope, 0):.0f} m²) | R² = {r2_val:.2f}"
+        fig.add_trace(
+            go.Scatter(
+                x=x_trend,
+                y=y_trend,
+                mode="lines",
+                name=eq_label,
+                line=dict(color="#e65100", width=2.5, dash="dash"),
+                hovertemplate="Chuva: %{x:.1f} mm → Volume Esperado: %{y:,.0f} L<extra></extra>",
+            )
+        )
+
+    fig.update_layout(
+        title="📈 Dispersão & Correlação Diária: Chuva Acumulada (mm) vs. Volume Expulso (Litros)",
+        xaxis=dict(
+            title="Chuva Acumulada no Dia (mm)",
+            gridcolor="rgba(0,0,0,0.08)",
+            zeroline=True,
+            zerolinecolor="rgba(0,0,0,0.2)",
+        ),
+        yaxis=dict(
+            title="Volume Expulso pela Bomba no Dia (Litros)",
+            gridcolor="rgba(0,0,0,0.08)",
+            zeroline=True,
+            zerolinecolor="rgba(0,0,0,0.2)",
+        ),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        height=450,
+        margin=dict(l=40, r=40, t=50, b=60),
+    )
+
+    return fig, stats
+
+
+def plot_rain_vs_pump_cumulative_timeline(
+    filled_df: pd.DataFrame,
+    fator_m3h_para_cmh: float = DEFAULT_FATOR_M3H_PARA_CMH,
+    vazao_bomba_m3h: float = DEFAULT_VAZAO_BOMBA_M3H,
+) -> Optional[go.Figure]:
+    """Gera gráfico temporal contínuo em eixos duplos mostrando a curva de Chuva Acumulada (mm)
+    e a curva de Volume Expulso Acumulado (Litros) ao longo de todo o histórico.
+    """
+    if filled_df is None or filled_df.empty or "dt_round" not in filled_df.columns:
+        return None
+
+    df_calc = filled_df.sort_values("dt_round").copy()
+    col_precip = "precipitation_5min" if "precipitation_5min" in df_calc.columns else None
+
+    if col_precip:
+        df_calc["rain_cum_mm"] = df_calc[col_precip].fillna(0.0).cumsum()
+    else:
+        df_calc["rain_cum_mm"] = 0.0
+
+    df_cycles, _ = detect_pump_cycles_and_volumes(
+        filled_df,
+        fator_m3h_para_cmh=fator_m3h_para_cmh,
+        vazao_bomba_m3h=vazao_bomba_m3h,
+    )
+
+    # Mapear cada acionamento da bomba ao timestamp mais próximo na série temporal
+    df_calc["pump_step_L"] = 0.0
+    if not df_cycles.empty:
+        # Arredondar t_desliga para o dt_round correspondente com compatibilidade de timezone
+        dt_tz = df_calc["dt_round"].dt.tz
+        for _, c_row in df_cycles.iterrows():
+            t_end = pd.to_datetime(c_row["t_desliga"])
+            if dt_tz is not None and t_end.tzinfo is None:
+                t_end = t_end.tz_localize(dt_tz)
+            elif dt_tz is None and t_end.tzinfo is not None:
+                t_end = t_end.tz_localize(None)
+            idx_near = (df_calc["dt_round"] - t_end).abs().idxmin()
+            df_calc.loc[idx_near, "pump_step_L"] += float(c_row["vol_expulso_L"])
+
+    df_calc["pump_cum_L"] = df_calc["pump_step_L"].cumsum()
+    df_calc["pump_cum_m3"] = df_calc["pump_cum_L"] / 1000.0
+
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+    # Traço 1: Volume Expulso Acumulado (Eixo Esquerdo)
+    fig.add_trace(
+        go.Scatter(
+            x=df_calc["dt_round"],
+            y=df_calc["pump_cum_L"],
+            name="Volume Expulso Acumulado (L)",
+            line=dict(color="#1565c0", width=2.5),
+            fill="tozeroy",
+            fillcolor="rgba(21, 101, 192, 0.08)",
+            customdata=df_calc["pump_cum_m3"],
+            hovertemplate=(
+                "<b>Data: %{x|%d/%m/%Y %H:%M}</b><br>"
+                "💧 Volume Expulso Acumulado: <b>%{y:,.0f} Litros (%{customdata:.3f} m³)</b>"
+                "<extra></extra>"
+            ),
+        ),
+        secondary_y=False,
+    )
+
+    # Traço 2: Chuva Acumulada (Eixo Direito)
+    fig.add_trace(
+        go.Scatter(
+            x=df_calc["dt_round"],
+            y=df_calc["rain_cum_mm"],
+            name="Chuva Acumulada (mm)",
+            line=dict(color="#00838f", width=2.5, dash="dot"),
+            hovertemplate=(
+                "<b>Data: %{x|%d/%m/%Y %H:%M}</b><br>"
+                "🌧️ Chuva Acumulada: <b>%{y:.1f} mm</b>"
+                "<extra></extra>"
+            ),
+        ),
+        secondary_y=True,
+    )
+
+    fig.update_layout(
+        title="⏱️ Evolução Temporal Contínua: Chuva Acumulada (mm) vs. Volume Expulso pela Bomba (Litros)",
+        xaxis=dict(
+            title="Data / Hora",
+            gridcolor="rgba(0,0,0,0.08)",
+        ),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        height=450,
+        margin=dict(l=40, r=40, t=50, b=60),
+    )
+
+    fig.update_yaxes(
+        title_text="Volume Expulso Acumulado (Litros)",
+        secondary_y=False,
+        gridcolor="rgba(0,0,0,0.08)",
+    )
+    fig.update_yaxes(
+        title_text="Precipitação Acumulada (mm)",
+        secondary_y=True,
+        showgrid=False,
+    )
+
+    return fig
+
