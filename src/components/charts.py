@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 
 from src.config import DEFAULT_FATOR_M3H_PARA_CMH, DEFAULT_VAZAO_BOMBA_M3H
 from src.models.pump_cycles import segment_operational_periods, detect_pump_cycles_and_volumes
+from src.utils import LOCAL_TZ, normalize_local_ts, to_brasilia_naive
 
 
 def plot_historical_extremes_chart(
@@ -40,7 +41,7 @@ def plot_historical_extremes_chart(
 
     fig.add_trace(
         go.Scatter(
-            x=df_calc["dt_round"],
+            x=to_brasilia_naive(df_calc["dt_round"]),
             y=df_calc[col_nivel],
             mode="lines",
             name="Nível do Poço (cm)",
@@ -52,16 +53,17 @@ def plot_historical_extremes_chart(
     # 1. Água mais alta (Pico)
     d1 = float(row_max_w[col_nivel])
     t1_dt = row_max_w["dt_round"]
-    t1_str = pd.to_datetime(t1_dt).strftime("%d/%m/%Y às %H:%M")
+    t1_naive = to_brasilia_naive(t1_dt)
+    t1_str = pd.to_datetime(t1_naive).strftime("%d/%m/%Y às %H:%M")
     fig.add_trace(
         go.Scatter(
-            x=[t1_dt], y=[d1], mode="markers", name="Água Mais Alta (Pico)",
+            x=[t1_naive], y=[d1], mode="markers", name="Água Mais Alta (Pico)",
             marker=dict(symbol="star", size=15, color="#d9534f", line=dict(width=1.5, color="black")),
             showlegend=True
         )
     )
     fig.add_annotation(
-        x=t1_dt, y=d1,
+        x=t1_naive, y=d1,
         text=f"<b>🔴 Água Mais Alta: {d1:.1f} cm</b><br>{t1_str}",
         showarrow=True, arrowhead=2, arrowsize=1.2, arrowcolor="#d9534f",
         ax=0, ay=45,
@@ -72,16 +74,17 @@ def plot_historical_extremes_chart(
     # 2. Água mais baixa (Vale)
     d2 = float(row_min_w[col_nivel])
     t2_dt = row_min_w["dt_round"]
-    t2_str = pd.to_datetime(t2_dt).strftime("%d/%m/%Y às %H:%M")
+    t2_naive = to_brasilia_naive(t2_dt)
+    t2_str = pd.to_datetime(t2_naive).strftime("%d/%m/%Y às %H:%M")
     fig.add_trace(
         go.Scatter(
-            x=[t2_dt], y=[d2], mode="markers", name="Água Mais Baixa (Vale)",
+            x=[t2_naive], y=[d2], mode="markers", name="Água Mais Baixa (Vale)",
             marker=dict(symbol="diamond", size=13, color="#0275d8", line=dict(width=1.5, color="black")),
             showlegend=True
         )
     )
     fig.add_annotation(
-        x=t2_dt, y=d2,
+        x=t2_naive, y=d2,
         text=f"<b>🔵 Água Mais Baixa: {d2:.1f} cm</b><br>{t2_str}",
         showarrow=True, arrowhead=2, arrowsize=1.2, arrowcolor="#0275d8",
         ax=0, ay=-45,
@@ -93,17 +96,18 @@ def plot_historical_extremes_chart(
     if row_peak_rise is not None:
         r3 = float(row_peak_rise["rate_cmh"])
         t3_dt = row_peak_rise["t_start"]
-        t3_str = pd.to_datetime(t3_dt).strftime("%d/%m/%Y às %H:%M")
+        t3_naive = to_brasilia_naive(t3_dt)
+        t3_str = pd.to_datetime(t3_naive).strftime("%d/%m/%Y às %H:%M")
         d3 = float(row_peak_rise["d_start"])
         fig.add_trace(
             go.Scatter(
-                x=[t3_dt], y=[d3], mode="markers", name="Pico Taxa Subida",
+                x=[t3_naive], y=[d3], mode="markers", name="Pico Taxa Subida",
                 marker=dict(symbol="triangle-up", size=13, color="#f0ad4e", line=dict(width=1.5, color="black")),
                 showlegend=True
             )
         )
         fig.add_annotation(
-            x=t3_dt, y=d3,
+            x=t3_naive, y=d3,
             text=f"<b>⚡ Pico Subida: +{r3:.1f} cm/h</b><br>{t3_str}",
             showarrow=True, arrowhead=2, arrowcolor="#f0ad4e",
             ax=50, ay=-35,
@@ -115,17 +119,18 @@ def plot_historical_extremes_chart(
     if row_peak_drop is not None:
         r4 = float(row_peak_drop["rate_cmh"])
         t4_dt = row_peak_drop["t_start"]
-        t4_str = pd.to_datetime(t4_dt).strftime("%d/%m/%Y às %H:%M")
+        t4_naive = to_brasilia_naive(t4_dt)
+        t4_str = pd.to_datetime(t4_naive).strftime("%d/%m/%Y às %H:%M")
         d4 = float(row_peak_drop["d_start"])
         fig.add_trace(
             go.Scatter(
-                x=[t4_dt], y=[d4], mode="markers", name="Pico Taxa Descida (Bomba)",
+                x=[t4_naive], y=[d4], mode="markers", name="Pico Taxa Descida (Bomba)",
                 marker=dict(symbol="triangle-down", size=13, color="#5cb85c", line=dict(width=1.5, color="black")),
                 showlegend=True
             )
         )
         fig.add_annotation(
-            x=t4_dt, y=d4,
+            x=t4_naive, y=d4,
             text=f"<b>🌊 Pico Descida: -{r4:.1f} cm/h</b><br>{t4_str}",
             showarrow=True, arrowhead=2, arrowcolor="#5cb85c",
             ax=-50, ay=35,
@@ -198,8 +203,12 @@ def plot_pump_cycles_volume_chart(df_cycles: pd.DataFrame) -> Optional[go.Figure
     df_plot["t_liga"] = pd.to_datetime(df_plot["t_liga"])
     df_plot["t_desliga"] = pd.to_datetime(df_plot["t_desliga"])
 
-    df_plot["x_mid"] = df_plot["t_liga"] + (df_plot["t_desliga"] - df_plot["t_liga"]) / 2
+    mid_dt = df_plot["t_liga"] + (df_plot["t_desliga"] - df_plot["t_liga"]) / 2
+    df_plot["x_mid"] = to_brasilia_naive(mid_dt)
     df_plot["width_ms"] = (df_plot["t_desliga"] - df_plot["t_liga"]).dt.total_seconds() * 1000.0
+
+    t_liga_str = to_brasilia_naive(df_plot["t_liga"]).dt.strftime("%d/%m/%Y %H:%M:%S")
+    t_desliga_str = to_brasilia_naive(df_plot["t_desliga"]).dt.strftime("%d/%m/%Y %H:%M:%S")
 
     fig = go.Figure()
 
@@ -217,8 +226,8 @@ def plot_pump_cycles_volume_chart(df_cycles: pd.DataFrame) -> Optional[go.Figure
                 line=dict(color="#0d47a1", width=1.2),
             ),
             customdata=np.stack((
-                df_plot["t_liga"].dt.strftime("%d/%m/%Y %H:%M:%S"),
-                df_plot["t_desliga"].dt.strftime("%d/%m/%Y %H:%M:%S"),
+                t_liga_str,
+                t_desliga_str,
                 df_plot["duracao_min"],
                 df_plot["d_alto_cm"],
                 df_plot["d_baixo_cm"],
@@ -471,7 +480,7 @@ def plot_rain_vs_pump_cumulative_timeline(
     # Traço 1: Volume Expulso Acumulado (Eixo Esquerdo)
     fig.add_trace(
         go.Scatter(
-            x=df_calc["dt_round"],
+            x=to_brasilia_naive(df_calc["dt_round"]),
             y=df_calc["pump_cum_L"],
             name="Volume Expulso Acumulado (L)",
             line=dict(color="#1565c0", width=2.5),
@@ -490,7 +499,7 @@ def plot_rain_vs_pump_cumulative_timeline(
     # Traço 2: Chuva Acumulada (Eixo Direito)
     fig.add_trace(
         go.Scatter(
-            x=df_calc["dt_round"],
+            x=to_brasilia_naive(df_calc["dt_round"]),
             y=df_calc["rain_cum_mm"],
             name="Chuva Acumulada (mm)",
             line=dict(color="#00838f", width=2.5, dash="dot"),
@@ -526,4 +535,250 @@ def plot_rain_vs_pump_cumulative_timeline(
     )
 
     return fig
+
+
+def plot_pump_starts_per_hour_chart(
+    filled_df: pd.DataFrame,
+    df_cycles: Optional[pd.DataFrame] = None,
+    fator_m3h_para_cmh: float = DEFAULT_FATOR_M3H_PARA_CMH,
+    vazao_bomba_m3h: float = DEFAULT_VAZAO_BOMBA_M3H,
+) -> Tuple[Optional[go.Figure], Dict[str, Any]]:
+    """Gera gráfico de barras verticais com o número de ciclos de acionamento (partidas) da bomba por hora.
+
+    Permite monitorar se a bomba foi acionada entre 6 a 10 vezes/hora (atenção) ou mais de 10 vezes/hora (crítico),
+    avaliando o estresse elétrico e térmico decorrente da corrente de partida (inrush current).
+    
+    Retorna (figura Plotly, dicionário de estatísticas por hora).
+    """
+    if filled_df is None or filled_df.empty or "dt_round" not in filled_df.columns:
+        return None, {}
+
+    if df_cycles is None:
+        df_cycles, _ = detect_pump_cycles_and_volumes(
+            filled_df,
+            fator_m3h_para_cmh=fator_m3h_para_cmh,
+            vazao_bomba_m3h=vazao_bomba_m3h,
+        )
+
+    dt_series = pd.to_datetime(filled_df["dt_round"])
+    t_start = dt_series.min().floor("h")
+    t_end = dt_series.max().ceil("h")
+    if t_start >= t_end:
+        t_end = t_start + pd.Timedelta(hours=1)
+
+    hourly_idx = pd.date_range(start=t_start, end=t_end, freq="1h", tz=t_start.tz)
+    if len(hourly_idx) == 0:
+        return None, {}
+
+    hourly_df = pd.DataFrame({"hora": hourly_idx})
+
+    if df_cycles is not None and not df_cycles.empty and "t_liga" in df_cycles.columns:
+        c_df = df_cycles.copy()
+        c_df["t_liga_clean"] = pd.to_datetime(c_df["t_liga"])
+        if t_start.tz is not None and c_df["t_liga_clean"].dt.tz is None:
+            c_df["t_liga_clean"] = c_df["t_liga_clean"].dt.tz_localize(t_start.tz)
+        elif t_start.tz is None and c_df["t_liga_clean"].dt.tz is not None:
+            c_df["t_liga_clean"] = c_df["t_liga_clean"].dt.tz_localize(None)
+
+        c_df["hora"] = c_df["t_liga_clean"].dt.floor("h")
+
+        vol_col = "vol_expulso_L" if "vol_expulso_L" in c_df.columns else None
+        dur_col = "duracao_min" if "duracao_min" in c_df.columns else None
+
+        agg_dict: Dict[str, Any] = {"ciclos": ("t_liga", "count")}
+        if vol_col:
+            agg_dict["vol_total_L"] = (vol_col, "sum")
+        if dur_col:
+            agg_dict["duracao_total_min"] = (dur_col, "sum")
+
+        agg_res = c_df.groupby("hora").agg(**agg_dict).reset_index()
+        hourly_df = pd.merge(hourly_df, agg_res, on="hora", how="left")
+
+    if "ciclos" not in hourly_df.columns:
+        hourly_df["ciclos"] = 0
+    else:
+        hourly_df["ciclos"] = hourly_df["ciclos"].fillna(0).astype(int)
+
+    if "vol_total_L" not in hourly_df.columns:
+        hourly_df["vol_total_L"] = 0.0
+    else:
+        hourly_df["vol_total_L"] = hourly_df["vol_total_L"].fillna(0.0)
+
+    if "duracao_total_min" not in hourly_df.columns:
+        hourly_df["duracao_total_min"] = 0.0
+    else:
+        hourly_df["duracao_total_min"] = hourly_df["duracao_total_min"].fillna(0.0)
+
+    # Classificação por faixa de inrush e cores
+    statuses = []
+    colors = []
+    text_labels = []
+
+    for c in hourly_df["ciclos"]:
+        if c == 0:
+            statuses.append("Inativo (0 ciclos)")
+            colors.append("rgba(160, 175, 195, 0.35)")
+            text_labels.append("")
+        elif c < 6:
+            statuses.append("Normal (< 6 ciclos/h)")
+            colors.append("#1976d2")
+            text_labels.append(str(c))
+        elif c <= 10:
+            statuses.append("⚠️ Atenção (6 a 10 ciclos/h - Inrush Elevado)")
+            colors.append("#f57c00")
+            text_labels.append(f"<b>{c}</b>")
+        else:
+            statuses.append("🚨 Crítico (> 10 ciclos/h - Sobrecarga Térmica)")
+            colors.append("#d32f2f")
+            text_labels.append(f"<b>{c}</b>")
+
+    hourly_df["hora_naive"] = to_brasilia_naive(hourly_df["hora"])
+    hourly_df["hora_fim_naive"] = hourly_df["hora_naive"] + pd.Timedelta(hours=1)
+    hora_str = (
+        hourly_df["hora_naive"].dt.strftime("%d/%m/%Y %H:00")
+        + " às "
+        + hourly_df["hora_fim_naive"].dt.strftime("%H:00")
+    )
+
+    custom_data = np.stack(
+        (
+            hora_str,
+            statuses,
+            hourly_df["duracao_total_min"],
+            hourly_df["vol_total_L"],
+            hourly_df["ciclos"],
+        ),
+        axis=-1,
+    )
+
+    fig = go.Figure()
+
+    # Traço principal: Barras verticais (uma para cada hora)
+    fig.add_trace(
+        go.Bar(
+            x=hourly_df["hora_naive"],
+            y=hourly_df["ciclos"],
+            text=text_labels,
+            textposition="outside",
+            textfont=dict(size=11, color="#222222"),
+            marker=dict(
+                color=colors,
+                line=dict(color="#0d47a1", width=0.8),
+            ),
+            customdata=custom_data,
+            hovertemplate=(
+                "<b>📅 Janela: %{customdata[0]}</b><br>"
+                "⚡ <b>Acionamentos da Bomba: %{y} partidas/hora</b><br>"
+                "🚦 <b>Regime Térmico: %{customdata[1]}</b><br>"
+                "⏱️ Tempo Total Ligada: <b>%{customdata[2]:.1f} min</b><br>"
+                "💧 Volume Expulso: <b>%{customdata[3]:,.0f} Litros</b>"
+                "<extra></extra>"
+            ),
+            name="Partidas / Hora",
+            showlegend=False,
+        )
+    )
+
+    # Legendas visuais através de marcadores dummy
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=10, color="#1976d2", symbol="square"),
+            name="Normal (< 6 ciclos/h)",
+            showlegend=True,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=10, color="#f57c00", symbol="square"),
+            name="Atenção: 6 a 10 ciclos/h (Estresse de Inrush)",
+            showlegend=True,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=[None], y=[None], mode="markers",
+            marker=dict(size=10, color="#d32f2f", symbol="square"),
+            name="Crítico: > 10 ciclos/h (Sobreaquecimento Térmico)",
+            showlegend=True,
+        )
+    )
+
+    # Linhas de referência de 6 e 10 acionamentos por hora
+    fig.add_hline(
+        y=6,
+        line_dash="dash",
+        line_color="#f57c00",
+        line_width=2.0,
+        annotation_text="⚠️ Limiar de Atenção: 6 partidas/h (estresse por inrush)",
+        annotation_position="top left",
+        annotation_font=dict(size=11, color="#e65100"),
+    )
+    fig.add_hline(
+        y=10,
+        line_dash="dash",
+        line_color="#d32f2f",
+        line_width=2.0,
+        annotation_text="🚨 Limiar Crítico: 10 partidas/h (risco de sobrecarga térmica)",
+        annotation_position="top left",
+        annotation_font=dict(size=11, color="#b71c1c"),
+    )
+
+    max_c = int(hourly_df["ciclos"].max()) if not hourly_df.empty else 0
+    y_top = max(max_c + 3, 12)
+
+    fig.update_layout(
+        title="⚡ Frequência de Acionamentos da Bomba por Hora (Avaliação de Partidas & Corrente de Inrush)",
+        xaxis=dict(
+            title="Hora do Dia (Intervalos de 1 Hora)",
+            gridcolor="rgba(0,0,0,0.08)",
+            tickformat="%d/%m %H:00",
+        ),
+        yaxis=dict(
+            title="Número de Acionamentos (Partidas / Hora)",
+            gridcolor="rgba(0,0,0,0.08)",
+            range=[0, y_top],
+            dtick=1 if y_top <= 14 else 2,
+        ),
+        legend=dict(orientation="h", y=-0.25, x=0.5, xanchor="center"),
+        height=460,
+        margin=dict(l=40, r=40, t=50, b=60),
+        bargap=0.15,
+    )
+
+    # Estatísticas
+    hours_with_pump = int((hourly_df["ciclos"] > 0).sum())
+    hours_warning = int(((hourly_df["ciclos"] >= 6) & (hourly_df["ciclos"] <= 10)).sum())
+    hours_critical = int((hourly_df["ciclos"] > 10).sum())
+    hours_normal = int(((hourly_df["ciclos"] > 0) & (hourly_df["ciclos"] < 6)).sum())
+    total_cycles = int(hourly_df["ciclos"].sum())
+    total_hours = len(hourly_df)
+
+    hourly_df["hora"] = hourly_df["hora_naive"]
+    max_idx = hourly_df["ciclos"].idxmax() if not hourly_df.empty else None
+    max_hour_ts = hourly_df.loc[max_idx, "hora"] if max_idx is not None else None
+    max_hour_str = max_hour_ts.strftime("%d/%m/%Y às %H:00") if pd.notna(max_hour_ts) else "N/A"
+
+    mean_cycles_active = (
+        float(hourly_df.loc[hourly_df["ciclos"] > 0, "ciclos"].mean())
+        if hours_with_pump > 0
+        else 0.0
+    )
+
+    stats = {
+        "max_cycles_per_h": max_c,
+        "max_hour_str": max_hour_str,
+        "hours_with_pump": hours_with_pump,
+        "hours_warning": hours_warning,
+        "hours_critical": hours_critical,
+        "hours_normal": hours_normal,
+        "total_cycles": total_cycles,
+        "total_hours": total_hours,
+        "mean_cycles_active": mean_cycles_active,
+        "hourly_df": hourly_df,
+    }
+
+    return fig, stats
+
 

@@ -10,6 +10,7 @@ from src.config import (
     DEFAULT_FATOR_M3H_PARA_CMH,
     DEFAULT_VAZAO_BOMBA_M3H,
 )
+from src.utils import LOCAL_TZ, normalize_local_ts
 
 
 def detect_pump_cycles_and_volumes(
@@ -66,12 +67,12 @@ def detect_pump_cycles_and_volumes(
             w_start_a = max(0, pos_start - 2)
             w_start_b = min(len(df_calc) - 1, pos_start + 2)
             d_min = df_calc.iloc[w_start_a:w_start_b + 1]["nivel_smooth"].min()
-            t_start = df_calc.iloc[pos_start]["dt_round"]
+            t_start = normalize_local_ts(df_calc.iloc[pos_start]["dt_round"])
 
             w_end_a = max(0, pos_end - 2)
             w_end_b = min(len(df_calc) - 1, pos_end + 2)
             d_max = df_calc.iloc[w_end_a:w_end_b + 1]["nivel_smooth"].max()
-            t_end = df_calc.iloc[pos_end]["dt_round"]
+            t_end = normalize_local_ts(df_calc.iloc[pos_end]["dt_round"])
 
             delta_cm = d_max - d_min
             dur_min_val = (t_end - t_start).total_seconds() / 60.0
@@ -96,7 +97,8 @@ def detect_pump_cycles_and_volumes(
 
     # Método B: Detecção Física Híbrida por Queda Rápida do Nível
     vals = df_calc["nivel_smooth"].values
-    ts = df_calc["dt_round"].values
+    dt_series = df_calc["dt_round"].reset_index(drop=True)
+    ts = dt_series.values
     n = len(vals)
 
     i = 0
@@ -122,8 +124,8 @@ def detect_pump_cycles_and_volumes(
                     best_j = k
 
             dur_m_best = (ts[best_j] - ts[i]).astype("timedelta64[s]").astype(float) / 60.0
-            t_st = pd.to_datetime(ts[i])
-            t_en = pd.to_datetime(ts[best_j])
+            t_st = normalize_local_ts(dt_series.iloc[i])
+            t_en = normalize_local_ts(dt_series.iloc[best_j])
 
             if max_drop >= min_delta_cm and min_dur_min <= dur_m_best <= max_dur_min:
                 is_dup = any(abs((t_st - st_t).total_seconds()) < 300 for st_t in seen_timestamps)
@@ -221,8 +223,8 @@ def segment_operational_periods(
     for _, group in df_calc.groupby("block"):
         if len(group) < 2 or group["direction"].iloc[0] != -1:
             continue
-        t_start = group["dt_round"].iloc[0]
-        t_end = group["dt_round"].iloc[-1]
+        t_start = normalize_local_ts(group["dt_round"].iloc[0])
+        t_end = normalize_local_ts(group["dt_round"].iloc[-1])
         dur_h = (t_end - t_start).total_seconds() / 3600.0
         if dur_h < 0.05:
             continue

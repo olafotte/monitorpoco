@@ -10,7 +10,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from src.config import FUNDODOPOCO, DEFAULT_FATOR_M3H_PARA_CMH
-from src.utils import format_hours, format_hours_status
+from src.utils import format_hours, format_hours_status, to_brasilia_naive, LOCAL_TZ
 from src.data.preprocessing import compute_ultrasonic_temperature_error
 from src.models.pump_cycles import (
     detect_pump_cycles_and_volumes,
@@ -23,6 +23,7 @@ from src.components.charts import (
     plot_pump_cycles_volume_chart,
     plot_rain_vs_pump_correlation_scatter,
     plot_rain_vs_pump_cumulative_timeline,
+    plot_pump_starts_per_hour_chart,
 )
 
 
@@ -111,7 +112,7 @@ def render_tab_timeseries(
 
             if not w_hist.empty:
                 trace_rain_hist = go.Bar(
-                    x=w_hist.index,
+                    x=to_brasilia_naive(w_hist.index),
                     y=w_hist["precipitation"],
                     name="Chuva Recente (mm/h)",
                     marker_color="rgba(30, 144, 255, 0.35)",
@@ -123,7 +124,7 @@ def render_tab_timeseries(
                     fig.add_trace(trace_rain_hist)
             if not w_fut.empty:
                 trace_rain_fut = go.Bar(
-                    x=w_fut.index,
+                    x=to_brasilia_naive(w_fut.index),
                     y=w_fut["precipitation"],
                     name="Previsão Chuva ERA5 (mm/h)",
                     marker_color="rgba(46, 204, 113, 0.45)",
@@ -143,7 +144,7 @@ def render_tab_timeseries(
         precip_mmh = filled_df["precipitation_5min"] * (60.0 / step_min)
 
         trace_rain_grid = go.Bar(
-            x=filled_df["dt_round"],
+            x=to_brasilia_naive(filled_df["dt_round"]),
             y=precip_mmh,
             name="Chuva (mm/h)",
             marker_color="rgba(30, 144, 255, 0.35)",
@@ -155,14 +156,14 @@ def render_tab_timeseries(
             fig.add_trace(trace_rain_grid)
 
     trace_sensor = go.Scatter(
-        x=filled_df["dt_round"],
+        x=to_brasilia_naive(filled_df["dt_round"]),
         y=filled_df["nivel_cm"],
         mode="markers",
         name="Dados Reais (Sensor)",
         marker=dict(size=4, color="#1f77b4"),
     )
     trace_imputed = go.Scatter(
-        x=filled_df["dt_round"],
+        x=to_brasilia_naive(filled_df["dt_round"]),
         y=filled_df["nivel_imputed"],
         mode="lines",
         name="Modelo Estimado (Sem Gaps)",
@@ -182,7 +183,7 @@ def render_tab_timeseries(
         t_overflow_dt = t_latest + pd.Timedelta(hours=trend["time_overflow_h"])
 
         trace_proj_base = go.Scatter(
-            x=[t_latest, t_sensor_dt, t_overflow_dt],
+            x=[to_brasilia_naive(t_latest), to_brasilia_naive(t_sensor_dt), to_brasilia_naive(t_overflow_dt)],
             y=[trend["curr_d"], 0, d_overflow],
             mode="lines+markers",
             name=f"Projeção Base ({trend['rate_cmh']:.2f} cm/h)",
@@ -197,7 +198,7 @@ def render_tab_timeseries(
         # Projeção Corrigida com Previsão ERA5 (Com Chuva Futura)
         if trend["era5_sim_df"] is not None and not trend["era5_sim_df"].empty:
             trace_proj_era5 = go.Scatter(
-                x=trend["era5_sim_df"]["dt_round"],
+                x=to_brasilia_naive(trend["era5_sim_df"]["dt_round"]),
                 y=trend["era5_sim_df"]["nivel_imputed"],
                 mode="lines",
                 name="Projeção Corrigida (ERA5 + Chuva)",
@@ -222,7 +223,7 @@ def render_tab_timeseries(
         # Subplot 2: Temperatura Local sincronizada no tempo
         fig.add_trace(
             go.Scatter(
-                x=filled_df["dt_round"],
+                x=to_brasilia_naive(filled_df["dt_round"]),
                 y=filled_df["temperatura_c"],
                 mode="lines",
                 name="Temperatura Local (°C)",
@@ -234,7 +235,7 @@ def render_tab_timeseries(
         if not w_fut.empty and "temperature_2m" in w_fut.columns:
             fig.add_trace(
                 go.Scatter(
-                    x=w_fut.index,
+                    x=to_brasilia_naive(w_fut.index),
                     y=w_fut["temperature_2m"],
                     mode="lines",
                     name="Previsão Temp. (°C)",
@@ -672,3 +673,105 @@ def render_tab_timeseries(
                 )
                 if fig_corr_ts is not None:
                     st.plotly_chart(fig_corr_ts, width="stretch")
+
+    # ── Frequência de Acionamentos por Hora (Corrente de Inrush & Estresse Térmico) ──
+    with st.container(border=True):
+        st.subheader("⚡ Frequência de Acionamentos da Bomba por Hora (Corrente de Inrush)")
+        st.caption(
+            "Análise do número de partidas da bomba a cada hora. A cada acionamento, o motor submersível "
+            "demanda uma elevada **corrente de partida (*inrush current*)** (5 a 8× a corrente nominal). "
+            "Operações com **mais de 6 a 10 partidas/hora** geram aquecimento excessivo nos enrolamentos de cobre, "
+            "desgaste prematuro dos contatores e risco de sobrecarga térmica."
+        )
+
+        fig_starts_h, stats_starts_h = plot_pump_starts_per_hour_chart(
+            filled_df=filled_df,
+            df_cycles=df_cycles if "df_cycles" in locals() and not df_cycles.empty else None,
+            fator_m3h_para_cmh=fator_m3h_para_cmh,
+            vazao_bomba_m3h=vazao_bomba_m3h,
+        )
+
+        if fig_starts_h is not None and stats_starts_h:
+            col_st1, col_st2, col_st3, col_st4, col_st5 = st.columns(5)
+            max_c = stats_starts_h.get("max_cycles_per_h", 0)
+            max_t = stats_starts_h.get("max_hour_str", "N/A")
+            h_warn = stats_starts_h.get("hours_warning", 0)
+            h_crit = stats_starts_h.get("hours_critical", 0)
+            tot_p = stats_starts_h.get("total_cycles", 0)
+            avg_act = stats_starts_h.get("mean_cycles_active", 0.0)
+
+            delta_max = "Normal (< 6/h)" if max_c < 6 else ("⚠️ Atenção (6-10/h)" if max_c <= 10 else "🚨 Crítico (> 10/h)")
+            col_st1.metric(
+                "Pico de Partidas/Hora",
+                f"{max_c} ciclos/h",
+                delta=delta_max,
+                delta_color="inverse" if max_c >= 6 else "normal",
+                help=f"Maior número de acionamentos registrado em um único bloco de 1 hora. Ocorrido em: {max_t}",
+            )
+            col_st2.metric(
+                "Horas em Atenção (6 a 10)",
+                f"{h_warn} h",
+                delta="Alerta de inrush" if h_warn > 0 else "Nenhuma",
+                delta_color="inverse" if h_warn > 0 else "off",
+                help="Quantidade de blocos horários com 6 a 10 partidas da bomba (zona de atenção).",
+            )
+            col_st3.metric(
+                "Horas Críticas (> 10)",
+                f"{h_crit} h",
+                delta="Sobrecarga térmica!" if h_crit > 0 else "Nenhuma",
+                delta_color="inverse" if h_crit > 0 else "off",
+                help="Quantidade de blocos horários com mais de 10 partidas da bomba (zona crítica de sobrecarga).",
+            )
+            col_st4.metric(
+                "Média em Horas Ativas",
+                f"{avg_act:.1f} ciclos/h",
+                help="Média de acionamentos por hora calculada apenas nos períodos em que a bomba ligou pelo menos uma vez.",
+            )
+            col_st5.metric(
+                "Total de Partidas",
+                f"{tot_p} acionamentos",
+                help="Soma total de partidas da bomba identificadas ao longo do período selecionado.",
+            )
+
+            if h_crit > 0:
+                st.error(
+                    f"🚨 **ALERTA CRÍTICO DE SOBRECARGA TÉRMICA:** A bomba ultrapassou **10 partidas/hora** em **{h_crit} hora(s)** "
+                    f"(pico de **{max_c} acionamentos/h** registrado em {max_t}). "
+                    f"Partidas tão frequentes impedem o resfriamento do motor, com risco de desarme térmico ou queima do estator."
+                )
+            elif h_warn > 0:
+                st.warning(
+                    f"⚠️ **ATENÇÃO À CORRENTE DE INRUSH:** Registradas **{h_warn} hora(s)** na faixa de **6 a 10 acionamentos/hora** "
+                    f"(pico de **{max_c} acionamentos/h** em {max_t}). "
+                    f"Recomenda-se ampliar a distância útil entre bóia liga e desliga para aumentar o volume bombeado por ciclo e reduzir partidas repetidas."
+                )
+            else:
+                st.success(
+                    f"✅ **REGIME SEGURO DE OPERAÇÃO:** A bomba operou em faixa segura durante todo o período "
+                    f"(pico de **{max_c} acionamentos/hora**, sempre abaixo do limite de alerta de 6 ciclos/h)."
+                )
+
+            st.plotly_chart(fig_starts_h, width="stretch")
+
+            # Tabela detalhada em expander
+            hourly_df = stats_starts_h.get("hourly_df")
+            if hourly_df is not None and not hourly_df.empty:
+                active_hours = hourly_df[hourly_df["ciclos"] > 0].copy()
+                if not active_hours.empty:
+                    with st.expander("📋 Ver Tabela de Horas com Acionamentos da Bomba", icon=":material/table_view:"):
+                        active_disp = active_hours.sort_values("ciclos", ascending=False).copy()
+                        active_disp["Hora"] = active_disp["hora"].dt.strftime("%d/%m/%Y %H:00")
+                        active_disp["Partidas / Hora"] = active_disp["ciclos"]
+                        active_disp["Tempo Ligada (min)"] = active_disp["duracao_total_min"].round(1)
+                        active_disp["Volume Expulso (L)"] = active_disp["vol_total_L"].round(0)
+                        active_disp["Regime Térmico"] = active_disp["ciclos"].apply(
+                            lambda c: "🚨 Crítico (> 10/h)" if c > 10 else ("⚠️ Atenção (6 a 10/h)" if c >= 6 else "Normal (< 6/h)")
+                        )
+                        st.dataframe(
+                            active_disp[["Hora", "Partidas / Hora", "Regime Térmico", "Tempo Ligada (min)", "Volume Expulso (L)"]],
+                            hide_index=True,
+                            width="stretch",
+                        )
+        else:
+            st.info("Nenhum acionamento da bomba registrado no período para análise horária.")
+

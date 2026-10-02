@@ -25,6 +25,38 @@ def normalize_local_ts(ts: Any) -> Union[pd.Timestamp, Any]:
     return ts.tz_convert(LOCAL_TZ)
 
 
+def to_brasilia_naive(ts_or_series: Any) -> Any:
+    """Garante que o timestamp, DatetimeIndex ou Series esteja no fuso de Brasília (America/Sao_Paulo)
+    e remove o offset de fuso horário (tz-naive) para que renderizadores como Plotly exibam
+    com precisão a hora de Brasília no eixo X e no cursor, sem desvios indesejados para UTC.
+    """
+    if ts_or_series is None:
+        return None
+    if isinstance(ts_or_series, pd.Series):
+        if ts_or_series.empty:
+            return ts_or_series
+        s = pd.to_datetime(ts_or_series)
+        if s.dt.tz is None:
+            return s
+        return s.dt.tz_convert(LOCAL_TZ).dt.tz_localize(None)
+    elif isinstance(ts_or_series, pd.DatetimeIndex):
+        if ts_or_series.empty:
+            return ts_or_series
+        if ts_or_series.tz is None:
+            return ts_or_series
+        return ts_or_series.tz_convert(LOCAL_TZ).tz_localize(None)
+    elif isinstance(ts_or_series, (list, tuple)):
+        return [to_brasilia_naive(item) for item in ts_or_series]
+    elif isinstance(ts_or_series, (pd.Timestamp, np.datetime64)):
+        if pd.isna(ts_or_series):
+            return ts_or_series
+        t = pd.Timestamp(ts_or_series)
+        if t.tzinfo is None:
+            return t
+        return t.tz_convert(LOCAL_TZ).tz_localize(None)
+    return ts_or_series
+
+
 def format_hours(hours: float) -> str:
     """Formata horas decimais em formato legível de dias, horas e minutos."""
     if hours == float("inf") or hours < 0 or pd.isna(hours):
